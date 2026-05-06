@@ -398,7 +398,7 @@ func (c *Client) setAuth(req *http.Request) {
 func printTable(prs []PullRequest) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(w, "OPENED_AT\tAGE\tSTATE\tPROJECT\tREPO\tPR\tAUTHOR\tTITLE\tURL")
+	fmt.Fprintln(w, "OPENED_AT\tAGE\tSTATE\tAPPROVES\tAUTHOR\tTITLE\tURL")
 
 	now := time.Now()
 
@@ -414,10 +414,11 @@ func printTable(prs []PullRequest) {
 
 		fmt.Fprintf(
 			w,
-			"%s\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 			openedStr,
 			ageStr,
 			pr.State,
+			countApprovals(pr.Reviewers),
 			displayUser(pr.Author.User),
 			sanitizeCell(pr.Title),
 			selfURL(pr),
@@ -427,6 +428,17 @@ func printTable(prs []PullRequest) {
 	_ = w.Flush()
 }
 
+func countApprovals(reviewers []Reviewer) int {
+	count := 0
+
+	for _, reviewer := range reviewers {
+		if reviewer.Approved || strings.EqualFold(reviewer.Status, "APPROVED") {
+			count++
+		}
+	}
+
+	return count
+}
 func reviewersList(pr PullRequest) string {
 	if len(pr.Reviewers) == 0 {
 		return "-"
