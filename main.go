@@ -61,6 +61,7 @@ type PullRequest struct {
 	ID          int64  `json:"id"`
 	Title       string `json:"title"`
 	State       string `json:"state"`
+	CommentCount int   `json:"commentCount"`
 	CreatedDate int64  `json:"createdDate"`
 	UpdatedDate int64  `json:"updatedDate"`
 
@@ -398,30 +399,33 @@ func (c *Client) setAuth(req *http.Request) {
 func printTable(prs []PullRequest) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(w, "OPENED_AT\tAGE\tSTATE\tAPPROVES\tAUTHOR\tTITLE\tURL")
+	fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tAUTHOR\tTITLE")
 
 	now := time.Now()
 
 	for _, pr := range prs {
 		opened := msToTime(pr.CreatedDate)
-		openedStr := "-"
 		ageStr := "-"
+		lastCommentStr := "-"
 
 		if !opened.IsZero() {
-			openedStr = opened.Format("2006-01-02 15:04:05 MST")
 			ageStr = humanAge(now.Sub(opened))
+		}
+		updated := msToTime(pr.UpdatedDate)
+		if !updated.IsZero() {
+			lastCommentStr = humanAge(now.Sub(updated))
 		}
 
 		fmt.Fprintf(
 			w,
-			"%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
-			openedStr,
+			"%s\t%s\t%d\t%s\t%d\t%s\t%s\n",
 			ageStr,
-			pr.State,
+			lastCommentStr,
+			pr.CommentCount,
+			needsWorkStatus(pr.Reviewers),
 			countApprovals(pr.Reviewers),
 			displayUser(pr.Author.User),
 			sanitizeCell(pr.Title),
-			selfURL(pr),
 		)
 	}
 
@@ -439,6 +443,17 @@ func countApprovals(reviewers []Reviewer) int {
 
 	return count
 }
+
+func needsWorkStatus(reviewers []Reviewer) string {
+	for _, reviewer := range reviewers {
+		if strings.EqualFold(reviewer.Status, "NEEDS_WORK") {
+			return "yes"
+		}
+	}
+
+	return "-"
+}
+
 func reviewersList(pr PullRequest) string {
 	if len(pr.Reviewers) == 0 {
 		return "-"
