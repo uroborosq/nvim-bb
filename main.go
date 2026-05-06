@@ -59,12 +59,12 @@ type PRPage struct {
 }
 
 type PullRequest struct {
-	ID          int64  `json:"id"`
-	Title       string `json:"title"`
-	State       string `json:"state"`
-	CommentCount int   `json:"commentCount"`
-	CreatedDate int64  `json:"createdDate"`
-	UpdatedDate int64  `json:"updatedDate"`
+	ID           int64  `json:"id"`
+	Title        string `json:"title"`
+	State        string `json:"state"`
+	CommentCount int    `json:"commentCount"`
+	CreatedDate  int64  `json:"createdDate"`
+	UpdatedDate  int64  `json:"updatedDate"`
 
 	Author struct {
 		User User `json:"user"`
