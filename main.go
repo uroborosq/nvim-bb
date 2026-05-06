@@ -36,7 +36,6 @@ type Config struct {
 	Timeout     string `json:"timeout"`
 	InsecureTLS bool   `json:"insecure_tls"`
 	JSONOutput  bool   `json:"json_output"`
-	Reviewers   bool   `json:"reviewers"`
 }
 
 type RuntimeConfig struct {
@@ -404,7 +403,7 @@ func (c *Client) setAuth(req *http.Request) {
 func printTable(prs []PullRequest, reviewersEnabled bool) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tAUTHOR\tTITLE")
+	_, _ = fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tAUTHOR\tTITLE")
 
 	now := time.Now()
 
@@ -421,15 +420,10 @@ func printTable(prs []PullRequest, reviewersEnabled bool) {
 			lastCommentStr = humanAge(now.Sub(updated))
 		}
 
-		needsWork := "-"
-		approvals := 0
+		needsWork := needsWorkStatus(pr.Reviewers)
+		approvals := countApprovals(pr.Reviewers)
 
-		if reviewersEnabled {
-			needsWork = needsWorkStatus(pr.Reviewers)
-			approvals = countApprovals(pr.Reviewers)
-		}
-
-		fmt.Fprintf(
+		_, _ = fmt.Fprintf(
 			w,
 			"%s\t%s\t%d\t%s\t%d\t%s\t%s\n",
 			ageStr,
@@ -467,28 +461,6 @@ func needsWorkStatus(reviewers []Reviewer) string {
 	return "-"
 }
 
-func reviewersList(pr PullRequest) string {
-	if len(pr.Reviewers) == 0 {
-		return "-"
-	}
-
-	names := make([]string, 0, len(pr.Reviewers))
-
-	for _, r := range pr.Reviewers {
-		name := displayUser(r.User)
-
-		if r.Status != "" {
-			name += ":" + r.Status
-		} else if r.Approved {
-			name += ":APPROVED"
-		}
-
-		names = append(names, name)
-	}
-
-	return strings.Join(names, ", ")
-}
-
 func msToTime(ms int64) time.Time {
 	if ms <= 0 {
 		return time.Time{}
@@ -521,14 +493,6 @@ func humanAge(d time.Duration) string {
 	}
 }
 
-func repoName(r Repository) string {
-	if r.Slug != "" {
-		return r.Slug
-	}
-
-	return r.Name
-}
-
 func displayUser(u User) string {
 	if u.DisplayName != "" {
 		return u.DisplayName
@@ -543,14 +507,6 @@ func displayUser(u User) string {
 	}
 
 	return u.EmailAddress
-}
-
-func selfURL(pr PullRequest) string {
-	if len(pr.Links.Self) == 0 {
-		return ""
-	}
-
-	return pr.Links.Self[0].Href
 }
 
 func sanitizeCell(s string) string {
