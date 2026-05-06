@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -112,6 +113,9 @@ type User struct {
 }
 
 func main() {
+	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
+	flag.Parse()
+
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		fatal(err)
@@ -145,7 +149,7 @@ func main() {
 		return
 	}
 
-	printTable(prs, cfg.Reviewers)
+	printTable(prs, *reviewersEnabled)
 }
 
 func LoadConfig(path string) (RuntimeConfig, error) {
