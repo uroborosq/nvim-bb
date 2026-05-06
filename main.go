@@ -35,6 +35,7 @@ type Config struct {
 	Timeout     string `json:"timeout"`
 	InsecureTLS bool   `json:"insecure_tls"`
 	JSONOutput  bool   `json:"json_output"`
+	Reviewers   bool   `json:"reviewers"`
 }
 
 type RuntimeConfig struct {
@@ -144,7 +145,7 @@ func main() {
 		return
 	}
 
-	printTable(prs)
+	printTable(prs, cfg.Reviewers)
 }
 
 func LoadConfig(path string) (RuntimeConfig, error) {
@@ -396,7 +397,7 @@ func (c *Client) setAuth(req *http.Request) {
 	}
 }
 
-func printTable(prs []PullRequest) {
+func printTable(prs []PullRequest, reviewersEnabled bool) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
 	fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tAUTHOR\tTITLE")
@@ -416,14 +417,22 @@ func printTable(prs []PullRequest) {
 			lastCommentStr = humanAge(now.Sub(updated))
 		}
 
+		needsWork := "-"
+		approvals := 0
+
+		if reviewersEnabled {
+			needsWork = needsWorkStatus(pr.Reviewers)
+			approvals = countApprovals(pr.Reviewers)
+		}
+
 		fmt.Fprintf(
 			w,
 			"%s\t%s\t%d\t%s\t%d\t%s\t%s\n",
 			ageStr,
 			lastCommentStr,
 			pr.CommentCount,
-			needsWorkStatus(pr.Reviewers),
-			countApprovals(pr.Reviewers),
+			needsWork,
+			approvals,
 			displayUser(pr.Author.User),
 			sanitizeCell(pr.Title),
 		)
