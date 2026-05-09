@@ -7,7 +7,20 @@ M.config = {
 
 local state = {
   prs = {},
+  pr_by_tab = {},
 }
+
+local function tab_key(tabpage)
+  return tostring(tabpage)
+end
+
+local function set_current_tab_pr(pr)
+  state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = pr
+end
+
+local function get_current_tab_pr()
+  return state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
 
 local function format_pr_entry(pr)
   local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
@@ -67,6 +80,7 @@ local function open_diffview(pr)
 
   local function open_after_fetch()
     vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
+    set_current_tab_pr(pr)
   end
 
   local fetch_cmd = {
@@ -97,6 +111,226 @@ local function open_diffview(pr)
       vim.schedule(open_after_fetch)
     end)
   end)
+end
+
+local function format_opened_date(ms)
+  if type(ms) ~= "number" or ms <= 0 then
+    return "unknown"
+  end
+
+  return os.date("%Y-%m-%d %H:%M:%S %Z", math.floor(ms / 1000))
+end
+
+local function format_opened_age(ms)
+  if type(ms) ~= "number" or ms <= 0 then
+    return "unknown"
+  end
+
+  local seconds = os.time() - math.floor(ms / 1000)
+  if seconds < 0 then
+    seconds = -seconds
+  end
+
+  local days = math.floor(seconds / 86400)
+  if days >= 365 then
+    return string.format("%dy%dd", math.floor(days / 365), days % 365)
+  end
+  if days >= 1 then
+    return string.format("%dd", days)
+  end
+
+  local hours = math.floor(seconds / 3600)
+  if hours > 0 then
+    return string.format("%dh", hours)
+  end
+
+  return string.format("%dm", math.floor(seconds / 60))
+end
+
+local function build_approval_lines(pr)
+  local lines = {}
+  local reviewers = pr.reviewers or {}
+
+  if #reviewers == 0 then
+    return { "None" }
+  end
+
+  local grouped = {}
+  local order = { "APPROVED", "UNAPPROVED", "NEEDS_WORK", "PENDING" }
+
+  local function normalize_status(reviewer)
+    if reviewer.approved or reviewer.status == "APPROVED" then
+      return "APPROVED"
+    end
+
+    local raw = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
+    if raw == "NEEDS_WORK" then
+      return "NEEDS_WORK"
+    end
+    if raw == "UNAPPROVED" then
+      return "UNAPPROVED"
+    end
+    if raw == "" then
+      return "PENDING"
+    end
+
+    return raw
+  end
+
+  for _, reviewer in ipairs(reviewers) do
+    local user = reviewer.user or {}
+    local name = user.displayName or user.name or user.slug or "unknown"
+    local status = normalize_status(reviewer)
+    grouped[status] = grouped[status] or {}
+    table.insert(grouped[status], name)
+  end
+
+  local emitted = {}
+  for _, status in ipairs(order) do
+    local names = grouped[status]
+    if names and #names > 0 then
+      table.sort(names)
+      table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
+      emitted[status] = true
+    end
+  end
+
+  local remaining_statuses = {}
+  for status, _ in pairs(grouped) do
+    if not emitted[status] then
+      table.insert(remaining_statuses, status)
+    end
+  end
+  table.sort(remaining_statuses)
+
+  for _, status in ipairs(remaining_statuses) do
+    local names = grouped[status]
+    table.sort(names)
+    table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
+  end
+
+  return lines
+end
+
+local function open_pr_info(pr)
+  local function enable_markview(buf, win)
+    local markview = nil
+    local commands = nil
+    do
+      local ok_markview, mod_markview = pcall(require, "markview")
+      if ok_markview then
+        markview = mod_markview
+      end
+      local ok_commands, mod_commands = pcall(require, "markview.commands")
+      if ok_commands then
+        commands = mod_commands
+      end
+    end
+
+    if not markview and not commands then
+      return
+    end
+
+    local function try_attach()
+      if markview and type(markview.attach) == "function" then
+        if pcall(markview.attach) then
+          return true
+        end
+        if pcall(markview.attach, buf) then
+          return true
+        end
+      end
+
+      if markview and type(markview.enable) == "function" then
+        if pcall(markview.enable) then
+          return true
+        end
+        if pcall(markview.enable, buf) then
+          return true
+        end
+      end
+
+      if commands and type(commands.attach) == "function" then
+        if pcall(commands.attach, buf) then
+          return true
+        end
+        if pcall(commands.attach) then
+          return true
+        end
+      end
+
+      return false
+    end
+
+    if win then
+      vim.schedule(function()
+        pcall(vim.api.nvim_win_call, win, function()
+          local ok_attach = try_attach()
+          if not ok_attach then
+            vim.cmd("silent! Markview attach")
+          end
+        end)
+      end)
+    else
+      local ok_attach = try_attach()
+      if not ok_attach then
+        vim.cmd("silent! Markview attach")
+      end
+    end
+  end
+
+  local function to_lines(text)
+    if type(text) ~= "string" or text == "" then
+      return { "(no description)" }
+    end
+
+    return vim.split(text, "\n", { plain = true })
+  end
+
+  local info_lines = {
+    string.format("PR #%s", tostring(pr.id or "?")),
+    string.format("Title: %s", pr.title or ""),
+    string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
+    "",
+    "Description:",
+  }
+
+  vim.list_extend(info_lines, to_lines(pr.description))
+  table.insert(info_lines, "")
+  table.insert(info_lines, "Approvals:")
+
+  vim.list_extend(info_lines, build_approval_lines(pr))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+  if vim.diagnostic and type(vim.diagnostic.disable) == "function" then
+    vim.diagnostic.disable(buf)
+  elseif vim.lsp and vim.lsp.diagnostic and type(vim.lsp.diagnostic.disable) == "function" then
+    vim.lsp.diagnostic.disable(buf)
+  end
+
+  local width = math.floor(vim.o.columns * 0.7)
+  local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = "PR Info",
+    title_pos = "center",
+  })
+
+  vim.api.nvim_set_option_value("wrap", true, { win = win })
+  vim.api.nvim_set_option_value("linebreak", true, { win = win })
+  enable_markview(buf, win)
+
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
 
 local function open_telescope_picker(prs)
@@ -131,6 +365,14 @@ local function open_telescope_picker(prs)
           open_diffview(selection.value)
         end
       end)
+
+      actions.select_horizontal:replace(function()
+        local selection = action_state.get_selected_entry()
+        if selection and selection.value then
+          open_pr_info(selection.value)
+        end
+      end)
+
       return true
     end,
   }):find()
@@ -162,6 +404,15 @@ function M.open_list()
         end
       end, { buffer = buf, silent = true })
 
+      vim.keymap.set("n", "i", function()
+        local line = vim.api.nvim_win_get_cursor(0)[1]
+        local idx = line - 2
+        local pr = state.prs[idx]
+        if pr then
+          open_pr_info(pr)
+        end
+      end, { buffer = buf, silent = true })
+
       vim.api.nvim_set_current_buf(buf)
     end)
   end)
@@ -173,6 +424,16 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("BBPRList", function()
     M.open_list()
   end, { desc = "List active Bitbucket PRs" })
+
+  vim.api.nvim_create_user_command("BBPRInfo", function()
+    local pr = get_current_tab_pr()
+    if not pr then
+      vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+      return
+    end
+
+    open_pr_info(pr)
+  end, { desc = "Show info for PR opened in current tab" })
 end
 
 return M
