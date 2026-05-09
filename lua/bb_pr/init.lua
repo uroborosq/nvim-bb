@@ -256,6 +256,7 @@ local function open_pr_info(pr)
   })
 
   vim.api.nvim_set_option_value("wrap", true, { win = win })
+  vim.api.nvim_set_option_value("linebreak", true, { win = win })
 
   vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
