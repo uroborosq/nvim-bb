@@ -110,9 +110,57 @@ type User struct {
 	EmailAddress string `json:"emailAddress"`
 }
 
+type CommentPage struct {
+	Size          int         `json:"size"`
+	Limit         int         `json:"limit"`
+	IsLastPage    bool        `json:"isLastPage"`
+	Start         int         `json:"start"`
+	NextPageStart int         `json:"nextPageStart"`
+	Values        []PRComment `json:"values"`
+}
+
+type PRComment struct {
+	ID          int64  `json:"id"`
+	Text        string `json:"text"`
+	CreatedDate int64  `json:"createdDate"`
+	UpdatedDate int64  `json:"updatedDate"`
+	Anchor      *struct {
+		Path     string `json:"path"`
+		Line     int    `json:"line"`
+		LineType string `json:"lineType"`
+		FileType string `json:"fileType"`
+		DiffType string `json:"diffType"`
+	} `json:"anchor,omitempty"`
+	Author User `json:"author"`
+}
+
+type PRCommentView struct {
+	ID            int64  `json:"id"`
+	Text          string `json:"text"`
+	Author        string `json:"author"`
+	CreatedDate   int64  `json:"created_date_ms"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedDate   int64  `json:"updated_date_ms"`
+	UpdatedAt     string `json:"updated_at"`
+	IsFileComment bool   `json:"is_file_comment"`
+	Path          string `json:"path,omitempty"`
+	Line          int    `json:"line,omitempty"`
+	LineType      string `json:"line_type,omitempty"`
+	FileType      string `json:"file_type,omitempty"`
+	DiffType      string `json:"diff_type,omitempty"`
+}
+
+type PullRequestComments struct {
+	PRID             int64           `json:"pr_id"`
+	FetchedAt        string          `json:"fetched_at"`
+	OverviewComments []PRCommentView `json:"overview_comments"`
+	FileComments     []PRCommentView `json:"file_comments"`
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
+	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	flag.Parse()
 
@@ -128,6 +176,22 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
 	defer cancel()
+
+	if *prCommentsID > 0 {
+		comments, err := client.GetPullRequestComments(ctx, *prCommentsID)
+		if err != nil {
+			fatal(err)
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+
+		if err := enc.Encode(comments); err != nil {
+			fatal(err)
+		}
+
+		return
+	}
 
 	prs, err := client.GetRepoPullRequests(ctx)
 	if err != nil {
@@ -325,6 +389,108 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 	}
 
 	return all, nil
+}
+
+func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
+	var all []PRComment
+	start := 0
+
+	for {
+		page, err := c.fetchPullRequestCommentPage(ctx, prID, start)
+		if err != nil {
+			return nil, err
+		}
+
+		all = append(all, page.Values...)
+
+		if page.IsLastPage {
+			break
+		}
+
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size > 0 {
+				next = start + page.Size
+			} else {
+				return nil, fmt.Errorf("comment pagination stuck: pr=%d start=%d next=%d size=%d", prID, start, page.NextPageStart, page.Size)
+			}
+		}
+		start = next
+	}
+
+	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
+	for _, cmt := range all {
+		view := PRCommentView{
+			ID:          cmt.ID,
+			Text:        cmt.Text,
+			Author:      displayUser(cmt.Author),
+			CreatedDate: cmt.CreatedDate,
+			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
+			UpdatedDate: cmt.UpdatedDate,
+			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+		}
+
+		if cmt.Anchor != nil {
+			view.IsFileComment = true
+			view.Path = cmt.Anchor.Path
+			view.Line = cmt.Anchor.Line
+			view.LineType = cmt.Anchor.LineType
+			view.FileType = cmt.Anchor.FileType
+			view.DiffType = cmt.Anchor.DiffType
+			out.FileComments = append(out.FileComments, view)
+			continue
+		}
+
+		out.OverviewComments = append(out.OverviewComments, view)
+	}
+
+	return out, nil
+}
+
+func (c *Client) fetchPullRequestCommentPage(ctx context.Context, prID int64, start int) (*CommentPage, error) {
+	u := *c.baseURL
+	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
+		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments",
+		url.PathEscape(c.cfg.Project),
+		url.PathEscape(c.cfg.Repo),
+		prID,
+	))
+
+	q := u.Query()
+	q.Set("limit", fmt.Sprintf("%d", c.cfg.Limit))
+	q.Set("start", fmt.Sprintf("%d", start))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", u.Redacted(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+
+		return nil, fmt.Errorf(
+			"BitBucket returned %s: %s",
+			resp.Status,
+			strings.TrimSpace(string(body)),
+		)
+	}
+
+	var page CommentPage
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket comments response: %w", err)
+	}
+
+	return &page, nil
 }
 
 func (c *Client) fetchRepoPRPage(ctx context.Context, start int) (*PRPage, error) {
