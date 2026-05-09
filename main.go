@@ -113,7 +113,7 @@ type User struct {
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
-	configPath := flag.String("config", "config.json", "path to config")
+	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
