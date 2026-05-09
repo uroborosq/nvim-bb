@@ -108,6 +108,15 @@ local function split_first_line(text)
 	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
 end
 
+local function as_array(value)
+	if type(value) == "table" then
+		return value
+	end
+
+	-- vim.json.decode can return vim.empty_dict() userdata for empty JSON objects.
+	return {}
+end
+
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
 	for _, c in ipairs(comments) do
@@ -149,7 +158,7 @@ apply_comments_to_current_buffer = function(comments_payload)
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
 
-	for _, c in ipairs(comments_payload.file_comments or {}) do
+	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
 		if c.path == rel or rel:sub(-#(c.path or "")) == c.path then
 			local line = tonumber(c.line or 0)
 			if line > 0 then
