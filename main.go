@@ -131,6 +131,13 @@ type PRComment struct {
 		FileType string `json:"fileType"`
 		DiffType string `json:"diffType"`
 	} `json:"anchor,omitempty"`
+	CommentAnchor *struct {
+		Path     string `json:"path"`
+		Line     int    `json:"line"`
+		LineType string `json:"lineType"`
+		FileType string `json:"fileType"`
+		DiffType string `json:"diffType"`
+	} `json:"commentAnchor,omitempty"`
 	Author User `json:"author"`
 }
 
@@ -438,6 +445,11 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, cmt := range all {
+		anchor := cmt.Anchor
+		if anchor == nil {
+			anchor = cmt.CommentAnchor
+		}
+
 		view := PRCommentView{
 			ID:          cmt.ID,
 			Text:        cmt.Text,
@@ -448,13 +460,13 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
 		}
 
-		if cmt.Anchor != nil {
+		if anchor != nil {
 			view.IsFileComment = true
-			view.Path = cmt.Anchor.Path
-			view.Line = cmt.Anchor.Line
-			view.LineType = cmt.Anchor.LineType
-			view.FileType = cmt.Anchor.FileType
-			view.DiffType = cmt.Anchor.DiffType
+			view.Path = anchor.Path
+			view.Line = anchor.Line
+			view.LineType = anchor.LineType
+			view.FileType = anchor.FileType
+			view.DiffType = anchor.DiffType
 			out.FileComments = append(out.FileComments, view)
 			continue
 		}
