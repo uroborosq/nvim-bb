@@ -113,6 +113,7 @@ type User struct {
 
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
+	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	flag.Parse()
 
 	cfg, err := LoadConfig(configPath)
@@ -137,7 +138,7 @@ func main() {
 		return prs[i].CreatedDate > prs[j].CreatedDate
 	})
 
-	if cfg.JSONOutput {
+	if *jsonEnabled || cfg.JSONOutput || envTrue("BB_JSON_OUTPUT") {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 
@@ -519,6 +520,16 @@ func sanitizeCell(s string) string {
 
 func joinURLPath(basePath, suffix string) string {
 	return strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(suffix, "/")
+}
+
+func envTrue(key string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func fatal(err error) {
