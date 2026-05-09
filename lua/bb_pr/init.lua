@@ -244,11 +244,17 @@ local function open_pr_info(pr)
     if win then
       vim.schedule(function()
         pcall(vim.api.nvim_win_call, win, function()
-          try_attach()
+          local ok_attach = try_attach()
+          if not ok_attach then
+            vim.cmd("silent! Markview attach")
+          end
         end)
       end)
     else
-      try_attach()
+      local ok_attach = try_attach()
+      if not ok_attach then
+        vim.cmd("silent! Markview attach")
+      end
     end
   end
 
