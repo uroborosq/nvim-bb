@@ -243,7 +243,7 @@ local function open_pr_info(pr)
   local width = math.floor(vim.o.columns * 0.7)
   local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
 
-  vim.api.nvim_open_win(buf, true, {
+  local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
     width = width,
     height = height,
@@ -254,6 +254,8 @@ local function open_pr_info(pr)
     title = "PR Info",
     title_pos = "center",
   })
+
+  vim.api.nvim_set_option_value("wrap", true, { win = win })
 
   vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
