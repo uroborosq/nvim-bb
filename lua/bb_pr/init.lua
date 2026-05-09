@@ -1,7 +1,7 @@
 local M = {}
 
 M.config = {
-  provider_cmd = { "go", "run", "./main.go", "-reviewers", "-json" },
+  provider_cmd = { "bb", "-reviewers", "-json" },
   diffview_cmd = "DiffviewOpen",
 }
 
