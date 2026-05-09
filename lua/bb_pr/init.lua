@@ -156,22 +156,22 @@ local function build_approval_lines(pr)
   end
 
   local grouped = {}
-  local order = { "approved", "unapproved", "needs_work", "pending" }
+  local order = { "APPROVED", "UNAPPROVED", "NEEDS_WORK", "PENDING" }
 
   local function normalize_status(reviewer)
     if reviewer.approved or reviewer.status == "APPROVED" then
-      return "approved"
+      return "APPROVED"
     end
 
-    local raw = type(reviewer.status) == "string" and string.lower(reviewer.status) or ""
-    if raw == "needs_work" then
-      return "needs_work"
+    local raw = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
+    if raw == "NEEDS_WORK" then
+      return "NEEDS_WORK"
     end
-    if raw == "unapproved" then
-      return "unapproved"
+    if raw == "UNAPPROVED" then
+      return "UNAPPROVED"
     end
     if raw == "" then
-      return "pending"
+      return "PENDING"
     end
 
     return raw
@@ -190,10 +190,7 @@ local function build_approval_lines(pr)
     local names = grouped[status]
     if names and #names > 0 then
       table.sort(names)
-      table.insert(lines, status .. ":")
-      for _, name in ipairs(names) do
-        table.insert(lines, "- " .. name)
-      end
+      table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
       emitted[status] = true
     end
   end
@@ -209,10 +206,7 @@ local function build_approval_lines(pr)
   for _, status in ipairs(remaining_statuses) do
     local names = grouped[status]
     table.sort(names)
-    table.insert(lines, status .. ":")
-    for _, name in ipairs(names) do
-      table.insert(lines, "- " .. name)
-    end
+    table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
   end
 
   return lines
