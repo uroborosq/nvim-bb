@@ -141,16 +141,25 @@ local function build_approval_lines(pr)
 end
 
 local function open_pr_info(pr)
+  local function to_lines(text)
+    if type(text) ~= "string" or text == "" then
+      return { "(no description)" }
+    end
+
+    return vim.split(text, "\n", { plain = true })
+  end
+
   local info_lines = {
     string.format("PR #%s", tostring(pr.id or "?")),
     string.format("Title: %s", pr.title or ""),
     string.format("Opened: %s", format_opened_date(pr.createdDate)),
     "",
     "Description:",
-    pr.description and pr.description ~= "" and pr.description or "(no description)",
-    "",
-    "Approvals:",
   }
+
+  vim.list_extend(info_lines, to_lines(pr.description))
+  table.insert(info_lines, "")
+  table.insert(info_lines, "Approvals:")
 
   vim.list_extend(info_lines, build_approval_lines(pr))
 
