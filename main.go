@@ -124,21 +124,18 @@ type PRComment struct {
 	Text        string `json:"text"`
 	CreatedDate int64  `json:"createdDate"`
 	UpdatedDate int64  `json:"updatedDate"`
-	Anchor      *struct {
-		Path     string `json:"path"`
-		Line     int    `json:"line"`
-		LineType string `json:"lineType"`
-		FileType string `json:"fileType"`
-		DiffType string `json:"diffType"`
-	} `json:"anchor,omitempty"`
-	CommentAnchor *struct {
-		Path     string `json:"path"`
-		Line     int    `json:"line"`
-		LineType string `json:"lineType"`
-		FileType string `json:"fileType"`
-		DiffType string `json:"diffType"`
-	} `json:"commentAnchor,omitempty"`
-	Author User `json:"author"`
+	Anchor        *Anchor     `json:"anchor,omitempty"`
+	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
+	Comments      []PRComment `json:"comments,omitempty"`
+	Author        User        `json:"author"`
+}
+
+type Anchor struct {
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
+	LineType string `json:"lineType"`
+	FileType string `json:"fileType"`
+	DiffType string `json:"diffType"`
 }
 
 type ActivityPage struct {
@@ -151,7 +148,12 @@ type ActivityPage struct {
 }
 
 type Activity struct {
-	Action  string     `json:"action"`
+	Action        string     `json:"action"`
+	Anchor        *Anchor    `json:"anchor,omitempty"`
+	CommentAction *struct {
+		Comment *PRComment `json:"comment"`
+		Anchor  *Anchor    `json:"anchor,omitempty"`
+	} `json:"commentAction,omitempty"`
 	Comment *PRComment `json:"comment"`
 }
 
@@ -423,8 +425,18 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 
 		for _, activity := range page.Values {
-			if activity.Comment != nil {
-				all = append(all, *activity.Comment)
+			root := activity.Comment
+			if activity.CommentAction != nil && activity.CommentAction.Comment != nil {
+				root = activity.CommentAction.Comment
+				if root.Anchor == nil {
+					root.Anchor = activity.CommentAction.Anchor
+				}
+			}
+			if root != nil {
+				if root.Anchor == nil {
+					root.Anchor = activity.Anchor
+				}
+				all = append(all, flattenCommentTree(*root)...)
 			}
 		}
 
@@ -475,6 +487,17 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	}
 
 	return out, nil
+}
+
+func flattenCommentTree(root PRComment) []PRComment {
+	out := []PRComment{root}
+	for _, child := range root.Comments {
+		if child.Anchor == nil && child.CommentAnchor == nil {
+			child.Anchor = root.Anchor
+		}
+		out = append(out, flattenCommentTree(child)...)
+	}
+	return out
 }
 
 func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
