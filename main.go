@@ -113,6 +113,7 @@ type User struct {
 
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
+	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	flag.Parse()
 
 	cfg, err := LoadConfig(configPath)
@@ -137,7 +138,7 @@ func main() {
 		return prs[i].CreatedDate > prs[j].CreatedDate
 	})
 
-	if cfg.JSONOutput {
+	if cfg.JSONOutput || *jsonEnabled {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 
