@@ -10,6 +10,7 @@ local state = {
 	prs = {},
 	pr_by_tab = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
+	comments_by_tab = {},
 }
 
 local function tab_key(tabpage)
@@ -17,7 +18,9 @@ local function tab_key(tabpage)
 end
 
 local function set_current_tab_pr(pr)
-	state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = pr
+	local key = tab_key(vim.api.nvim_get_current_tabpage())
+	state.pr_by_tab[key] = pr
+	state.comments_by_tab[key] = nil
 end
 
 local function get_current_tab_pr()
@@ -64,6 +67,8 @@ local function run_provider(cb)
 	end)
 end
 
+local apply_comments_to_current_buffer
+
 local function run_comments_provider(pr_id, cb)
 	local cmd = vim.deepcopy(M.config.comments_cmd)
 	table.insert(cmd, tostring(pr_id))
@@ -86,6 +91,14 @@ local function run_comments_provider(pr_id, cb)
 
 		cb(decoded)
 	end)
+end
+
+local function set_current_tab_comments(payload)
+	state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = payload
+end
+
+local function get_current_tab_comments()
+	return state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
 end
 
 local function split_first_line(text)
@@ -128,7 +141,7 @@ local function open_comment_float(comments, line)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
 
-local function apply_comments_to_current_buffer(comments_payload)
+apply_comments_to_current_buffer = function(comments_payload)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local file = vim.api.nvim_buf_get_name(bufnr)
 	local rel = vim.fn.fnamemodify(file, ":.")
@@ -197,6 +210,12 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_to_current_buffer(payload)
+			end)
+		end)
 	end
 
 	local fetch_cmd = {
@@ -559,6 +578,7 @@ function M.setup(opts)
 
 		run_comments_provider(pr.id, function(payload)
 			vim.schedule(function()
+				set_current_tab_comments(payload)
 				apply_comments_to_current_buffer(payload)
 			end)
 		end)
@@ -577,6 +597,17 @@ function M.setup(opts)
 	end, { desc = "Open floating window with comments for current line" })
 
 	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
+
+	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
+	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+		group = aug,
+		callback = function()
+			local payload = get_current_tab_comments()
+			if payload then
+				apply_comments_to_current_buffer(payload)
+			end
+		end,
+	})
 end
 
 return M

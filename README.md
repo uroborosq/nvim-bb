@@ -8,5 +8,6 @@ Bitbucket PR helper CLI + Neovim plugin.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
 - CLI: `bb -pr-comments <id> -json` returns structured PR comments (overview + file anchors) with timestamps for Neovim overlays (virtual text / floating windows).
 - Neovim integration:
+  - PR comments are auto-loaded when opening a PR diff and then auto-applied on buffer enter.
   - `:BBPRLoadComments` loads PR comments for the PR opened in current tab and renders virtual text on commented lines.
   - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line.
