@@ -213,6 +213,22 @@ local function build_approval_lines(pr)
 end
 
 local function open_pr_info(pr)
+  local function enable_markview(buf)
+    local ok, markview = pcall(require, "markview")
+    if not ok or not markview then
+      return
+    end
+
+    if type(markview.attach) == "function" then
+      pcall(markview.attach, buf)
+      return
+    end
+
+    if type(markview.enable) == "function" then
+      pcall(markview.enable, buf)
+    end
+  end
+
   local function to_lines(text)
     if type(text) ~= "string" or text == "" then
       return { "(no description)" }
@@ -239,6 +255,7 @@ local function open_pr_info(pr)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
   vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+  enable_markview(buf)
 
   local width = math.floor(vim.o.columns * 0.7)
   local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
