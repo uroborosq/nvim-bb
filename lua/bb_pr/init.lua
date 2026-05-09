@@ -214,24 +214,30 @@ end
 
 local function open_pr_info(pr)
   local function enable_markview(buf, win)
-    if win then
-      pcall(vim.api.nvim_win_call, win, function()
-        vim.cmd("silent! Markview attach")
-      end)
-    end
-
     local ok, markview = pcall(require, "markview")
     if not ok or not markview then
       return
     end
 
     if type(markview.attach) == "function" then
-      pcall(markview.attach, buf)
+      if win then
+        pcall(vim.api.nvim_win_call, win, function()
+          pcall(markview.attach, buf)
+        end)
+      else
+        pcall(markview.attach, buf)
+      end
       return
     end
 
     if type(markview.enable) == "function" then
-      pcall(markview.enable, buf)
+      if win then
+        pcall(vim.api.nvim_win_call, win, function()
+          pcall(markview.enable, buf)
+        end)
+      else
+        pcall(markview.enable, buf)
+      end
     end
   end
 
