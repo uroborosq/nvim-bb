@@ -121,6 +121,32 @@ local function format_opened_date(ms)
   return os.date("%Y-%m-%d %H:%M:%S %Z", math.floor(ms / 1000))
 end
 
+local function format_opened_age(ms)
+  if type(ms) ~= "number" or ms <= 0 then
+    return "unknown"
+  end
+
+  local seconds = os.time() - math.floor(ms / 1000)
+  if seconds < 0 then
+    seconds = -seconds
+  end
+
+  local days = math.floor(seconds / 86400)
+  if days >= 365 then
+    return string.format("%dy%dd", math.floor(days / 365), days % 365)
+  end
+  if days >= 1 then
+    return string.format("%dd", days)
+  end
+
+  local hours = math.floor(seconds / 3600)
+  if hours > 0 then
+    return string.format("%dh", hours)
+  end
+
+  return string.format("%dm", math.floor(seconds / 60))
+end
+
 local function build_approval_lines(pr)
   local lines = {}
   local reviewers = pr.reviewers or {}
@@ -204,7 +230,7 @@ local function open_pr_info(pr)
   local info_lines = {
     string.format("PR #%s", tostring(pr.id or "?")),
     string.format("Title: %s", pr.title or ""),
-    string.format("Opened: %s", format_opened_date(pr.createdDate)),
+    string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
     "",
     "Description:",
   }
