@@ -5,9 +5,8 @@ local state = {
   buf = nil,
   win = nil,
   config = {
-    cli_cmd = "go run .",
+    cli_cmd = "bb",
     cwd = vim.fn.getcwd(),
-    reviewers = true,
   },
 }
 
@@ -32,30 +31,10 @@ function M.setup(opts)
   end, { nargs = 1, desc = "Open PR in diffview" })
 end
 
-local function parse_json_lines(lines)
-  local text = table.concat(lines, "\n")
-  if text == "" then
-    return nil, "empty output"
-  end
-
-  local ok, decoded = pcall(vim.json.decode, text)
-  if not ok then
-    return nil, decoded
-  end
-
-  return decoded, nil
-end
-
 function M.fetch_prs(cb)
-  local argv = { "bash", "-lc", state.config.cli_cmd .. " --reviewers" }
+  local argv = { "bash", "-lc", state.config.cli_cmd .. " --json --reviewers" }
 
-  vim.system(argv, {
-    cwd = state.config.cwd,
-    text = true,
-    env = vim.tbl_extend("force", vim.fn.environ(), {
-      BB_JSON_OUTPUT = "1",
-    }),
-  }, function(res)
+  vim.system(argv, { cwd = state.config.cwd, text = true }, function(res)
     if res.code ~= 0 then
       vim.schedule(function()
         notify("CLI failed: " .. (res.stderr or "unknown error"), vim.log.levels.ERROR)
@@ -63,10 +42,10 @@ function M.fetch_prs(cb)
       return
     end
 
-    local parsed, err = parse_json_lines(vim.split(res.stdout or "", "\n", { trimempty = true }))
-    if err then
+    local ok, parsed = pcall(vim.json.decode, res.stdout or "")
+    if not ok then
       vim.schedule(function()
-        notify("failed to parse JSON: " .. tostring(err), vim.log.levels.ERROR)
+        notify("failed to parse JSON: " .. tostring(parsed), vim.log.levels.ERROR)
       end)
       return
     end
@@ -104,10 +83,7 @@ local function ensure_list_buffer()
 end
 
 local function render_pr_lines(prs)
-  local lines = {
-    "Bitbucket Pull Requests",
-    "",
-  }
+  local lines = { "Bitbucket Pull Requests", "" }
 
   for _, pr in ipairs(prs) do
     local author = (((pr.author or {}).user or {}).displayName) or "unknown"
@@ -126,19 +102,14 @@ end
 function M.open_list(refresh)
   local buf = ensure_list_buffer()
 
-  local open_window = function()
-    if state.win and vim.api.nvim_win_is_valid(state.win) then
-      vim.api.nvim_set_current_win(state.win)
-      return
-    end
-
+  if not (state.win and vim.api.nvim_win_is_valid(state.win)) then
     vim.cmd("botright vnew")
     state.win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(state.win, buf)
     vim.api.nvim_win_set_width(state.win, 70)
+  else
+    vim.api.nvim_set_current_win(state.win)
   end
-
-  open_window()
 
   if refresh ~= false and #state.prs == 0 then
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "Loading PRs..." })
@@ -146,13 +117,12 @@ function M.open_list(refresh)
 
   M.fetch_prs(function(prs)
     state.prs = prs or {}
-    local lines = render_pr_lines(state.prs)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, render_pr_lines(state.prs))
   end)
 end
 
 function M.open_diff_for_pr(pr_id)
-  local pr = nil
+  local pr
   for _, item in ipairs(state.prs) do
     if item.id == pr_id then
       pr = item
@@ -167,7 +137,6 @@ function M.open_diff_for_pr(pr_id)
 
   local from_ref = ((pr.fromRef or {}).displayId)
   local to_ref = ((pr.toRef or {}).displayId)
-
   if not from_ref or not to_ref then
     notify("PR refs are missing for #" .. pr_id, vim.log.levels.ERROR)
     return
