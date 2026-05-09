@@ -2,12 +2,14 @@ local M = {}
 
 M.config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
+	comments_cmd = { "bb", "-json", "-pr-comments" },
 	diffview_cmd = "DiffviewOpen",
 }
 
 local state = {
 	prs = {},
 	pr_by_tab = {},
+	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 }
 
 local function tab_key(tabpage)
@@ -60,6 +62,101 @@ local function run_provider(cb)
 
 		cb(decoded)
 	end)
+end
+
+local function run_comments_provider(pr_id, cb)
+	local cmd = vim.deepcopy(M.config.comments_cmd)
+	table.insert(cmd, tostring(pr_id))
+
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: comments provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+
+		local ok, decoded = pcall(vim.json.decode, res.stdout)
+		if not ok or type(decoded) ~= "table" then
+			vim.schedule(function()
+				vim.notify("bb_pr: invalid PR comments JSON", vim.log.levels.ERROR)
+			end)
+			return
+		end
+
+		cb(decoded)
+	end)
+end
+
+local function split_first_line(text)
+	if type(text) ~= "string" or text == "" then
+		return "(empty)"
+	end
+	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
+end
+
+local function open_comment_float(comments, line)
+	local lines = { string.format("PR comments for line %d", line), "" }
+	for _, c in ipairs(comments) do
+		table.insert(lines, string.format("- %s @ %s", c.author or "unknown", c.created_at or "unknown time"))
+		for _, msg_line in ipairs(vim.split(c.text or "", "\n", { plain = true })) do
+			table.insert(lines, "  " .. msg_line)
+		end
+		table.insert(lines, "")
+	end
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].filetype = "markdown"
+
+	local width = math.floor(vim.o.columns * 0.6)
+	local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.5))
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = "BB PR Comments",
+		title_pos = "center",
+	})
+
+	vim.api.nvim_set_option_value("wrap", true, { win = win })
+	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+end
+
+local function apply_comments_to_current_buffer(comments_payload)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local file = vim.api.nvim_buf_get_name(bufnr)
+	local rel = vim.fn.fnamemodify(file, ":.")
+
+	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
+	local by_line = {}
+
+	for _, c in ipairs(comments_payload.file_comments or {}) do
+		if c.path == rel or rel:sub(-#(c.path or "")) == c.path then
+			local line = tonumber(c.line or 0)
+			if line > 0 then
+				by_line[line] = by_line[line] or {}
+				table.insert(by_line[line], c)
+			end
+		end
+	end
+
+	for line, line_comments in pairs(by_line) do
+		local preview = split_first_line(line_comments[1].text)
+		local vt = string.format("💬 %d %s", #line_comments, preview)
+		vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
+			virt_text = { { vt, "Comment" } },
+			virt_text_pos = "eol",
+		})
+	end
+
+	vim.b[bufnr].bb_pr_line_comments = by_line
+	vim.notify(string.format("bb_pr: loaded %d commented lines for %s", vim.tbl_count(by_line), rel))
 end
 
 local function build_lines(prs)
@@ -452,6 +549,34 @@ function M.setup(opts)
 
 		open_pr_info(pr)
 	end, { desc = "Show info for PR opened in current tab" })
+
+	vim.api.nvim_create_user_command("BBPRLoadComments", function()
+		local pr = get_current_tab_pr()
+		if not pr or not pr.id then
+			vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+			return
+		end
+
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				apply_comments_to_current_buffer(payload)
+			end)
+		end)
+	end, { desc = "Load PR comments and render virtual text in current buffer" })
+
+	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
+		local bufnr = vim.api.nvim_get_current_buf()
+		local line = vim.api.nvim_win_get_cursor(0)[1]
+		local by_line = vim.b[bufnr].bb_pr_line_comments or {}
+		local comments = by_line[line]
+		if not comments or #comments == 0 then
+			vim.notify("bb_pr: no comments on current line", vim.log.levels.INFO)
+			return
+		end
+		open_comment_float(comments, line)
+	end, { desc = "Open floating window with comments for current line" })
+
+	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
 end
 
 return M
