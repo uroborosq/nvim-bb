@@ -99,6 +99,70 @@ local function open_diffview(pr)
   end)
 end
 
+local function format_opened_date(ms)
+  if type(ms) ~= "number" or ms <= 0 then
+    return "unknown"
+  end
+
+  return os.date("%Y-%m-%d %H:%M:%S %Z", math.floor(ms / 1000))
+end
+
+local function build_approval_lines(pr)
+  local lines = {}
+  local reviewers = pr.reviewers or {}
+
+  if #reviewers == 0 then
+    return { "None" }
+  end
+
+  for _, reviewer in ipairs(reviewers) do
+    local user = reviewer.user or {}
+    local name = user.displayName or user.name or user.slug or "unknown"
+    local approved = reviewer.approved or reviewer.status == "APPROVED"
+    local status = approved and "approved" or (reviewer.status or "pending")
+    table.insert(lines, string.format("- %s (%s)", name, status))
+  end
+
+  return lines
+end
+
+local function open_pr_info(pr)
+  local info_lines = {
+    string.format("PR #%s", tostring(pr.id or "?")),
+    string.format("Title: %s", pr.title or ""),
+    string.format("Opened: %s", format_opened_date(pr.createdDate)),
+    "",
+    "Description:",
+    pr.description and pr.description ~= "" and pr.description or "(no description)",
+    "",
+    "Approvals:",
+  }
+
+  vim.list_extend(info_lines, build_approval_lines(pr))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+
+  local width = math.floor(vim.o.columns * 0.7)
+  local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
+
+  vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = "PR Info",
+    title_pos = "center",
+  })
+
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+end
+
 local function open_telescope_picker(prs)
   local ok_pickers, pickers = pcall(require, "telescope.pickers")
   local ok_finders, finders = pcall(require, "telescope.finders")
@@ -131,6 +195,14 @@ local function open_telescope_picker(prs)
           open_diffview(selection.value)
         end
       end)
+
+      actions.select_horizontal:replace(function()
+        local selection = action_state.get_selected_entry()
+        if selection and selection.value then
+          open_pr_info(selection.value)
+        end
+      end)
+
       return true
     end,
   }):find()
@@ -159,6 +231,15 @@ function M.open_list()
         local pr = state.prs[idx]
         if pr then
           open_diffview(pr)
+        end
+      end, { buffer = buf, silent = true })
+
+      vim.keymap.set("n", "i", function()
+        local line = vim.api.nvim_win_get_cursor(0)[1]
+        local idx = line - 2
+        local pr = state.prs[idx]
+        if pr then
+          open_pr_info(pr)
         end
       end, { buffer = buf, silent = true })
 
