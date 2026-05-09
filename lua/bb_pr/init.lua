@@ -7,7 +7,20 @@ M.config = {
 
 local state = {
   prs = {},
+  pr_by_tab = {},
 }
+
+local function tab_key(tabpage)
+  return tostring(tabpage)
+end
+
+local function set_current_tab_pr(pr)
+  state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = pr
+end
+
+local function get_current_tab_pr()
+  return state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
 
 local function format_pr_entry(pr)
   local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
@@ -67,6 +80,7 @@ local function open_diffview(pr)
 
   local function open_after_fetch()
     vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
+    set_current_tab_pr(pr)
   end
 
   local fetch_cmd = {
@@ -254,6 +268,16 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("BBPRList", function()
     M.open_list()
   end, { desc = "List active Bitbucket PRs" })
+
+  vim.api.nvim_create_user_command("BBPRInfo", function()
+    local pr = get_current_tab_pr()
+    if not pr then
+      vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+      return
+    end
+
+    open_pr_info(pr)
+  end, { desc = "Show info for PR opened in current tab" })
 end
 
 return M
