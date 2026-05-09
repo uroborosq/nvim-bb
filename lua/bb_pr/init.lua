@@ -219,25 +219,36 @@ local function open_pr_info(pr)
       return
     end
 
-    if type(markview.attach) == "function" then
-      if win then
-        pcall(vim.api.nvim_win_call, win, function()
-          pcall(markview.attach, buf)
-        end)
-      else
-        pcall(markview.attach, buf)
+    local function try_attach()
+      if type(markview.attach) == "function" then
+        if pcall(markview.attach) then
+          return true
+        end
+        if pcall(markview.attach, buf) then
+          return true
+        end
       end
-      return
+
+      if type(markview.enable) == "function" then
+        if pcall(markview.enable) then
+          return true
+        end
+        if pcall(markview.enable, buf) then
+          return true
+        end
+      end
+
+      return false
     end
 
-    if type(markview.enable) == "function" then
-      if win then
+    if win then
+      vim.schedule(function()
         pcall(vim.api.nvim_win_call, win, function()
-          pcall(markview.enable, buf)
+          try_attach()
         end)
-      else
-        pcall(markview.enable, buf)
-      end
+      end)
+    else
+      try_attach()
     end
   end
 
