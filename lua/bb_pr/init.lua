@@ -117,6 +117,33 @@ local function as_array(value)
 	return {}
 end
 
+local function normalize_repo_path(path)
+	if type(path) ~= "string" then
+		return ""
+	end
+
+	local p = path:gsub("\\", "/")
+	p = p:gsub("^%./", "")
+	p = p:gsub("^a/", "")
+	p = p:gsub("^b/", "")
+	p = p:gsub("^/", "")
+	return p
+end
+
+local function path_matches(current_file, anchor_path)
+	local cur = normalize_repo_path(current_file)
+	local anc = normalize_repo_path(anchor_path)
+	if anc == "" or cur == "" then
+		return false
+	end
+
+	if cur == anc then
+		return true
+	end
+
+	return cur:sub(-#anc) == anc
+end
+
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
 	for _, c in ipairs(comments) do
@@ -154,12 +181,13 @@ apply_comments_to_current_buffer = function(comments_payload)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local file = vim.api.nvim_buf_get_name(bufnr)
 	local rel = vim.fn.fnamemodify(file, ":.")
+	local rel_norm = normalize_repo_path(rel)
 
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
 
 	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
-		if c.path == rel or rel:sub(-#(c.path or "")) == c.path then
+		if path_matches(rel_norm, c.path) then
 			local line = tonumber(c.line or 0)
 			if line > 0 then
 				by_line[line] = by_line[line] or {}
