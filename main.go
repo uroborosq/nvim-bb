@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const configPath = "config.json"
+const configPath = "/etc/bb/config.json"
 
 type Config struct {
 	BaseURL string `json:"base_url"`
