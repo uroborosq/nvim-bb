@@ -267,6 +267,7 @@ local function open_pr_info(pr)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
   vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+  vim.diagnostic.disable(buf)
 
   local width = math.floor(vim.o.columns * 0.7)
   local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
