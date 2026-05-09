@@ -214,13 +214,25 @@ end
 
 local function open_pr_info(pr)
   local function enable_markview(buf, win)
-    local ok, markview = pcall(require, "markview")
-    if not ok or not markview then
+    local markview = nil
+    local commands = nil
+    do
+      local ok_markview, mod_markview = pcall(require, "markview")
+      if ok_markview then
+        markview = mod_markview
+      end
+      local ok_commands, mod_commands = pcall(require, "markview.commands")
+      if ok_commands then
+        commands = mod_commands
+      end
+    end
+
+    if not markview and not commands then
       return
     end
 
     local function try_attach()
-      if type(markview.attach) == "function" then
+      if markview and type(markview.attach) == "function" then
         if pcall(markview.attach) then
           return true
         end
@@ -229,11 +241,20 @@ local function open_pr_info(pr)
         end
       end
 
-      if type(markview.enable) == "function" then
+      if markview and type(markview.enable) == "function" then
         if pcall(markview.enable) then
           return true
         end
         if pcall(markview.enable, buf) then
+          return true
+        end
+      end
+
+      if commands and type(commands.attach) == "function" then
+        if pcall(commands.attach, buf) then
+          return true
+        end
+        if pcall(commands.attach) then
           return true
         end
       end
