@@ -134,6 +134,20 @@ type PRComment struct {
 	Author User `json:"author"`
 }
 
+type ActivityPage struct {
+	Size          int        `json:"size"`
+	Limit         int        `json:"limit"`
+	IsLastPage    bool       `json:"isLastPage"`
+	Start         int        `json:"start"`
+	NextPageStart int        `json:"nextPageStart"`
+	Values        []Activity `json:"values"`
+}
+
+type Activity struct {
+	Action  string     `json:"action"`
+	Comment *PRComment `json:"comment"`
+}
+
 type PRCommentView struct {
 	ID            int64  `json:"id"`
 	Text          string `json:"text"`
@@ -396,12 +410,16 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	start := 0
 
 	for {
-		page, err := c.fetchPullRequestCommentPage(ctx, prID, start)
+		page, err := c.fetchPullRequestActivityPage(ctx, prID, start)
 		if err != nil {
 			return nil, err
 		}
 
-		all = append(all, page.Values...)
+		for _, activity := range page.Values {
+			if activity.Comment != nil {
+				all = append(all, *activity.Comment)
+			}
+		}
 
 		if page.IsLastPage {
 			break
@@ -447,10 +465,10 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func (c *Client) fetchPullRequestCommentPage(ctx context.Context, prID int64, start int) (*CommentPage, error) {
+func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
 	u := *c.baseURL
 	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
-		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments",
+		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/activities",
 		url.PathEscape(c.cfg.Project),
 		url.PathEscape(c.cfg.Repo),
 		prID,
@@ -485,9 +503,9 @@ func (c *Client) fetchPullRequestCommentPage(ctx context.Context, prID int64, st
 		)
 	}
 
-	var page CommentPage
+	var page ActivityPage
 	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-		return nil, fmt.Errorf("decode Bitbucket comments response: %w", err)
+		return nil, fmt.Errorf("decode Bitbucket activities response: %w", err)
 	}
 
 	return &page, nil
