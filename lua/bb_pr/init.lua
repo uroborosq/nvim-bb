@@ -213,7 +213,13 @@ local function build_approval_lines(pr)
 end
 
 local function open_pr_info(pr)
-  local function enable_markview(buf)
+  local function enable_markview(buf, win)
+    if win then
+      pcall(vim.api.nvim_win_call, win, function()
+        vim.cmd("silent! Markview attach")
+      end)
+    end
+
     local ok, markview = pcall(require, "markview")
     if not ok or not markview then
       return
@@ -255,7 +261,6 @@ local function open_pr_info(pr)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
   vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-  enable_markview(buf)
 
   local width = math.floor(vim.o.columns * 0.7)
   local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
@@ -274,6 +279,7 @@ local function open_pr_info(pr)
 
   vim.api.nvim_set_option_value("wrap", true, { win = win })
   vim.api.nvim_set_option_value("linebreak", true, { win = win })
+  enable_markview(buf, win)
 
   vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
