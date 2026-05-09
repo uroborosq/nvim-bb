@@ -129,12 +129,64 @@ local function build_approval_lines(pr)
     return { "None" }
   end
 
+  local grouped = {}
+  local order = { "approved", "unapproved", "needs_work", "pending" }
+
+  local function normalize_status(reviewer)
+    if reviewer.approved or reviewer.status == "APPROVED" then
+      return "approved"
+    end
+
+    local raw = type(reviewer.status) == "string" and string.lower(reviewer.status) or ""
+    if raw == "needs_work" then
+      return "needs_work"
+    end
+    if raw == "unapproved" then
+      return "unapproved"
+    end
+    if raw == "" then
+      return "pending"
+    end
+
+    return raw
+  end
+
   for _, reviewer in ipairs(reviewers) do
     local user = reviewer.user or {}
     local name = user.displayName or user.name or user.slug or "unknown"
-    local approved = reviewer.approved or reviewer.status == "APPROVED"
-    local status = approved and "approved" or (reviewer.status or "pending")
-    table.insert(lines, string.format("- %s (%s)", name, status))
+    local status = normalize_status(reviewer)
+    grouped[status] = grouped[status] or {}
+    table.insert(grouped[status], name)
+  end
+
+  local emitted = {}
+  for _, status in ipairs(order) do
+    local names = grouped[status]
+    if names and #names > 0 then
+      table.sort(names)
+      table.insert(lines, status .. ":")
+      for _, name in ipairs(names) do
+        table.insert(lines, "- " .. name)
+      end
+      emitted[status] = true
+    end
+  end
+
+  local remaining_statuses = {}
+  for status, _ in pairs(grouped) do
+    if not emitted[status] then
+      table.insert(remaining_statuses, status)
+    end
+  end
+  table.sort(remaining_statuses)
+
+  for _, status in ipairs(remaining_statuses) do
+    local names = grouped[status]
+    table.sort(names)
+    table.insert(lines, status .. ":")
+    for _, name in ipairs(names) do
+      table.insert(lines, "- " .. name)
+    end
   end
 
   return lines
