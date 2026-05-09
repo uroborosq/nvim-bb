@@ -65,7 +65,38 @@ local function open_diffview(pr)
     return
   end
 
-  vim.cmd(string.format("%s %s...%s", M.config.diffview_cmd, to_ref, from_ref))
+  local function open_after_fetch()
+    vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
+  end
+
+  local fetch_cmd = {
+    "git",
+    "fetch",
+    "origin",
+    "+refs/heads/" .. to_ref .. ":refs/remotes/origin/" .. to_ref,
+    "+refs/heads/" .. from_ref .. ":refs/remotes/origin/" .. from_ref,
+  }
+
+  vim.system(fetch_cmd, { text = true }, function(fetch_res)
+    if fetch_res.code ~= 0 then
+      vim.schedule(function()
+        vim.notify("bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""), vim.log.levels.ERROR)
+      end)
+      return
+    end
+
+    -- Match Bitbucket's merge check by trying a temporary merge of target into source.
+    local merge_check_cmd = {
+      "git",
+      "merge-tree",
+      "origin/" .. to_ref,
+      "origin/" .. from_ref,
+    }
+
+    vim.system(merge_check_cmd, { text = true }, function(_)
+      vim.schedule(open_after_fetch)
+    end)
+  end)
 end
 
 local function open_telescope_picker(prs)
