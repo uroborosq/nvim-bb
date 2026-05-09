@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-const configPath = "config.json"
-
 type Config struct {
 	BaseURL string `json:"base_url"`
 	Project string `json:"project"`
@@ -114,9 +112,10 @@ type User struct {
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
+	configPath := flag.String("config", "config.json", "path to config")
 	flag.Parse()
 
-	cfg, err := LoadConfig(configPath)
+	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -369,7 +368,7 @@ func (c *Client) fetchRepoPRPage(ctx context.Context, start int) (*PRPage, error
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 
 		return nil, fmt.Errorf(
-			"Bitbucket returned %s: %s",
+			"BitBucket returned %s: %s",
 			resp.Status,
 			strings.TrimSpace(string(body)),
 		)
