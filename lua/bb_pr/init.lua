@@ -149,6 +149,72 @@ local function path_matches(current_file, anchor_path)
 	return cur:sub(-#anc) == anc
 end
 
+local function enable_markview(buf, win)
+	local markview = nil
+	local commands = nil
+	do
+		local ok_markview, mod_markview = pcall(require, "markview")
+		if ok_markview then
+			markview = mod_markview
+		end
+		local ok_commands, mod_commands = pcall(require, "markview.commands")
+		if ok_commands then
+			commands = mod_commands
+		end
+	end
+
+	if not markview and not commands then
+		return
+	end
+
+	local function try_attach()
+		if markview and type(markview.attach) == "function" then
+			if pcall(markview.attach) then
+				return true
+			end
+			if pcall(markview.attach, buf) then
+				return true
+			end
+		end
+
+		if markview and type(markview.enable) == "function" then
+			if pcall(markview.enable) then
+				return true
+			end
+			if pcall(markview.enable, buf) then
+				return true
+			end
+		end
+
+		if commands and type(commands.attach) == "function" then
+			if pcall(commands.attach, buf) then
+				return true
+			end
+			if pcall(commands.attach) then
+				return true
+			end
+		end
+
+		return false
+	end
+
+	if win then
+		vim.schedule(function()
+			pcall(vim.api.nvim_win_call, win, function()
+				local ok_attach = try_attach()
+				if not ok_attach then
+					vim.cmd("silent! Markview attach")
+				end
+			end)
+		end)
+	else
+		local ok_attach = try_attach()
+		if not ok_attach then
+			vim.cmd("silent! Markview attach")
+		end
+	end
+end
+
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
 		for idx, c in ipairs(comments) do
@@ -177,6 +243,7 @@ local function open_comment_float(comments, line)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].filetype = "markdown"
+	vim.diagnostic.enable(false, { bufnr = buf })
 
 	local width = math.floor(vim.o.columns * 0.6)
 	local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.5))
@@ -193,6 +260,8 @@ local function open_comment_float(comments, line)
 	})
 
 	vim.api.nvim_set_option_value("wrap", true, { win = win })
+	vim.api.nvim_set_option_value("linebreak", true, { win = win })
+	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
 
@@ -406,72 +475,6 @@ local function build_approval_lines(pr)
 end
 
 local function open_pr_info(pr)
-	local function enable_markview(buf, win)
-		local markview = nil
-		local commands = nil
-		do
-			local ok_markview, mod_markview = pcall(require, "markview")
-			if ok_markview then
-				markview = mod_markview
-			end
-			local ok_commands, mod_commands = pcall(require, "markview.commands")
-			if ok_commands then
-				commands = mod_commands
-			end
-		end
-
-		if not markview and not commands then
-			return
-		end
-
-		local function try_attach()
-			if markview and type(markview.attach) == "function" then
-				if pcall(markview.attach) then
-					return true
-				end
-				if pcall(markview.attach, buf) then
-					return true
-				end
-			end
-
-			if markview and type(markview.enable) == "function" then
-				if pcall(markview.enable) then
-					return true
-				end
-				if pcall(markview.enable, buf) then
-					return true
-				end
-			end
-
-			if commands and type(commands.attach) == "function" then
-				if pcall(commands.attach, buf) then
-					return true
-				end
-				if pcall(commands.attach) then
-					return true
-				end
-			end
-
-			return false
-		end
-
-		if win then
-			vim.schedule(function()
-				pcall(vim.api.nvim_win_call, win, function()
-					local ok_attach = try_attach()
-					if not ok_attach then
-						vim.cmd("silent! Markview attach")
-					end
-				end)
-			end)
-		else
-			local ok_attach = try_attach()
-			if not ok_attach then
-				vim.cmd("silent! Markview attach")
-			end
-		end
-	end
-
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
 			return { "(no description)" }
