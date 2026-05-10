@@ -205,6 +205,8 @@ apply_comments_to_current_buffer = function(comments_payload)
 		local preview = split_first_line(line_comments[1].text)
 		local vt = string.format("💬 %d %s", #line_comments, preview)
 		vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
+			sign_text = "💬",
+			sign_hl_group = "Comment",
 			virt_text = { { vt, "Comment" } },
 			virt_text_pos = "eol",
 		})
