@@ -298,9 +298,13 @@ end
 
 apply_comments_to_current_buffer = function(comments_payload)
 	local bufnr = vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+		return
+	end
 	local file = vim.api.nvim_buf_get_name(bufnr)
 	local rel = vim.fn.fnamemodify(file, ":.")
 	local rel_norm = normalize_repo_path(rel)
+	local line_count = vim.api.nvim_buf_line_count(bufnr)
 
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
@@ -316,15 +320,17 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 
 	for line, line_comments in pairs(by_line) do
-		local preview = split_first_line(line_comments[1].text)
-		local vt = string.format("💬 %d %s", #line_comments, preview)
-		vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
-			sign_text = "💬",
-			sign_hl_group = "DiagnosticSignInfo",
-			virt_text = { { vt, "DiagnosticVirtualTextInfo" } },
-			virt_text_pos = "eol",
-		})
-		vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, "Underlined", line - 1, 0, -1)
+		if line > 0 and line <= line_count then
+			local preview = split_first_line(line_comments[1].text)
+			local vt = string.format("💬 %d %s", #line_comments, preview)
+			vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
+				sign_text = "💬",
+				sign_hl_group = "DiagnosticSignInfo",
+				virt_text = { { vt, "DiagnosticVirtualTextInfo" } },
+				virt_text_pos = "eol",
+			})
+			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, "Underlined", line - 1, 0, -1)
+		end
 	end
 
 	vim.b[bufnr].bb_pr_line_comments = by_line
