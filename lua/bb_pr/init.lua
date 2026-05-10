@@ -149,6 +149,75 @@ local function path_matches(current_file, anchor_path)
 	return cur:sub(-#anc) == anc
 end
 
+local function current_diff_side()
+	local win = vim.api.nvim_get_current_win()
+	if not vim.api.nvim_win_is_valid(win) then
+		return "single"
+	end
+	if not vim.wo[win].diff then
+		return "single"
+	end
+
+	local tab_wins = vim.api.nvim_tabpage_list_wins(0)
+	local diff_wins = {}
+	for _, w in ipairs(tab_wins) do
+		if vim.api.nvim_win_is_valid(w) and vim.wo[w].diff then
+			table.insert(diff_wins, w)
+		end
+	end
+	if #diff_wins < 2 then
+		return "single"
+	end
+
+	table.sort(diff_wins, function(a, b)
+		local pa = vim.api.nvim_win_get_position(a)
+		local pb = vim.api.nvim_win_get_position(b)
+		if pa[1] == pb[1] then
+			return pa[2] < pb[2]
+		end
+		return pa[1] < pb[1]
+	end)
+
+	if win == diff_wins[1] then
+		return "left"
+	end
+	if win == diff_wins[#diff_wins] then
+		return "right"
+	end
+	return "single"
+end
+
+local function comment_matches_side(c, side)
+	if side == "single" then
+		return true
+	end
+
+	local file_type = tostring(c.file_type or ""):upper()
+	local line_type = tostring(c.line_type or ""):upper()
+
+	if side == "left" then
+		if file_type == "FROM" then
+			return true
+		end
+		if line_type == "REMOVED" then
+			return true
+		end
+		return false
+	end
+
+	if side == "right" then
+		if file_type == "TO" or file_type == "" then
+			return true
+		end
+		if line_type == "ADDED" or line_type == "CONTEXT" then
+			return true
+		end
+		return false
+	end
+
+	return true
+end
+
 local function enable_markview(buf, win)
 	local markview = nil
 	local commands = nil
@@ -305,13 +374,14 @@ apply_comments_to_current_buffer = function(comments_payload)
 	local rel = vim.fn.fnamemodify(file, ":.")
 	local rel_norm = normalize_repo_path(rel)
 	local line_count = vim.api.nvim_buf_line_count(bufnr)
+	local side = current_diff_side()
 
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
 	local seen_comment_ids = {}
 
 	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
-		if path_matches(rel_norm, c.path) then
+		if path_matches(rel_norm, c.path) and comment_matches_side(c, side) then
 			local cid = tonumber(c.id or 0) or 0
 			if cid > 0 and seen_comment_ids[cid] then
 				goto continue
