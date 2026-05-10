@@ -138,6 +138,84 @@ type Anchor struct {
 	DiffType string `json:"diffType"`
 }
 
+func (a *Anchor) UnmarshalJSON(data []byte) error {
+	type alias Anchor
+	var direct alias
+	if err := json.Unmarshal(data, &direct); err == nil {
+		*a = Anchor(direct)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if a.Path == "" {
+		a.Path = pickString(raw, "path", "srcPath", "file", "filePath")
+		if a.Path == "" {
+			if p := pickNestedString(raw, "path", "toString"); p != "" {
+				a.Path = p
+			}
+		}
+	}
+	if a.Line == 0 {
+		a.Line = pickInt(raw, "line", "lineNumber", "line_num", "fromLine", "toLine")
+	}
+	if a.LineType == "" {
+		a.LineType = pickString(raw, "lineType")
+	}
+	if a.FileType == "" {
+		a.FileType = pickString(raw, "fileType")
+	}
+	if a.DiffType == "" {
+		a.DiffType = pickString(raw, "diffType")
+	}
+
+	return nil
+}
+
+func pickString(raw map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func pickNestedString(raw map[string]any, k1, k2 string) string {
+	v, ok := raw[k1]
+	if !ok {
+		return ""
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m[k2].(string)
+	return s
+}
+
+func pickInt(raw map[string]any, keys ...string) int {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				if int(n) != 0 {
+					return int(n)
+				}
+			case int:
+				if n != 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
 type ActivityPage struct {
 	Size          int        `json:"size"`
 	Limit         int        `json:"limit"`
