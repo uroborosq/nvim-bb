@@ -269,8 +269,11 @@ local function open_comment_float(comments, line)
 	vim.bo[buf].filetype = "markdown"
 	vim.diagnostic.enable(false, { bufnr = buf })
 
-	local width = math.floor(vim.o.columns * 0.6)
-	local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.5))
+	local base_win = vim.api.nvim_get_current_win()
+	local base_width = vim.api.nvim_win_get_width(base_win)
+	local base_height = vim.api.nvim_win_get_height(base_win)
+	local width = math.max(80, math.floor(base_width * 0.85))
+	local height = math.min(#lines + 2, math.max(12, math.floor(base_height * 0.8)))
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		width = width,
