@@ -216,6 +216,24 @@ local function enable_markview(buf, win)
 end
 
 local function open_comment_float(comments, line)
+	local function trim_edge_empty_lines(items)
+		local first = 1
+		local last = #items
+
+		while first <= last and (items[first] or ""):match("^%s*$") do
+			first = first + 1
+		end
+		while last >= first and (items[last] or ""):match("^%s*$") do
+			last = last - 1
+		end
+
+		local out = {}
+		for i = first, last do
+			table.insert(out, items[i])
+		end
+		return out
+	end
+
 	local lines = { string.format("PR comments for line %d", line), "" }
 	for idx, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
@@ -235,9 +253,15 @@ local function open_comment_float(comments, line)
 			header = header .. string.format(" ↳ reply to #%d", reply_to)
 		end
 		table.insert(lines, header)
-		for _, msg_line in ipairs(vim.split(c.text or "", "\n", { plain = true })) do
+		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
+		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, indent .. "  " .. msg_line)
 		end
+		table.insert(lines, "")
+	end
+
+	if lines[#lines] ~= "" then
+		table.insert(lines, "")
 	end
 
 	local buf = vim.api.nvim_create_buf(false, true)
