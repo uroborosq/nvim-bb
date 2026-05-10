@@ -798,15 +798,15 @@ function M.setup(opts)
 	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
-	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
 		group = aug,
 		callback = function()
-				local payload = get_current_tab_comments()
-				if payload then
-					apply_comments_to_tab_windows(payload)
-				end
-			end,
-		})
+			local payload = get_current_tab_comments()
+			if payload then
+				apply_comments_to_tab_windows(payload)
+			end
+		end,
+	})
 end
 
 return M
