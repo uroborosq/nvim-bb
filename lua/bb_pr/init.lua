@@ -157,6 +157,7 @@ local function current_diff_side()
 		return "single"
 	end
 	if not vim.wo[win].diff then
+		vim.notify("single", "nodiff")
 		return "single"
 	end
 
@@ -168,6 +169,7 @@ local function current_diff_side()
 		end
 	end
 	if #diff_wins < 2 then
+		vim.notify("a")
 		return "single"
 	end
 
