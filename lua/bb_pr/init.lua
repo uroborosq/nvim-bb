@@ -151,11 +151,18 @@ end
 
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
-	for _, c in ipairs(comments) do
+	for idx, c in ipairs(comments) do
+		if idx > 1 then
+			table.insert(lines, "---")
+		end
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
+		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
 		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
+		if comment_id > 0 then
+			header = header .. string.format(" (#%d)", comment_id)
+		end
 		if reply_to > 0 then
 			header = header .. string.format(" ↳ reply to #%d", reply_to)
 		end
@@ -163,7 +170,6 @@ local function open_comment_float(comments, line)
 		for _, msg_line in ipairs(vim.split(c.text or "", "\n", { plain = true })) do
 			table.insert(lines, indent .. "  " .. msg_line)
 		end
-		table.insert(lines, "")
 	end
 
 	local buf = vim.api.nvim_create_buf(false, true)
