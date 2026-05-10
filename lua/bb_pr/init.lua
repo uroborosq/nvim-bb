@@ -478,12 +478,9 @@ local function open_diffview(pr)
 			run_comments_provider(pr.id, function(payload)
 				vim.schedule(function()
 					set_current_tab_comments(payload)
-					-- Diffview may still be finalizing initial window layout right after
-					-- opening a PR. Defer the first render so side detection is stable
-					-- and we don't paint both old/new markers on initial load.
-					vim.defer_fn(function()
-						apply_comments_to_tab_windows(payload)
-					end, 120)
+					-- Do not render immediately on PR open: Diffview may still be
+					-- building windows and side detection can be incorrect at this
+					-- moment. Rendering is performed by navigation autocmds.
 				end)
 			end, { notify_errors = false })
 		end
