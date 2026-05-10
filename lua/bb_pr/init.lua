@@ -204,13 +204,14 @@ apply_comments_to_current_buffer = function(comments_payload)
 	for line, line_comments in pairs(by_line) do
 		local preview = split_first_line(line_comments[1].text)
 		local vt = string.format("💬 %d %s", #line_comments, preview)
-			vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
-				sign_text = "💬",
-				sign_hl_group = "DiagnosticSignInfo",
-				virt_text = { { vt, "DiagnosticVirtualTextInfo" } },
-				virt_text_pos = "eol",
-			})
-		end
+		vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
+			sign_text = "💬",
+			sign_hl_group = "DiagnosticSignInfo",
+			virt_text = { { vt, "DiagnosticVirtualTextInfo" } },
+			virt_text_pos = "eol",
+		})
+		vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, "Underlined", line - 1, 0, -1)
+	end
 
 	vim.b[bufnr].bb_pr_line_comments = by_line
 end
