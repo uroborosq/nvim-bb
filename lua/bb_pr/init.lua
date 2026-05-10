@@ -69,23 +69,28 @@ end
 
 local apply_comments_to_current_buffer
 
-local function run_comments_provider(pr_id, cb)
+local function run_comments_provider(pr_id, cb, opts)
+	opts = opts or {}
 	local cmd = vim.deepcopy(M.config.comments_cmd)
 	table.insert(cmd, tostring(pr_id))
 
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: comments provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
+			if opts.notify_errors ~= false then
+				vim.schedule(function()
+					vim.notify("bb_pr: comments provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+			end
 			return
 		end
 
 		local ok, decoded = pcall(vim.json.decode, res.stdout)
 		if not ok or type(decoded) ~= "table" then
-			vim.schedule(function()
-				vim.notify("bb_pr: invalid PR comments JSON", vim.log.levels.ERROR)
-			end)
+			if opts.notify_errors ~= false then
+				vim.schedule(function()
+					vim.notify("bb_pr: invalid PR comments JSON", vim.log.levels.ERROR)
+				end)
+			end
 			return
 		end
 
@@ -206,7 +211,6 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 
 	vim.b[bufnr].bb_pr_line_comments = by_line
-	vim.notify(string.format("bb_pr: loaded %d commented lines for %s", vim.tbl_count(by_line), rel))
 end
 
 local function build_lines(prs)
@@ -252,7 +256,7 @@ local function open_diffview(pr)
 				set_current_tab_comments(payload)
 				apply_comments_to_current_buffer(payload)
 			end)
-		end)
+		end, { notify_errors = false })
 	end
 
 	local fetch_cmd = {
