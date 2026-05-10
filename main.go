@@ -120,10 +120,10 @@ type CommentPage struct {
 }
 
 type PRComment struct {
-	ID          int64  `json:"id"`
-	Text        string `json:"text"`
-	CreatedDate int64  `json:"createdDate"`
-	UpdatedDate int64  `json:"updatedDate"`
+	ID            int64       `json:"id"`
+	Text          string      `json:"text"`
+	CreatedDate   int64       `json:"createdDate"`
+	UpdatedDate   int64       `json:"updatedDate"`
 	Anchor        *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
@@ -228,6 +228,7 @@ type ActivityPage struct {
 type Activity struct {
 	Action        string          `json:"action"`
 	Anchor        *Anchor         `json:"anchor,omitempty"`
+	CommentAnchor *Anchor         `json:"commentAnchor,omitempty"`
 	CommentAction json.RawMessage `json:"commentAction,omitempty"`
 	Comment       *PRComment      `json:"comment"`
 }
@@ -506,7 +507,13 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 					root.Anchor = commentActionAnchor
 				}
 				if root.Anchor == nil {
+					root.Anchor = root.CommentAnchor
+				}
+				if root.Anchor == nil {
 					root.Anchor = activity.Anchor
+				}
+				if root.Anchor == nil {
+					root.Anchor = activity.CommentAnchor
 				}
 				all = append(all, flattenCommentTree(*root)...)
 			}
@@ -566,6 +573,7 @@ func flattenCommentTree(root PRComment) []PRComment {
 	for _, child := range root.Comments {
 		if child.Anchor == nil && child.CommentAnchor == nil {
 			child.Anchor = root.Anchor
+			child.CommentAnchor = root.CommentAnchor
 		}
 		out = append(out, flattenCommentTree(child)...)
 	}
