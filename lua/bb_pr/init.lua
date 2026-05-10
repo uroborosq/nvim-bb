@@ -217,13 +217,13 @@ end
 
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
-		for idx, c in ipairs(comments) do
-			if idx > 1 then
-				table.insert(lines, "---")
-				table.insert(lines, "")
-			end
+	for idx, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
+		if idx > 1 then
+			table.insert(lines, indent .. "---")
+			table.insert(lines, "")
+		end
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
 		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
