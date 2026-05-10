@@ -192,6 +192,8 @@ local function current_diff_side()
 	end
 
 	if not cur_col or min_col == max_col then
+		vim.notify("akkk")
+
 		return "single"
 	end
 
