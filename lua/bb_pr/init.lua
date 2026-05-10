@@ -453,13 +453,15 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_to_current_buffer(payload)
-			end)
-		end, { notify_errors = false })
-	end
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					-- Let BufEnter/BufWinEnter apply comments once Diffview finishes
+					-- creating/focusing side-specific buffers. Applying too early can
+					-- classify the side as "single" and cause duplicate markers.
+				end)
+			end, { notify_errors = false })
+		end
 
 	local fetch_cmd = {
 		"git",
