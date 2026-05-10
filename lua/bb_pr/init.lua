@@ -170,22 +170,33 @@ local function current_diff_side()
 		return "single"
 	end
 
-	table.sort(diff_wins, function(a, b)
-		local pa = vim.api.nvim_win_get_position(a)
-		local pb = vim.api.nvim_win_get_position(b)
-		if pa[1] == pb[1] then
-			return pa[2] < pb[2]
-		end
-		return pa[1] < pb[1]
-	end)
+	local min_col = math.huge
+	local max_col = -math.huge
+	local cur_col = nil
 
-	if win == diff_wins[1] then
+	for _, w in ipairs(diff_wins) do
+		local pos = vim.api.nvim_win_get_position(w)
+		local col = pos[2]
+		if col < min_col then
+			min_col = col
+		end
+		if col > max_col then
+			max_col = col
+		end
+		if w == win then
+			cur_col = col
+		end
+	end
+
+	if not cur_col or min_col == max_col then
+		return "single"
+	end
+
+	local mid = (min_col + max_col) / 2
+	if cur_col <= mid then
 		return "left"
 	end
-	if win == diff_wins[#diff_wins] then
-		return "right"
-	end
-	return "single"
+	return "right"
 end
 
 local function comment_matches_side(c, side)
