@@ -153,6 +153,7 @@ end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
+		vim.notify("single")
 		return "single"
 	end
 	if not vim.wo[win].diff then
@@ -475,15 +476,13 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
-			run_comments_provider(pr.id, function(payload)
-				vim.schedule(function()
-					set_current_tab_comments(payload)
-					-- Do not render immediately on PR open: Diffview may still be
-					-- building windows and side detection can be incorrect at this
-					-- moment. Rendering is performed by navigation autocmds.
-				end)
-			end, { notify_errors = false })
-		end
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_to_tab_windows(payload)
+			end)
+		end, { notify_errors = false })
+	end
 
 	local fetch_cmd = {
 		"git",
@@ -777,12 +776,12 @@ function M.setup(opts)
 			return
 		end
 
-			run_comments_provider(pr.id, function(payload)
-				vim.schedule(function()
-					set_current_tab_comments(payload)
-					apply_comments_to_tab_windows(payload)
-				end)
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_to_tab_windows(payload)
 			end)
+		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
 
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
@@ -797,7 +796,12 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
-	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
+	vim.keymap.set(
+		"n",
+		"gc",
+		"<cmd>BBPROpenLineComments<CR>",
+		{ desc = "Open PR comments for current line", silent = true }
+	)
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
