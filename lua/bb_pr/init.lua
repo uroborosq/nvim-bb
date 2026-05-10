@@ -68,6 +68,7 @@ local function run_provider(cb)
 end
 
 local apply_comments_to_current_buffer
+local apply_comments_to_tab_windows
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -415,6 +416,16 @@ apply_comments_to_current_buffer = function(comments_payload)
 	vim.b[bufnr].bb_pr_line_comments = by_line
 end
 
+apply_comments_to_tab_windows = function(comments_payload)
+	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+		if vim.api.nvim_win_is_valid(win) then
+			pcall(vim.api.nvim_win_call, win, function()
+				apply_comments_to_current_buffer(comments_payload)
+			end)
+		end
+	end
+end
+
 local function build_lines(prs)
 	local lines = {
 		"ID  STATE    AUTHOR               FROM -> TO           TITLE",
@@ -456,9 +467,7 @@ local function open_diffview(pr)
 			run_comments_provider(pr.id, function(payload)
 				vim.schedule(function()
 					set_current_tab_comments(payload)
-					-- Let BufEnter/BufWinEnter apply comments once Diffview finishes
-					-- creating/focusing side-specific buffers. Applying too early can
-					-- classify the side as "single" and cause duplicate markers.
+					apply_comments_to_tab_windows(payload)
 				end)
 			end, { notify_errors = false })
 		end
@@ -755,12 +764,12 @@ function M.setup(opts)
 			return
 		end
 
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_to_current_buffer(payload)
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					apply_comments_to_tab_windows(payload)
+				end)
 			end)
-		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
 
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
@@ -781,12 +790,12 @@ function M.setup(opts)
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
 		group = aug,
 		callback = function()
-			local payload = get_current_tab_comments()
-			if payload then
-				apply_comments_to_current_buffer(payload)
-			end
-		end,
-	})
+				local payload = get_current_tab_comments()
+				if payload then
+					apply_comments_to_tab_windows(payload)
+				end
+			end,
+		})
 end
 
 return M
