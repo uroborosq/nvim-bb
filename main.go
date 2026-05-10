@@ -226,11 +226,11 @@ type ActivityPage struct {
 }
 
 type Activity struct {
-	Action        string          `json:"action"`
-	Anchor        *Anchor         `json:"anchor,omitempty"`
-	CommentAnchor *Anchor         `json:"commentAnchor,omitempty"`
-	CommentAction json.RawMessage `json:"commentAction,omitempty"`
-	Comment       *PRComment      `json:"comment"`
+	Action        string     `json:"action"`
+	Anchor        *Anchor    `json:"anchor,omitempty"`
+	CommentAnchor *Anchor    `json:"commentAnchor,omitempty"`
+	CommentAction string     `json:"commentAction,omitempty"`
+	Comment       *PRComment `json:"comment"`
 }
 
 type PRCommentView struct {
@@ -501,11 +501,8 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 
 		for _, activity := range page.Values {
-			root, commentActionAnchor := extractActivityComment(activity)
+			root := extractActivityComment(activity)
 			if root != nil {
-				if root.Anchor == nil {
-					root.Anchor = commentActionAnchor
-				}
 				if root.Anchor == nil {
 					root.Anchor = root.CommentAnchor
 				}
@@ -580,24 +577,11 @@ func flattenCommentTree(root PRComment) []PRComment {
 	return out
 }
 
-func extractActivityComment(activity Activity) (*PRComment, *Anchor) {
+func extractActivityComment(activity Activity) *PRComment {
 	if activity.Comment != nil {
-		return activity.Comment, nil
+		return activity.Comment
 	}
-
-	if len(activity.CommentAction) == 0 {
-		return nil, nil
-	}
-
-	var actionObj struct {
-		Comment *PRComment `json:"comment"`
-		Anchor  *Anchor    `json:"anchor,omitempty"`
-	}
-	if err := json.Unmarshal(activity.CommentAction, &actionObj); err == nil && actionObj.Comment != nil {
-		return actionObj.Comment, actionObj.Anchor
-	}
-
-	return nil, nil
+	return nil
 }
 
 func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
