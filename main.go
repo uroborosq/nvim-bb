@@ -235,6 +235,8 @@ type Activity struct {
 
 type PRCommentView struct {
 	ID            int64  `json:"id"`
+	ParentID      int64  `json:"parent_id,omitempty"`
+	Depth         int    `json:"depth,omitempty"`
 	Text          string `json:"text"`
 	Author        string `json:"author"`
 	CreatedDate   int64  `json:"created_date_ms"`
@@ -254,6 +256,12 @@ type PullRequestComments struct {
 	FetchedAt        string          `json:"fetched_at"`
 	OverviewComments []PRCommentView `json:"overview_comments"`
 	FileComments     []PRCommentView `json:"file_comments"`
+}
+
+type FlatComment struct {
+	Comment  PRComment
+	ParentID int64
+	Depth    int
 }
 
 func main() {
@@ -491,7 +499,7 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 }
 
 func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
-	var all []PRComment
+	var all []FlatComment
 	start := 0
 
 	for {
@@ -512,7 +520,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 				if root.Anchor == nil {
 					root.Anchor = activity.CommentAnchor
 				}
-				all = append(all, flattenCommentTree(*root)...)
+				all = append(all, flattenCommentTree(*root, 0, 0)...)
 			}
 		}
 
@@ -532,7 +540,8 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	}
 
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
-	for _, cmt := range all {
+	for _, item := range all {
+		cmt := item.Comment
 		anchor := cmt.Anchor
 		if anchor == nil {
 			anchor = cmt.CommentAnchor
@@ -540,6 +549,8 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 
 		view := PRCommentView{
 			ID:          cmt.ID,
+			ParentID:    item.ParentID,
+			Depth:       item.Depth,
 			Text:        cmt.Text,
 			Author:      displayUser(cmt.Author),
 			CreatedDate: cmt.CreatedDate,
@@ -565,14 +576,14 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func flattenCommentTree(root PRComment) []PRComment {
-	out := []PRComment{root}
+func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
+	out := []FlatComment{{Comment: root, ParentID: parentID, Depth: depth}}
 	for _, child := range root.Comments {
 		if child.Anchor == nil && child.CommentAnchor == nil {
 			child.Anchor = root.Anchor
 			child.CommentAnchor = root.CommentAnchor
 		}
-		out = append(out, flattenCommentTree(child)...)
+		out = append(out, flattenCommentTree(child, root.ID, depth+1)...)
 	}
 	return out
 }
