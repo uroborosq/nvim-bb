@@ -221,6 +221,7 @@ local function open_comment_float(comments, line)
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
 		if idx > 1 then
+			table.insert(lines, "")
 			table.insert(lines, indent .. "---")
 			table.insert(lines, "")
 		end
