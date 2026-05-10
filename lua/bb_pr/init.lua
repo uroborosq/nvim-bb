@@ -308,15 +308,24 @@ apply_comments_to_current_buffer = function(comments_payload)
 
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
+	local seen_comment_ids = {}
 
 	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
 		if path_matches(rel_norm, c.path) then
+			local cid = tonumber(c.id or 0) or 0
+			if cid > 0 and seen_comment_ids[cid] then
+				goto continue
+			end
 			local line = tonumber(c.line or 0)
 			if line > 0 then
+				if cid > 0 then
+					seen_comment_ids[cid] = true
+				end
 				by_line[line] = by_line[line] or {}
 				table.insert(by_line[line], c)
 			end
 		end
+		::continue::
 	end
 
 	for line, line_comments in pairs(by_line) do
