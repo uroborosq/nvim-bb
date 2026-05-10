@@ -151,10 +151,11 @@ end
 
 local function open_comment_float(comments, line)
 	local lines = { string.format("PR comments for line %d", line), "" }
-	for idx, c in ipairs(comments) do
-		if idx > 1 then
-			table.insert(lines, "---")
-		end
+		for idx, c in ipairs(comments) do
+			if idx > 1 then
+				table.insert(lines, "---")
+				table.insert(lines, "")
+			end
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
 		local comment_id = tonumber(c.id or 0) or 0
