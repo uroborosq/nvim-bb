@@ -178,6 +178,28 @@ local function path_matches(current_file, anchor_path)
 	return cur:sub(-#anc) == anc
 end
 
+
+local function extract_repo_relative_path(bufname)
+	if type(bufname) ~= "string" or bufname == "" then
+		return ""
+	end
+
+	local name = bufname
+	if name:match("^diffview://") then
+		name = name:gsub("^diffview://", "")
+		local git_idx = name:find("/.git/")
+		if git_idx then
+			local after_git = name:sub(git_idx + 6)
+			local slash_after_hash = after_git:find("/")
+			if slash_after_hash then
+				name = after_git:sub(slash_after_hash + 1)
+			end
+		end
+	end
+
+	local rel = vim.fn.fnamemodify(name, ":.")
+	return normalize_repo_path(rel)
+end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
@@ -1108,7 +1130,7 @@ local function resolve_comment_context(mode)
 		return { mode = "new_overview" }
 	end
 
-	local rel = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":.")
+	local rel = extract_repo_relative_path(vim.api.nvim_buf_get_name(bufnr))
 	local side = current_diff_side()
 	local file_type = "TO"
 	local line_type = "CONTEXT"
@@ -1121,7 +1143,7 @@ local function resolve_comment_context(mode)
 	end
 	return {
 		mode = "new_file",
-		path = normalize_repo_path(rel),
+		path = rel,
 		line = line,
 		line_type = line_type,
 		file_type = file_type,
