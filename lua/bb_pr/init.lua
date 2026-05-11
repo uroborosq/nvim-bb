@@ -11,6 +11,7 @@ local state = {
 	pr_by_tab = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 	comments_by_tab = {},
+	pending_comments_by_tab = {},
 }
 
 local function tab_key(tabpage)
@@ -100,11 +101,20 @@ local function run_comments_provider(pr_id, cb, opts)
 end
 
 local function set_current_tab_comments(payload)
-	state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = payload
+	local key = tab_key(vim.api.nvim_get_current_tabpage())
+	state.comments_by_tab[key] = payload
+	state.pending_comments_by_tab[key] = payload
 end
 
 local function get_current_tab_comments()
 	return state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
+
+local function consume_pending_tab_comments()
+	local key = tab_key(vim.api.nvim_get_current_tabpage())
+	local payload = state.pending_comments_by_tab[key]
+	state.pending_comments_by_tab[key] = nil
+	return payload
 end
 
 local function split_first_line(text)
@@ -153,11 +163,9 @@ end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
-		vim.notify("single")
 		return "single"
 	end
 	if not vim.wo[win].diff then
-		vim.notify("single", "nodiff")
 		return "single"
 	end
 
@@ -169,7 +177,6 @@ local function current_diff_side()
 		end
 	end
 	if #diff_wins < 2 then
-		vim.notify("a")
 		return "single"
 	end
 
@@ -192,8 +199,6 @@ local function current_diff_side()
 	end
 
 	if not cur_col or min_col == max_col then
-		vim.notify("akkk")
-
 		return "single"
 	end
 
@@ -442,6 +447,37 @@ apply_comments_to_tab_windows = function(comments_payload)
 	end
 end
 
+local function apply_comments_when_diffview_ready(comments_payload, opts)
+	opts = opts or {}
+	local retries_left = opts.retries or 20
+	local delay_ms = opts.delay_ms or 100
+
+	local function attempt()
+		local has_stable_diff_side = false
+		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
+				local side = vim.api.nvim_win_call(win, current_diff_side)
+				if side == "left" or side == "right" then
+					has_stable_diff_side = true
+					break
+				end
+			end
+		end
+
+		if has_stable_diff_side then
+			apply_comments_to_tab_windows(comments_payload)
+			return
+		end
+
+		retries_left = retries_left - 1
+		if retries_left > 0 then
+			vim.defer_fn(attempt, delay_ms)
+		end
+	end
+
+	attempt()
+end
+
 local function build_lines(prs)
 	local lines = {
 		"ID  STATE    AUTHOR               FROM -> TO           TITLE",
@@ -480,13 +516,13 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_to_tab_windows(payload)
-			end)
-		end, { notify_errors = false })
-	end
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+						apply_comments_when_diffview_ready(payload)
+					end)
+				end, { notify_errors = false })
+			end
 
 	local fetch_cmd = {
 		"git",
@@ -780,12 +816,12 @@ function M.setup(opts)
 			return
 		end
 
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_to_tab_windows(payload)
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					apply_comments_to_tab_windows(payload)
+				end)
 			end)
-		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
 
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
@@ -800,17 +836,18 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
-	vim.keymap.set(
-		"n",
-		"gc",
-		"<cmd>BBPROpenLineComments<CR>",
-		{ desc = "Open PR comments for current line", silent = true }
-	)
+	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
 		group = aug,
 		callback = function()
+			local pending_payload = consume_pending_tab_comments()
+			if pending_payload then
+				apply_comments_when_diffview_ready(pending_payload)
+				return
+			end
+
 			local payload = get_current_tab_comments()
 			if payload then
 				apply_comments_to_tab_windows(payload)
