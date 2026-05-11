@@ -558,18 +558,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		start = next
 	}
 
-	reactionByCommentID := map[int64]map[string]int{}
-	for _, activity := range activities {
-		commentID, reactionKey := extractActivityReaction(activity)
-		if commentID <= 0 || reactionKey == "" {
-			continue
-		}
-		if reactionByCommentID[commentID] == nil {
-			reactionByCommentID[commentID] = map[string]int{}
-		}
-		reactionByCommentID[commentID][reactionKey]++
-	}
-
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, item := range all {
 		cmt := item.Comment
@@ -579,7 +567,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 
 		commentReactions := extractReactionCounts(cmt.Properties.Reactions)
-		commentReactions = mergeReactionCounts(commentReactions, reactionByCommentID[cmt.ID])
 
 		view := PRCommentView{
 			ID:          cmt.ID,
@@ -619,14 +606,9 @@ func extractReactionCounts(reactions []Reaction) map[string]int {
 			continue
 		}
 		count := len(reaction.Users)
-		if count <= 0 {
-			continue
-		}
 		result[key] += count
 	}
-	if len(result) == 0 {
-		return nil
-	}
+
 	return result
 }
 
