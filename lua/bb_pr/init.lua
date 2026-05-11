@@ -1109,7 +1109,23 @@ local function resolve_comment_context(mode)
 	end
 
 	local rel = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":.")
-	return { mode = "new_file", path = normalize_repo_path(rel), line = line }
+	local side = current_diff_side()
+	local file_type = "TO"
+	local line_type = "CONTEXT"
+	if side == "left" then
+		file_type = "FROM"
+		line_type = "REMOVED"
+	elseif side == "right" then
+		file_type = "TO"
+		line_type = "ADDED"
+	end
+	return {
+		mode = "new_file",
+		path = normalize_repo_path(rel),
+		line = line,
+		line_type = line_type,
+		file_type = file_type,
+	}
 end
 
 local function post_comment_or_task(is_task, force_reply)
@@ -1140,6 +1156,10 @@ local function post_comment_or_task(is_task, force_reply)
 			table.insert(cmd, tostring(ctx.path or ""))
 			table.insert(cmd, "-line")
 			table.insert(cmd, tostring(ctx.line or 0))
+			table.insert(cmd, "-line-type")
+			table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
+			table.insert(cmd, "-file-type")
+			table.insert(cmd, tostring(ctx.file_type or "TO"))
 		end
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
