@@ -35,6 +35,7 @@ local function format_pr_entry(pr)
 	local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
 	local from_ref = (pr.fromRef and pr.fromRef.displayId) or "?"
 	local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
+
 	return string.format(
 		"#%s [%s] %s (%s → %s) — %s",
 		pr.id,
@@ -125,6 +126,17 @@ local function split_first_line(text)
 		return "(empty)"
 	end
 	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
+end
+
+local function task_checkbox_prefix(c)
+	if type(c) ~= "table" or not c.is_task then
+		return nil
+	end
+	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+	if status == "DONE" or status == "RESOLVED" then
+		return "- [x] "
+	end
+	return "- [ ] "
 end
 
 local function as_array(value)
@@ -345,7 +357,8 @@ local function open_comment_float(comments, line)
 		end
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
+		local checkbox = task_checkbox_prefix(c) or "- "
+		local header = string.format("%s%s%s %s", indent, checkbox, c.author or "unknown", c.created_at or "unknown time")
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -874,7 +887,8 @@ local function build_overview_comment_lines(payload)
 			local created_at = c.created_at or "unknown time"
 			local comment_id = tonumber(c.id or 0) or 0
 			local reply_to = tonumber(c.parent_id or 0) or 0
-			local header = string.format("%s- %s @ %s", indent, author, created_at)
+			local checkbox = task_checkbox_prefix(c) or "- "
+			local header = string.format("%s%s%s %s", indent, checkbox, author, created_at)
 			if comment_id > 0 then
 				header = header .. string.format(" (#%d)", comment_id)
 			end
