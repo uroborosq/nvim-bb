@@ -178,7 +178,6 @@ local function path_matches(current_file, anchor_path)
 	return cur:sub(-#anc) == anc
 end
 
-
 local function extract_repo_relative_path(bufname)
 	if type(bufname) ~= "string" or bufname == "" then
 		return ""
@@ -990,27 +989,41 @@ local function open_pr_info(pr)
 
 	local comments_payload = get_current_tab_comments()
 	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line = build_overview_comment_lines(comments_payload)
+	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
+		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+
 	vim.b[buf].bb_pr_overview_comment_lines = {}
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
+
+	local ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line or {}
+
 	for idx, line in ipairs(comment_line_numbers) do
 		local abs = overview_start_line + line - 1
 		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
 		local cid = tonumber((comment_ids_by_line_order or {})[idx] or 0) or 0
 		if cid > 0 then
-			vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = cid
+			ids_by_line[abs] = cid
+			vim.notify(vim.inspect(vim.b[buf].bb_pr_overview_comment_ids_by_line))
 		end
 	end
+
 	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
 		local abs = overview_start_line + rel_line - 1
-		vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = tonumber(cid) or 0
+		ids_by_line[abs] = tonumber(cid) or 0
+
+		vim.notify(tostring(cid))
+		vim.notify(vim.inspect(ids_by_line))
 	end
+
+	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
+
+	vim.notify(vim.inspect(vim.b[buf].bb_pr_overview_comment_ids_by_line))
 
 	vim.diagnostic.enable(false, { bufnr = buf })
 
@@ -1034,7 +1047,6 @@ local function open_pr_info(pr)
 
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
-
 
 local function open_pr_info_with_comments(pr)
 	local payload = get_current_tab_comments()
@@ -1137,9 +1149,6 @@ function M.open_list()
 	end)
 end
 
-
-
-
 local function detect_line_type_for_cursor(side, line)
 	local ok, diff_hl = pcall(vim.fn.diff_hlID, line, 1)
 	if not ok then
@@ -1192,7 +1201,6 @@ local function resolve_comment_context(mode)
 		file_type = file_type,
 	}
 end
-
 
 local function open_multiline_comment_input(opts, on_submit)
 	opts = opts or {}
@@ -1293,15 +1301,15 @@ local function post_comment_or_task(is_task, force_reply)
 				table.insert(cmd, "-reply-to")
 				table.insert(cmd, tostring(reply_to))
 			elseif ctx.mode == "new_file" then
-			table.insert(cmd, "-path")
-			table.insert(cmd, tostring(ctx.path or ""))
-			table.insert(cmd, "-line")
-			table.insert(cmd, tostring(ctx.line or 0))
-			table.insert(cmd, "-line-type")
-			table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
-			table.insert(cmd, "-file-type")
-			table.insert(cmd, tostring(ctx.file_type or "TO"))
-		end
+				table.insert(cmd, "-path")
+				table.insert(cmd, tostring(ctx.path or ""))
+				table.insert(cmd, "-line")
+				table.insert(cmd, tostring(ctx.line or 0))
+				table.insert(cmd, "-line-type")
+				table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
+				table.insert(cmd, "-file-type")
+				table.insert(cmd, tostring(ctx.file_type or "TO"))
+			end
 			vim.system(cmd, { text = true }, function(res)
 				if res.code ~= 0 then
 					vim.schedule(function()
@@ -1404,13 +1412,28 @@ function M.setup(opts)
 	end, { desc = "Reply to current PR comment" })
 
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
-		vim.keymap.set("n", M.config.create_comment_map, "<cmd>BBPRCreateComment<CR>", { desc = "Create PR comment", silent = true })
+		vim.keymap.set(
+			"n",
+			M.config.create_comment_map,
+			"<cmd>BBPRCreateComment<CR>",
+			{ desc = "Create PR comment", silent = true }
+		)
 	end
 	if M.config.create_task_map and M.config.create_task_map ~= "" then
-		vim.keymap.set("n", M.config.create_task_map, "<cmd>BBPRCreateTask<CR>", { desc = "Create PR task", silent = true })
+		vim.keymap.set(
+			"n",
+			M.config.create_task_map,
+			"<cmd>BBPRCreateTask<CR>",
+			{ desc = "Create PR task", silent = true }
+		)
 	end
 	if M.config.reply_comment_map and M.config.reply_comment_map ~= "" then
-		vim.keymap.set("n", M.config.reply_comment_map, "<cmd>BBPRReplyComment<CR>", { desc = "Reply PR comment", silent = true })
+		vim.keymap.set(
+			"n",
+			M.config.reply_comment_map,
+			"<cmd>BBPRReplyComment<CR>",
+			{ desc = "Reply PR comment", silent = true }
+		)
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
