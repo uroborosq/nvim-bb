@@ -653,6 +653,122 @@ local function build_approval_lines(pr)
 	return lines
 end
 
+local function build_overview_comment_lines(payload)
+	local function trim_edge_empty_lines(items)
+		local first = 1
+		local last = #items
+
+		while first <= last and (items[first] or ""):match("^%s*$") do
+			first = first + 1
+		end
+		while last >= first and (items[last] or ""):match("^%s*$") do
+			last = last - 1
+		end
+
+		local out = {}
+		for i = first, last do
+			table.insert(out, items[i])
+		end
+		return out
+	end
+
+	local comments = as_array(payload and payload.overview_comments)
+	if #comments == 0 then
+		return { "None" }
+	end
+
+	local comments_by_id = {}
+	for _, c in ipairs(comments) do
+		local cid = tonumber(c.id or 0) or 0
+		if cid > 0 then
+			comments_by_id[cid] = c
+		end
+	end
+
+	local function thread_root_key(c, fallback_idx)
+		local seen = {}
+		local current = c
+		local current_id = tonumber(current.id or 0) or 0
+		local parent_id = tonumber(current.parent_id or 0) or 0
+
+		while parent_id > 0 and not seen[parent_id] do
+			seen[parent_id] = true
+			local parent = comments_by_id[parent_id]
+			if not parent then
+				return parent_id
+			end
+			current = parent
+			current_id = tonumber(current.id or 0) or 0
+			parent_id = tonumber(current.parent_id or 0) or 0
+		end
+
+		if current_id > 0 then
+			return current_id
+		end
+		return string.format("idx:%d", fallback_idx)
+	end
+
+	local thread_order = {}
+	local comments_by_thread = {}
+	for idx, c in ipairs(comments) do
+		local root = thread_root_key(c, idx)
+		if not comments_by_thread[root] then
+			comments_by_thread[root] = {}
+			table.insert(thread_order, root)
+		end
+		table.insert(comments_by_thread[root], c)
+	end
+
+	local lines = {}
+	for thread_idx, root in ipairs(thread_order) do
+		local thread_comments = comments_by_thread[root]
+		if thread_idx > 1 then
+			table.insert(lines, "")
+		end
+		table.insert(lines, string.format("### Thread %d", thread_idx))
+		table.insert(lines, "")
+
+		for comment_idx, c in ipairs(thread_comments) do
+			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
+			local indent = string.rep("  ", depth)
+
+			if #thread_comments > 1 and comment_idx > 1 then
+				table.insert(lines, indent .. "---")
+				table.insert(lines, "")
+			end
+
+			local author = c.author or "unknown"
+			local created_at = c.created_at or "unknown time"
+			local comment_id = tonumber(c.id or 0) or 0
+			local reply_to = tonumber(c.parent_id or 0) or 0
+			local header = string.format("%s- %s @ %s", indent, author, created_at)
+			if comment_id > 0 then
+				header = header .. string.format(" (#%d)", comment_id)
+			end
+			if reply_to > 0 then
+				header = header .. string.format(" ↳ reply to #%d", reply_to)
+			end
+			table.insert(lines, header)
+
+			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
+			if #msg_lines == 0 then
+				table.insert(lines, indent .. "  (empty)")
+			else
+				for _, msg_line in ipairs(msg_lines) do
+					table.insert(lines, indent .. "  " .. msg_line)
+				end
+			end
+			table.insert(lines, "")
+		end
+	end
+
+	if lines[#lines] ~= "" then
+		table.insert(lines, "")
+	end
+
+	return lines
+end
+
 local function open_pr_info(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
@@ -667,14 +783,22 @@ local function open_pr_info(pr)
 		string.format("Title: %s", pr.title or ""),
 		string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
 		"",
-		"Description:",
+		"## Description",
+		"",
 	}
 
 	vim.list_extend(info_lines, to_lines(pr.description))
 	table.insert(info_lines, "")
-	table.insert(info_lines, "Approvals:")
+	table.insert(info_lines, "## Approvals")
+	table.insert(info_lines, "")
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
+	table.insert(info_lines, "")
+	table.insert(info_lines, "## Comments")
+	table.insert(info_lines, "")
+
+	local comments_payload = get_current_tab_comments()
+	vim.list_extend(info_lines, build_overview_comment_lines(comments_payload))
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
