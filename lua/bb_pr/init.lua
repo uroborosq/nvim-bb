@@ -35,14 +35,57 @@ local function format_pr_entry(pr)
 	local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
 	local from_ref = (pr.fromRef and pr.fromRef.displayId) or "?"
 	local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
+
+	local function to_number(v)
+		if type(v) == "number" then
+			return math.floor(v)
+		end
+		if type(v) == "string" then
+			local n = tonumber(v)
+			if n then
+				return math.floor(n)
+			end
+		end
+		return nil
+	end
+
+	local function task_status_text()
+		local open = to_number(pr.openTaskCount)
+			or to_number(pr.open_tasks)
+			or to_number(pr.open_task_count)
+		local done = to_number(pr.resolvedTaskCount)
+			or to_number(pr.completedTaskCount)
+			or to_number(pr.resolved_tasks)
+			or to_number(pr.completed_tasks)
+
+		if open == nil and done == nil and type(pr.properties) == "table" then
+			open = to_number(pr.properties.openTaskCount)
+				or to_number(pr.properties.open_tasks)
+				or to_number(pr.properties.open_task_count)
+			done = to_number(pr.properties.resolvedTaskCount)
+				or to_number(pr.properties.completedTaskCount)
+				or to_number(pr.properties.resolved_tasks)
+				or to_number(pr.properties.completed_tasks)
+		end
+
+		if open == nil and done == nil then
+			return "tasks: нет"
+		end
+
+		open = open or 0
+		done = done or 0
+		return string.format("tasks: ✅%d ❌%d", done, open)
+	end
+
 	return string.format(
-		"#%s [%s] %s (%s → %s) — %s",
+		"#%s [%s] %s (%s → %s) — %s — %s",
 		pr.id,
 		pr.state or "-",
 		author,
 		from_ref,
 		to_ref,
-		pr.title or ""
+		pr.title or "",
+		task_status_text()
 	)
 end
 
