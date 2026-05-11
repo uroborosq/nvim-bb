@@ -677,39 +677,84 @@ local function build_overview_comment_lines(payload)
 		return { "None" }
 	end
 
-	local lines = {}
+	local comments_by_id = {}
+	for _, c in ipairs(comments) do
+		local cid = tonumber(c.id or 0) or 0
+		if cid > 0 then
+			comments_by_id[cid] = c
+		end
+	end
+
+	local function thread_root_key(c, fallback_idx)
+		local seen = {}
+		local current = c
+		local current_id = tonumber(current.id or 0) or 0
+		local parent_id = tonumber(current.parent_id or 0) or 0
+
+		while parent_id > 0 and not seen[parent_id] do
+			seen[parent_id] = true
+			local parent = comments_by_id[parent_id]
+			if not parent then
+				return parent_id
+			end
+			current = parent
+			current_id = tonumber(current.id or 0) or 0
+			parent_id = tonumber(current.parent_id or 0) or 0
+		end
+
+		if current_id > 0 then
+			return current_id
+		end
+		return string.format("idx:%d", fallback_idx)
+	end
+
+	local thread_order = {}
+	local comments_by_thread = {}
 	for idx, c in ipairs(comments) do
-		if idx > 1 then
+		local root = thread_root_key(c, idx)
+		if not comments_by_thread[root] then
+			comments_by_thread[root] = {}
+			table.insert(thread_order, root)
+		end
+		table.insert(comments_by_thread[root], c)
+	end
+
+	local lines = {}
+	for thread_idx, root in ipairs(thread_order) do
+		local thread_comments = comments_by_thread[root]
+		if thread_idx > 1 then
 			table.insert(lines, "---")
 			table.insert(lines, "")
 		end
-		table.insert(lines, string.format("### Thread %d", idx))
+		table.insert(lines, string.format("### Thread %d", thread_idx))
 		table.insert(lines, "")
 
-		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-		local indent = string.rep("  ", depth)
-		local author = c.author or "unknown"
-		local created_at = c.created_at or "unknown time"
-		local comment_id = tonumber(c.id or 0) or 0
-		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header = string.format("%s- %s @ %s", indent, author, created_at)
-		if comment_id > 0 then
-			header = header .. string.format(" (#%d)", comment_id)
-		end
-		if reply_to > 0 then
-			header = header .. string.format(" ↳ reply to #%d", reply_to)
-		end
-		table.insert(lines, header)
-
-		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
-		if #msg_lines == 0 then
-			table.insert(lines, indent .. "  (empty)")
-		else
-			for _, msg_line in ipairs(msg_lines) do
-				table.insert(lines, indent .. "  " .. msg_line)
+		for _, c in ipairs(thread_comments) do
+			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
+			local indent = string.rep("  ", depth)
+			local author = c.author or "unknown"
+			local created_at = c.created_at or "unknown time"
+			local comment_id = tonumber(c.id or 0) or 0
+			local reply_to = tonumber(c.parent_id or 0) or 0
+			local header = string.format("%s- %s @ %s", indent, author, created_at)
+			if comment_id > 0 then
+				header = header .. string.format(" (#%d)", comment_id)
 			end
+			if reply_to > 0 then
+				header = header .. string.format(" ↳ reply to #%d", reply_to)
+			end
+			table.insert(lines, header)
+
+			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
+			if #msg_lines == 0 then
+				table.insert(lines, indent .. "  (empty)")
+			else
+				for _, msg_line in ipairs(msg_lines) do
+					table.insert(lines, indent .. "  " .. msg_line)
+				end
+			end
+			table.insert(lines, "")
 		end
-		table.insert(lines, "")
 	end
 
 	if lines[#lines] ~= "" then
