@@ -1,5 +1,7 @@
 # bb
 
+**This code was fully vibecoded**
+
 Bitbucket PR helper CLI + Neovim plugin.
 
 - Provider command defaults to `bb -reviewers -json` (override via `setup({ provider_cmd = {...} })`).
