@@ -683,7 +683,8 @@ local function build_overview_comment_lines(payload)
 			table.insert(lines, "---")
 			table.insert(lines, "")
 		end
-		table.insert(lines, string.format("### thread %d", idx))
+		table.insert(lines, string.format("### Thread %d", idx))
+		table.insert(lines, "")
 
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
@@ -732,16 +733,19 @@ local function open_pr_info(pr)
 		string.format("Title: %s", pr.title or ""),
 		string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
 		"",
-		"## desc",
+		"## Description",
+		"",
 	}
 
 	vim.list_extend(info_lines, to_lines(pr.description))
 	table.insert(info_lines, "")
-	table.insert(info_lines, "## appr-s")
+	table.insert(info_lines, "## Approvals")
+	table.insert(info_lines, "")
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
 	table.insert(info_lines, "")
-	table.insert(info_lines, "## comments")
+	table.insert(info_lines, "## Comments")
+	table.insert(info_lines, "")
 
 	local comments_payload = get_current_tab_comments()
 	vim.list_extend(info_lines, build_overview_comment_lines(comments_payload))
