@@ -357,7 +357,8 @@ local function open_comment_float(comments, line)
 		end
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
+		local checkbox = task_checkbox_prefix(c) or "- "
+		local header = string.format("%s%s%s %s", indent, checkbox, c.author or "unknown", c.created_at or "unknown time")
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -366,13 +367,8 @@ local function open_comment_float(comments, line)
 		end
 		table.insert(lines, header)
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
-		local checkbox = task_checkbox_prefix(c)
-		for msg_idx, msg_line in ipairs(msg_lines) do
-			local text = msg_line
-			if checkbox and msg_idx == 1 then
-				text = checkbox .. text
-			end
-			table.insert(lines, indent .. "  " .. text)
+		for _, msg_line in ipairs(msg_lines) do
+			table.insert(lines, indent .. "  " .. msg_line)
 		end
 		local reactions_line = reactions.format_line(c.reactions)
 		if reactions_line then
@@ -891,7 +887,8 @@ local function build_overview_comment_lines(payload)
 			local created_at = c.created_at or "unknown time"
 			local comment_id = tonumber(c.id or 0) or 0
 			local reply_to = tonumber(c.parent_id or 0) or 0
-			local header = string.format("%s- %s @ %s", indent, author, created_at)
+			local checkbox = task_checkbox_prefix(c) or "- "
+			local header = string.format("%s%s%s %s", indent, checkbox, author, created_at)
 			if comment_id > 0 then
 				header = header .. string.format(" (#%d)", comment_id)
 			end
@@ -903,20 +900,10 @@ local function build_overview_comment_lines(payload)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
-				local checkbox = task_checkbox_prefix(c)
-				if checkbox then
-					table.insert(lines, indent .. "  " .. checkbox .. "(empty)")
-				else
-					table.insert(lines, indent .. "  (empty)")
-				end
+				table.insert(lines, indent .. "  (empty)")
 			else
-				local checkbox = task_checkbox_prefix(c)
-				for msg_idx, msg_line in ipairs(msg_lines) do
-					local text = msg_line
-					if checkbox and msg_idx == 1 then
-						text = checkbox .. text
-					end
-					table.insert(lines, indent .. "  " .. text)
+				for _, msg_line in ipairs(msg_lines) do
+					table.insert(lines, indent .. "  " .. msg_line)
 				end
 			end
 			table.insert(lines, "")
