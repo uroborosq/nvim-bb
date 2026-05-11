@@ -120,15 +120,16 @@ type CommentPage struct {
 }
 
 type PRComment struct {
-	ID            int64       `json:"id"`
-	Text          string      `json:"text"`
-	CreatedDate   int64       `json:"createdDate"`
-	UpdatedDate   int64       `json:"updatedDate"`
-	Anchor        *Anchor     `json:"anchor,omitempty"`
-	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
-	Comments      []PRComment `json:"comments,omitempty"`
-	Reactions     any         `json:"reactions,omitempty"`
-	Author        User        `json:"author"`
+	ID            int64          `json:"id"`
+	Text          string         `json:"text"`
+	CreatedDate   int64          `json:"createdDate"`
+	UpdatedDate   int64          `json:"updatedDate"`
+	Anchor        *Anchor        `json:"anchor,omitempty"`
+	CommentAnchor *Anchor        `json:"commentAnchor,omitempty"`
+	Comments      []PRComment    `json:"comments,omitempty"`
+	Reactions     any            `json:"reactions,omitempty"`
+	Properties    map[string]any `json:"properties,omitempty"`
+	Author        User           `json:"author"`
 }
 
 type Anchor struct {
@@ -227,11 +228,13 @@ type ActivityPage struct {
 }
 
 type Activity struct {
-	Action        string     `json:"action"`
-	Anchor        *Anchor    `json:"anchor,omitempty"`
-	CommentAnchor *Anchor    `json:"commentAnchor,omitempty"`
-	CommentAction string     `json:"commentAction,omitempty"`
-	Comment       *PRComment `json:"comment"`
+	Action        string         `json:"action"`
+	Anchor        *Anchor        `json:"anchor,omitempty"`
+	CommentAnchor *Anchor        `json:"commentAnchor,omitempty"`
+	CommentAction string         `json:"commentAction,omitempty"`
+	Comment       *PRComment     `json:"comment"`
+	User          User           `json:"user"`
+	Properties    map[string]any `json:"properties,omitempty"`
 }
 
 type PRCommentView struct {
@@ -502,6 +505,7 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 
 func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
 	var all []FlatComment
+	var activities []Activity
 	start := 0
 
 	for {
@@ -510,6 +514,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			return nil, err
 		}
 
+		activities = append(activities, page.Values...)
 		for _, activity := range page.Values {
 			root := extractActivityComment(activity)
 			if root != nil {
@@ -541,6 +546,18 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		start = next
 	}
 
+	reactionByCommentID := map[int64]map[string]int{}
+	for _, activity := range activities {
+		commentID, reactionKey := extractActivityReaction(activity)
+		if commentID <= 0 || reactionKey == "" {
+			continue
+		}
+		if reactionByCommentID[commentID] == nil {
+			reactionByCommentID[commentID] = map[string]int{}
+		}
+		reactionByCommentID[commentID][reactionKey]++
+	}
+
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, item := range all {
 		cmt := item.Comment
@@ -548,6 +565,10 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		if anchor == nil {
 			anchor = cmt.CommentAnchor
 		}
+
+		commentReactions := extractReactionCounts(cmt.Reactions)
+		commentReactions = mergeReactionCounts(commentReactions, extractReactionCounts(cmt.Properties))
+		commentReactions = mergeReactionCounts(commentReactions, reactionByCommentID[cmt.ID])
 
 		view := PRCommentView{
 			ID:          cmt.ID,
@@ -559,7 +580,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
-			Reactions:   extractReactionCounts(cmt.Reactions),
+			Reactions:   commentReactions,
 		}
 
 		if anchor != nil {
@@ -622,6 +643,43 @@ func extractReactionCounts(raw any) map[string]int {
 		return nil
 	}
 	return result
+}
+
+func mergeReactionCounts(dst map[string]int, src map[string]int) map[string]int {
+	if dst == nil {
+		dst = map[string]int{}
+	}
+	for k, v := range src {
+		if v > 0 {
+			dst[k] += v
+		}
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func extractActivityReaction(activity Activity) (int64, string) {
+	commentID := int64(0)
+	if activity.Comment != nil {
+		commentID = activity.Comment.ID
+	}
+	if commentID <= 0 {
+		return 0, ""
+	}
+
+	properties := extractReactionCounts(activity.Properties)
+	for key := range properties {
+		return commentID, key
+	}
+	if activity.Comment != nil {
+		fromComment := extractReactionCounts(activity.Comment.Properties)
+		for key := range fromComment {
+			return commentID, key
+		}
+	}
+	return 0, ""
 }
 
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
