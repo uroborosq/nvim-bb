@@ -605,80 +605,72 @@ func isLikelyReactionKey(key string) bool {
 	if upper == "" {
 		return false
 	}
-
-	blocked := map[string]struct{}{
-		"REPOSITORYID": {},
-		"ID":           {},
-		"VERSION":      {},
-		"COUNT":        {},
-		"TOTAL":        {},
-		"VALUE":        {},
-	}
-	if _, bad := blocked[upper]; bad {
-		return false
-	}
-
-	if strings.Contains(upper, "REACTION") || strings.Contains(upper, "EMOJI") {
-		return true
-	}
-
 	known := map[string]struct{}{
-		"+1": {}, "-1": {}, "THUMBS_UP": {}, "THUMBS_DOWN": {}, "THUMBSUP": {}, "THUMBSDOWN": {},
-		"LAUGH": {}, "SMILE": {}, "SMILEY": {}, "HOORAY": {}, "TADA": {}, "CONFUSED": {},
-		"HEART": {}, "EYES": {}, "ROCKET": {},
+		"+1": {}, "-1": {}, "THUMBSUP": {}, "THUMBSDOWN": {},
+		"THUMBS_UP": {}, "THUMBS_DOWN": {}, "LAUGH": {}, "SMILE": {}, "SMILEY": {},
+		"HOORAY": {}, "TADA": {}, "CONFUSED": {}, "HEART": {}, "EYES": {}, "ROCKET": {},
 	}
-	if _, ok := known[upper]; ok {
-		return true
-	}
-
-	for _, r := range upper {
-		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '+' || r == '-' {
-			continue
-		}
-		return false
-	}
-	return false
+	_, ok := known[upper]
+	return ok
 }
 
 func extractReactionCounts(raw any) map[string]int {
 	result := map[string]int{}
-	var walk func(any)
 
 	add := func(key string, count int) {
-		key = strings.TrimSpace(strings.ToUpper(key))
+		key = strings.ToUpper(strings.TrimSpace(key))
 		if key == "" || count <= 0 || !isLikelyReactionKey(key) {
 			return
 		}
 		result[key] += count
 	}
 
-	walk = func(v any) {
-		switch x := v.(type) {
-		case map[string]any:
-			if k, ok := x["key"].(string); ok {
-				add(k, pickInt(x, "count", "total", "value"))
+	items, ok := raw.([]any)
+	if ok {
+		for _, item := range items {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
 			}
-			if k, ok := x["name"].(string); ok {
-				add(k, pickInt(x, "count", "total", "value"))
-			}
-			for k, val := range x {
-				switch n := val.(type) {
-				case float64:
-					add(k, int(n))
-				case int:
-					add(k, n)
-				default:
-					walk(n)
+			shortcut := ""
+			if emoticon, ok := m["emoticon"].(map[string]any); ok {
+				if s, ok := emoticon["shortcut"].(string); ok {
+					shortcut = s
 				}
 			}
-		case []any:
-			for _, item := range x {
-				walk(item)
+			if shortcut == "" {
+				if s, ok := m["shortcut"].(string); ok {
+					shortcut = s
+				}
+			}
+			count := 0
+			if users, ok := m["users"].([]any); ok {
+				count = len(users)
+			}
+			if count == 0 {
+				count = pickInt(m, "count", "total", "value")
+			}
+			add(shortcut, count)
+		}
+	}
+
+	if m, ok := raw.(map[string]any); ok {
+		if s, ok := m["shortcut"].(string); ok {
+			add(s, pickInt(m, "count", "total", "value"))
+		}
+		if emoticon, ok := m["emoticon"].(map[string]any); ok {
+			if s, ok := emoticon["shortcut"].(string); ok {
+				count := pickInt(m, "count", "total", "value")
+				if count == 0 {
+					if users, ok := m["users"].([]any); ok {
+						count = len(users)
+					}
+				}
+				add(s, count)
 			}
 		}
 	}
 
-	walk(raw)
 	if len(result) == 0 {
 		return nil
 	}
