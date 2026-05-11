@@ -1137,12 +1137,18 @@ end
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
-	local by_line = vim.b[bufnr].bb_pr_line_comments or {}
+	local by_line = vim.b[bufnr].bb_pr_line_comments
+	if type(by_line) ~= "table" then
+		by_line = {}
+	end
 	local comments = by_line[line]
-	if comments and #comments > 0 then
-		local cid = tonumber(comments[1].id or 0) or 0
-		if cid > 0 then
-			return { mode = "reply", reply_to = cid }
+	if type(comments) == "table" and #comments > 0 then
+		local first = comments[1]
+		if type(first) == "table" then
+			local cid = tonumber(first.id or 0) or 0
+			if cid > 0 then
+				return { mode = "reply", reply_to = cid }
+			end
 		end
 	end
 
