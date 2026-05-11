@@ -138,6 +138,7 @@ type PRComment struct {
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
 	Properties    Properties  `json:"properties,omitempty"`
+	Severity      string      `json:"severity,omitempty"`
 	Author        User        `json:"author"`
 }
 
@@ -520,7 +521,6 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
 	var all []FlatComment
 	var activities []Activity
-	taskStatusByComment := map[int64]string{}
 	start := 0
 
 	for {
@@ -531,7 +531,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 
 		activities = append(activities, page.Values...)
 		for _, activity := range page.Values {
-			markActivityTaskStatus(activity, taskStatusByComment)
 			root := extractActivityComment(activity)
 			if root != nil {
 				if root.Anchor == nil {
@@ -584,9 +583,14 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
 			Reactions:   commentReactions,
 		}
-		if status, ok := taskStatusByComment[cmt.ID]; ok {
+		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
+		if severity == "BLOCKER" {
 			view.IsTask = true
-			view.TaskStatus = status
+			if isResolvedComment(cmt) {
+				view.TaskStatus = "DONE"
+			} else {
+				view.TaskStatus = "OPEN"
+			}
 		}
 
 		if anchor != nil {
@@ -606,28 +610,16 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func markActivityTaskStatus(activity Activity, statusByComment map[int64]string) {
-	if activity.Comment == nil || activity.Comment.ID <= 0 {
-		return
+func isResolvedComment(cmt PRComment) bool {
+	if cmt.UpdatedDate <= 0 || cmt.CreatedDate <= 0 {
+		return false
 	}
-
-	action := strings.ToUpper(strings.TrimSpace(activity.Action))
-	commentAction := strings.ToUpper(strings.TrimSpace(activity.CommentAction))
-	combined := action + " " + commentAction
-
-	if !strings.Contains(combined, "TASK") {
-		return
+	updated := msToTime(cmt.UpdatedDate)
+	created := msToTime(cmt.CreatedDate)
+	if updated.IsZero() || created.IsZero() {
+		return false
 	}
-
-	status := "OPEN"
-	if strings.Contains(combined, "RESOLV") {
-		status = "DONE"
-	}
-	if strings.Contains(combined, "REOPEN") || strings.Contains(combined, "OPEN") {
-		status = "OPEN"
-	}
-
-	statusByComment[activity.Comment.ID] = status
+	return updated.After(created)
 }
 
 func extractReactionCounts(reactions []Reaction) map[string]int {
