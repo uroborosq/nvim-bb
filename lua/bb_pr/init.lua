@@ -729,13 +729,14 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 
 		for comment_idx, c in ipairs(thread_comments) do
+			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
+			local indent = string.rep("  ", depth)
+
 			if #thread_comments > 1 and comment_idx > 1 then
-				table.insert(lines, "---")
+				table.insert(lines, indent .. "---")
 				table.insert(lines, "")
 			end
 
-			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-			local indent = string.rep("  ", depth)
 			local author = c.author or "unknown"
 			local created_at = c.created_at or "unknown time"
 			local comment_id = tonumber(c.id or 0) or 0
