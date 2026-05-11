@@ -110,6 +110,16 @@ type User struct {
 	EmailAddress string `json:"emailAddress"`
 }
 
+type Emoticon struct {
+	Shortcut string `json:"shortcut"`
+	URL      string `json:"url"`
+}
+
+type Reaction struct {
+	Emoticon Emoticon `json:"emoticon"`
+	Users    []User   `json:"users"`
+}
+
 type CommentPage struct {
 	Size          int         `json:"size"`
 	Limit         int         `json:"limit"`
@@ -127,7 +137,7 @@ type PRComment struct {
 	Anchor        *Anchor        `json:"anchor,omitempty"`
 	CommentAnchor *Anchor        `json:"commentAnchor,omitempty"`
 	Comments      []PRComment    `json:"comments,omitempty"`
-	Reactions     any            `json:"reactions,omitempty"`
+	Reactions     []Reaction     `json:"reactions,omitempty"`
 	Properties    map[string]any `json:"properties,omitempty"`
 	Author        User           `json:"author"`
 }
@@ -567,7 +577,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 
 		commentReactions := extractReactionCounts(cmt.Reactions)
-		commentReactions = mergeReactionCounts(commentReactions, extractReactionCounts(cmt.Properties))
 		commentReactions = mergeReactionCounts(commentReactions, reactionByCommentID[cmt.ID])
 
 		view := PRCommentView{
@@ -600,46 +609,19 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func extractReactionCounts(raw any) map[string]int {
+func extractReactionCounts(reactions []Reaction) map[string]int {
 	result := map[string]int{}
-
-	add := func(key string, count int) {
-		key = strings.ToUpper(strings.TrimSpace(key))
-		if key == "" || count <= 0 {
-			return
+	for _, reaction := range reactions {
+		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
+		if key == "" {
+			continue
+		}
+		count := len(reaction.Users)
+		if count <= 0 {
+			continue
 		}
 		result[key] += count
 	}
-
-	items, ok := raw.([]any)
-	if ok {
-		for _, item := range items {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			shortcut := ""
-			if emoticon, ok := m["emoticon"].(map[string]any); ok {
-				if s, ok := emoticon["shortcut"].(string); ok {
-					shortcut = s
-				}
-			}
-			if shortcut == "" {
-				if s, ok := m["shortcut"].(string); ok {
-					shortcut = s
-				}
-			}
-			count := 0
-			if users, ok := m["users"].([]any); ok {
-				count = len(users)
-			}
-			if count == 0 {
-				count = pickInt(m, "count", "total", "value")
-			}
-			add(shortcut, count)
-		}
-	}
-
 	if len(result) == 0 {
 		return nil
 	}
@@ -661,29 +643,8 @@ func mergeReactionCounts(dst map[string]int, src map[string]int) map[string]int 
 	return dst
 }
 
-func extractActivityReaction(activity Activity) (int64, string) {
-	commentID := int64(0)
-	if activity.Comment != nil {
-		commentID = activity.Comment.ID
-	}
-	if commentID <= 0 {
-		return 0, ""
-	}
-
-	properties := extractReactionCounts(activity.Properties)
-	for key := range properties {
-		return commentID, key
-	}
-	if activity.Comment != nil {
-		fromComment := extractReactionCounts(activity.Comment.Properties)
-		for key := range fromComment {
-			return commentID, key
-		}
-	}
-	return 0, ""
-}
-
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
+
 	out := []FlatComment{{Comment: root, ParentID: parentID, Depth: depth}}
 	for _, child := range root.Comments {
 		if child.Anchor == nil && child.CommentAnchor == nil {
