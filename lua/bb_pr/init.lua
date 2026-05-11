@@ -128,17 +128,6 @@ local function split_first_line(text)
 	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
 end
 
-local function comment_task_status_label(c)
-	if type(c) ~= "table" or not c.is_task then
-		return nil
-	end
-	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
-	if status == "DONE" or status == "RESOLVED" then
-		return "✅ выполнено"
-	end
-	return "❌ не выполнено"
-end
-
 local function task_checkbox_prefix(c)
 	if type(c) ~= "table" or not c.is_task then
 		return nil
@@ -369,10 +358,6 @@ local function open_comment_float(comments, line)
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
 		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
-		local task_status = comment_task_status_label(c)
-		if task_status then
-			header = header .. " [" .. task_status .. "]"
-		end
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -907,10 +892,6 @@ local function build_overview_comment_lines(payload)
 			local comment_id = tonumber(c.id or 0) or 0
 			local reply_to = tonumber(c.parent_id or 0) or 0
 			local header = string.format("%s- %s @ %s", indent, author, created_at)
-			local task_status = comment_task_status_label(c)
-			if task_status then
-				header = header .. " [" .. task_status .. "]"
-			end
 			if comment_id > 0 then
 				header = header .. string.format(" (#%d)", comment_id)
 			end
