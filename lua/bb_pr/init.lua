@@ -4,6 +4,8 @@ M.config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
 	diffview_cmd = "DiffviewOpen",
+	comment_prev_map = "[C",
+	comment_next_map = "]C",
 }
 
 local state = {
@@ -387,6 +389,124 @@ local function open_comment_float(comments, line)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
 
+local function jump_file_comment(direction)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local by_line = vim.b[bufnr].bb_pr_line_comments
+	if type(by_line) ~= "table" then
+		by_line = {}
+	end
+	local current_line = vim.api.nvim_win_get_cursor(0)[1]
+	local lines = {}
+	for line, comments in pairs(by_line) do
+		if type(comments) == "table" and #comments > 0 then
+			table.insert(lines, line)
+		end
+	end
+
+	if #lines == 0 then
+		local extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.comment_ns, 0, -1, { details = true })
+		local seen = {}
+		for _, mark in ipairs(extmarks) do
+			local details = mark[4] or {}
+			if details.sign_text ~= "💬" then
+				goto continue
+			end
+			local row = tonumber(mark[2] or -1)
+			if row >= 0 then
+				local line = row + 1
+				if not seen[line] then
+					seen[line] = true
+					table.insert(lines, line)
+				end
+			end
+			::continue::
+		end
+	end
+
+	if #lines == 0 then
+		vim.notify("bb_pr: no file comments in current buffer", vim.log.levels.INFO)
+		return
+	end
+
+	table.sort(lines)
+	local target = nil
+
+	if direction > 0 then
+		for _, line in ipairs(lines) do
+			if line > current_line then
+				target = line
+				break
+			end
+		end
+		target = target or lines[1]
+	else
+		for i = #lines, 1, -1 do
+			local line = lines[i]
+			if line < current_line then
+				target = line
+				break
+			end
+		end
+		target = target or lines[#lines]
+	end
+
+	vim.api.nvim_win_set_cursor(0, { target, 0 })
+end
+
+local function jump_overview_comment(direction)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local overview_lines = vim.b[bufnr].bb_pr_overview_comment_lines
+	if type(overview_lines) ~= "table" or #overview_lines == 0 then
+		overview_lines = {}
+		local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+		for idx, line in ipairs(all_lines) do
+			if type(line) == "string" and line:match("^%s*%- .+ @ .+") then
+				table.insert(overview_lines, idx)
+			end
+		end
+		vim.b[bufnr].bb_pr_overview_comment_lines = overview_lines
+	end
+
+	if #overview_lines == 0 then
+		vim.notify("bb_pr: no overview comments in current buffer", vim.log.levels.INFO)
+		return
+	end
+
+	local current_line = vim.api.nvim_win_get_cursor(0)[1]
+	local target = nil
+
+	if direction > 0 then
+		for _, line in ipairs(overview_lines) do
+			if line > current_line then
+				target = line
+				break
+			end
+		end
+		target = target or overview_lines[1]
+	else
+		for i = #overview_lines, 1, -1 do
+			local line = overview_lines[i]
+			if line < current_line then
+				target = line
+				break
+			end
+		end
+		target = target or overview_lines[#overview_lines]
+	end
+
+	vim.api.nvim_win_set_cursor(0, { target, 0 })
+end
+
+local function jump_comment(direction)
+	local bufnr = vim.api.nvim_get_current_buf()
+	if type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
+		jump_overview_comment(direction)
+		return
+	end
+
+	jump_file_comment(direction)
+end
+
 apply_comments_to_current_buffer = function(comments_payload)
 	local bufnr = vim.api.nvim_get_current_buf()
 	if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
@@ -720,6 +840,7 @@ local function build_overview_comment_lines(payload)
 	end
 
 	local lines = {}
+	local comment_line_numbers = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		if thread_idx > 1 then
@@ -749,6 +870,7 @@ local function build_overview_comment_lines(payload)
 				header = header .. string.format(" ↳ reply to #%d", reply_to)
 			end
 			table.insert(lines, header)
+			table.insert(comment_line_numbers, #lines)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
@@ -766,7 +888,7 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 	end
 
-	return lines
+	return lines, comment_line_numbers
 end
 
 local function open_pr_info(pr)
@@ -798,12 +920,18 @@ local function open_pr_info(pr)
 	table.insert(info_lines, "")
 
 	local comments_payload = get_current_tab_comments()
-	vim.list_extend(info_lines, build_overview_comment_lines(comments_payload))
+	local overview_start_line = #info_lines + 1
+	local overview_lines, comment_line_numbers = build_overview_comment_lines(comments_payload)
+	vim.list_extend(info_lines, overview_lines)
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+	vim.b[buf].bb_pr_overview_comment_lines = {}
+	for _, line in ipairs(comment_line_numbers) do
+		table.insert(vim.b[buf].bb_pr_overview_comment_lines, overview_start_line + line - 1)
+	end
 
 	vim.diagnostic.enable(false, { bufnr = buf })
 
@@ -961,6 +1089,16 @@ function M.setup(opts)
 	end, { desc = "Open floating window with comments for current line" })
 
 	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
+	if M.config.comment_next_map and M.config.comment_next_map ~= "" then
+		vim.keymap.set("n", M.config.comment_next_map, function()
+			jump_comment(1)
+		end, { desc = "Jump to next PR comment", silent = true })
+	end
+	if M.config.comment_prev_map and M.config.comment_prev_map ~= "" then
+		vim.keymap.set("n", M.config.comment_prev_map, function()
+			jump_comment(-1)
+		end, { desc = "Jump to previous PR comment", silent = true })
+	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
