@@ -1,4 +1,5 @@
 local M = {}
+local reactions = require("bb_pr.reactions")
 
 M.config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
@@ -348,6 +349,10 @@ local function open_comment_float(comments, line)
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, indent .. "  " .. msg_line)
+		end
+		local reactions_line = reactions.format_line(c.reactions)
+		if reactions_line then
+			table.insert(lines, indent .. "  " .. reactions_line)
 		end
 		table.insert(lines, "")
 	end
