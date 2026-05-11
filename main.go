@@ -144,13 +144,11 @@ type PRComment struct {
 }
 
 type Anchor struct {
-	Path          string `json:"path"`
-	Line          int    `json:"line"`
-	LineType      string `json:"lineType"`
-	FileType      string `json:"fileType"`
-	DiffType      string `json:"diffType"`
-	StartLine     int    `json:"startLine,omitempty"`
-	StartLineType string `json:"startLineType,omitempty"`
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
+	LineType string `json:"lineType"`
+	FileType string `json:"fileType"`
+	DiffType string `json:"diffType"`
 }
 
 func (a *Anchor) UnmarshalJSON(data []byte) error {
@@ -308,9 +306,7 @@ func main() {
 	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
 	commentPath := flag.String("path", "", "repo-relative path for file comment")
 	commentLine := flag.Int("line", 0, "line number for file comment")
-	commentStartLine := flag.Int("start-line", 0, "start line for multiline file comment")
 	commentLineType := flag.String("line-type", "CONTEXT", "line type: ADDED|REMOVED|CONTEXT")
-	commentStartLineType := flag.String("start-line-type", "", "start line type for multiline comment: ADDED|REMOVED|CONTEXT")
 	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	flag.Parse()
@@ -343,16 +339,11 @@ func main() {
 		}
 		if strings.TrimSpace(*commentPath) != "" || *commentLine > 0 {
 			req.Anchor = &Anchor{
-				Path:          strings.TrimSpace(*commentPath),
-				Line:          *commentLine,
-				LineType:      strings.ToUpper(strings.TrimSpace(*commentLineType)),
-				FileType:      strings.ToUpper(strings.TrimSpace(*commentFileType)),
-				DiffType:      "EFFECTIVE",
-				StartLine:     *commentStartLine,
-				StartLineType: strings.ToUpper(strings.TrimSpace(*commentStartLineType)),
-			}
-			if req.Anchor.StartLine > 0 && req.Anchor.StartLineType == "" {
-				req.Anchor.StartLineType = req.Anchor.LineType
+				Path:     strings.TrimSpace(*commentPath),
+				Line:     *commentLine,
+				LineType: strings.ToUpper(strings.TrimSpace(*commentLineType)),
+				FileType: strings.ToUpper(strings.TrimSpace(*commentFileType)),
+				DiffType: "EFFECTIVE",
 			}
 		}
 

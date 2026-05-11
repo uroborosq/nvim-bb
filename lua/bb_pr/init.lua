@@ -1081,8 +1081,6 @@ function M.open_list()
 
 			vim.keymap.set("n", "<CR>", function()
 				local line = vim.api.nvim_win_get_cursor(0)[1]
-	local start_line, end_line = get_selected_line_range(bufnr)
-	local start_line, end_line = get_selected_line_range(bufnr)
 				local idx = line - 2
 				local pr = state.prs[idx]
 				if pr then
@@ -1136,25 +1134,6 @@ local function detect_line_type_for_cursor(side, line)
 	end
 	return "CONTEXT"
 end
-
-local function get_selected_line_range(bufnr)
-	if type(bufnr) ~= "number" then
-		return nil, nil
-	end
-	local mode = vim.fn.mode()
-	if mode ~= "v" and mode ~= "V" and mode ~= "" then
-		return nil, nil
-	end
-	local srow = vim.api.nvim_buf_get_mark(bufnr, "<")[1]
-	local erow = vim.api.nvim_buf_get_mark(bufnr, ">")[1]
-	if srow <= 0 or erow <= 0 then
-		return nil, nil
-	end
-	if srow > erow then
-		srow, erow = erow, srow
-	end
-	return srow, erow
-end
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1191,25 +1170,66 @@ local function resolve_comment_context(mode)
 	local side = current_diff_side()
 	local file_type = side == "left" and "FROM" or "TO"
 	local line_type = detect_line_type_for_cursor(side, line) or "CONTEXT"
-	local range_start_line = nil
-	local range_start_line_type = nil
-	if start_line and end_line and end_line > start_line then
-		range_start_line = start_line
-		range_start_line_type = detect_line_type_for_cursor(side, start_line) or line_type
-		line = end_line
-		line_type = detect_line_type_for_cursor(side, end_line) or line_type
-	end
 	return {
 		mode = "new_file",
 		path = rel,
 		line = line,
-		start_line = range_start_line,
 		line_type = line_type,
-		start_line_type = range_start_line_type,
 		file_type = file_type,
 	}
 end
 
+
+local function open_multiline_comment_input(opts, on_submit)
+	opts = opts or {}
+	local title = opts.title or "Comment"
+	local prompt = opts.prompt or "Write text. <C-s> submit, q cancel"
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "markdown"
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "", "", "" })
+
+	local width = math.max(80, math.floor(vim.o.columns * 0.7))
+	local height = math.max(12, math.floor(vim.o.lines * 0.35))
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = title,
+		title_pos = "center",
+	})
+	vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "<!-- " .. prompt .. " -->", "" })
+	vim.api.nvim_win_set_cursor(win, { 3, 0 })
+
+	local function submit()
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+		if #lines >= 2 and lines[1]:match("^%<%!%-%-") then
+			lines = vim.list_slice(lines, 3)
+		end
+		local text = table.concat(lines, "\n")
+		text = vim.trim(text)
+		pcall(vim.api.nvim_win_close, win, true)
+		if text ~= "" then
+			on_submit(text)
+		end
+	end
+
+	vim.keymap.set("n", "q", function()
+		pcall(vim.api.nvim_win_close, win, true)
+	end, { buffer = buf, silent = true })
+	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.cmd("startinsert")
+end
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1221,11 +1241,10 @@ local function post_comment_or_task(is_task, force_reply)
 		vim.notify("bb_pr: cannot resolve comment to reply", vim.log.levels.WARN)
 		return
 	end
-	vim.ui.input({ prompt = is_task and "Task text: " or "Comment text: " }, function(input)
-		local text = vim.trim(input or "")
-		if text == "" then
-			return
-		end
+	open_multiline_comment_input({
+		title = is_task and "BB PR Task" or "BB PR Comment",
+		prompt = "Write multiline text. <C-s> submit, q cancel",
+	}, function(text)
 		local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
 		if is_task then
 			table.insert(cmd, "-task")
@@ -1240,12 +1259,6 @@ local function post_comment_or_task(is_task, force_reply)
 			table.insert(cmd, tostring(ctx.line or 0))
 			table.insert(cmd, "-line-type")
 			table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
-			if (tonumber(ctx.start_line or 0) or 0) > 0 then
-				table.insert(cmd, "-start-line")
-				table.insert(cmd, tostring(ctx.start_line))
-				table.insert(cmd, "-start-line-type")
-				table.insert(cmd, tostring(ctx.start_line_type or ctx.line_type or "CONTEXT"))
-			end
 			table.insert(cmd, "-file-type")
 			table.insert(cmd, tostring(ctx.file_type or "TO"))
 		end
