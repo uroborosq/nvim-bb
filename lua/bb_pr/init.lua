@@ -139,6 +139,17 @@ local function comment_task_status_label(c)
 	return "❌ не выполнено"
 end
 
+local function task_checkbox_prefix(c)
+	if type(c) ~= "table" or not c.is_task then
+		return nil
+	end
+	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+	if status == "DONE" or status == "RESOLVED" then
+		return "- [x] "
+	end
+	return "- [ ] "
+end
+
 local function as_array(value)
 	if type(value) == "table" then
 		return value
@@ -370,8 +381,13 @@ local function open_comment_float(comments, line)
 		end
 		table.insert(lines, header)
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
-		for _, msg_line in ipairs(msg_lines) do
-			table.insert(lines, indent .. "  " .. msg_line)
+		local checkbox = task_checkbox_prefix(c)
+		for msg_idx, msg_line in ipairs(msg_lines) do
+			local text = msg_line
+			if checkbox and msg_idx == 1 then
+				text = checkbox .. text
+			end
+			table.insert(lines, indent .. "  " .. text)
 		end
 		local reactions_line = reactions.format_line(c.reactions)
 		if reactions_line then
@@ -906,10 +922,20 @@ local function build_overview_comment_lines(payload)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
-				table.insert(lines, indent .. "  (empty)")
+				local checkbox = task_checkbox_prefix(c)
+				if checkbox then
+					table.insert(lines, indent .. "  " .. checkbox .. "(empty)")
+				else
+					table.insert(lines, indent .. "  (empty)")
+				end
 			else
-				for _, msg_line in ipairs(msg_lines) do
-					table.insert(lines, indent .. "  " .. msg_line)
+				local checkbox = task_checkbox_prefix(c)
+				for msg_idx, msg_line in ipairs(msg_lines) do
+					local text = msg_line
+					if checkbox and msg_idx == 1 then
+						text = checkbox .. text
+					end
+					table.insert(lines, indent .. "  " .. text)
 				end
 			end
 			table.insert(lines, "")
