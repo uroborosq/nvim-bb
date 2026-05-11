@@ -654,6 +654,24 @@ local function build_approval_lines(pr)
 end
 
 local function build_overview_comment_lines(payload)
+	local function trim_edge_empty_lines(items)
+		local first = 1
+		local last = #items
+
+		while first <= last and (items[first] or ""):match("^%s*$") do
+			first = first + 1
+		end
+		while last >= first and (items[last] or ""):match("^%s*$") do
+			last = last - 1
+		end
+
+		local out = {}
+		for i = first, last do
+			table.insert(out, items[i])
+		end
+		return out
+	end
+
 	local comments = as_array(payload and payload.overview_comments)
 	if #comments == 0 then
 		return { "None" }
@@ -662,14 +680,17 @@ local function build_overview_comment_lines(payload)
 	local lines = {}
 	for idx, c in ipairs(comments) do
 		if idx > 1 then
+			table.insert(lines, "---")
 			table.insert(lines, "")
 		end
 
+		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
+		local indent = string.rep("  ", depth)
 		local author = c.author or "unknown"
 		local created_at = c.created_at or "unknown time"
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header = string.format("- %s @ %s", author, created_at)
+		local header = string.format("%s- %s @ %s", indent, author, created_at)
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -678,14 +699,19 @@ local function build_overview_comment_lines(payload)
 		end
 		table.insert(lines, header)
 
-		local text = vim.split(c.text or "", "\n", { plain = true })
-		if #text == 0 then
-			table.insert(lines, "  (empty)")
+		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
+		if #msg_lines == 0 then
+			table.insert(lines, indent .. "  (empty)")
 		else
-			for _, text_line in ipairs(text) do
-				table.insert(lines, "  " .. text_line)
+			for _, msg_line in ipairs(msg_lines) do
+				table.insert(lines, indent .. "  " .. msg_line)
 			end
 		end
+		table.insert(lines, "")
+	end
+
+	if lines[#lines] ~= "" then
+		table.insert(lines, "")
 	end
 
 	return lines
@@ -705,16 +731,16 @@ local function open_pr_info(pr)
 		string.format("Title: %s", pr.title or ""),
 		string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
 		"",
-		"Description:",
+		"## desc",
 	}
 
 	vim.list_extend(info_lines, to_lines(pr.description))
 	table.insert(info_lines, "")
-	table.insert(info_lines, "Approvals:")
+	table.insert(info_lines, "## appr-s")
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
 	table.insert(info_lines, "")
-	table.insert(info_lines, "Overview comments:")
+	table.insert(info_lines, "## comments")
 
 	local comments_payload = get_current_tab_comments()
 	vim.list_extend(info_lines, build_overview_comment_lines(comments_payload))
