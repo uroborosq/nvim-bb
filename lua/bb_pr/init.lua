@@ -683,6 +683,7 @@ local function build_overview_comment_lines(payload)
 			table.insert(lines, "---")
 			table.insert(lines, "")
 		end
+		table.insert(lines, string.format("### thread %d", idx))
 
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
