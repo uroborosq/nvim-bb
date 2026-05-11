@@ -1137,27 +1137,6 @@ end
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
-	local by_line = vim.b[bufnr].bb_pr_line_comments
-	if type(by_line) ~= "table" then
-		by_line = {}
-	end
-	local comments = by_line[line]
-	if type(comments) == "table" and #comments > 0 then
-		local first = comments[1]
-		if type(first) == "table" then
-			local cid = tonumber(first.id or 0) or 0
-			if cid > 0 then
-				return { mode = "reply", reply_to = cid }
-			end
-		end
-	end
-
-	local ov = vim.b[bufnr].bb_pr_overview_comment_ids_by_line or {}
-	local ocid = tonumber(ov[line] or 0) or 0
-	if ocid > 0 then
-		return { mode = "reply", reply_to = ocid }
-	end
-
 	if mode == "reply" then
 		return nil
 	end
@@ -1230,29 +1209,67 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
 	vim.cmd("startinsert")
 end
+
+local function collect_current_thread_comments()
+	local bufnr = vim.api.nvim_get_current_buf()
+	local line = vim.api.nvim_win_get_cursor(0)[1]
+	local by_line = vim.b[bufnr].bb_pr_line_comments
+	if type(by_line) ~= "table" then
+		return nil
+	end
+	local comments = by_line[line]
+	if type(comments) ~= "table" or #comments == 0 then
+		return nil
+	end
+	return comments
+end
+
+local function pick_comment_for_reply(comments, cb)
+	vim.ui.select(comments, {
+		prompt = "Reply to comment:",
+		format_item = function(c)
+			local author = c.author or "unknown"
+			local id = tonumber(c.id or 0) or 0
+			local text = split_first_line(c.text or "")
+			return string.format("#%d %s: %s", id, author, text)
+		end,
+	}, function(item)
+		if not item then
+			return
+		end
+		local cid = tonumber(item.id or 0) or 0
+		if cid <= 0 then
+			vim.notify("bb_pr: invalid comment selected", vim.log.levels.WARN)
+			return
+		end
+		cb(cid)
+	end)
+end
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
 		return
 	end
-	local ctx = resolve_comment_context(force_reply and "reply" or "auto")
+	local ctx = resolve_comment_context("auto")
 	if not ctx then
-		vim.notify("bb_pr: cannot resolve comment to reply", vim.log.levels.WARN)
+		vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
 		return
 	end
-	open_multiline_comment_input({
-		title = is_task and "BB PR Task" or "BB PR Comment",
-		prompt = "Write multiline text. <C-s> submit, q cancel",
-	}, function(text)
-		local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
-		if is_task then
-			table.insert(cmd, "-task")
-		end
-		if ctx.mode == "reply" and ctx.reply_to then
-			table.insert(cmd, "-reply-to")
-			table.insert(cmd, tostring(ctx.reply_to))
-		elseif ctx.mode == "new_file" then
+
+	local function send_comment(reply_to)
+		open_multiline_comment_input({
+			title = is_task and "BB PR Task" or "BB PR Comment",
+			prompt = "Write multiline text. <C-s> submit, q cancel",
+		}, function(text)
+			local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
+			if is_task then
+				table.insert(cmd, "-task")
+			end
+			if reply_to and reply_to > 0 then
+				table.insert(cmd, "-reply-to")
+				table.insert(cmd, tostring(reply_to))
+			elseif ctx.mode == "new_file" then
 			table.insert(cmd, "-path")
 			table.insert(cmd, tostring(ctx.path or ""))
 			table.insert(cmd, "-line")
@@ -1262,19 +1279,32 @@ local function post_comment_or_task(is_task, force_reply)
 			table.insert(cmd, "-file-type")
 			table.insert(cmd, tostring(ctx.file_type or "TO"))
 		end
-		vim.system(cmd, { text = true }, function(res)
-			if res.code ~= 0 then
+			vim.system(cmd, { text = true }, function(res)
+				if res.code ~= 0 then
+					vim.schedule(function()
+						vim.notify("bb_pr: create comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+					end)
+					return
+				end
 				vim.schedule(function()
-					vim.notify("bb_pr: create comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+					vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
+					vim.cmd("BBPRLoadComments")
 				end)
-				return
-			end
-			vim.schedule(function()
-				vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
-				vim.cmd("BBPRLoadComments")
 			end)
 		end)
-	end)
+	end
+
+	if force_reply then
+		local comments = collect_current_thread_comments()
+		if not comments then
+			vim.notify("bb_pr: put cursor on a commented line, then choose comment to reply", vim.log.levels.WARN)
+			return
+		end
+		pick_comment_for_reply(comments, send_comment)
+		return
+	end
+
+	send_comment(nil)
 end
 
 function M.setup(opts)
