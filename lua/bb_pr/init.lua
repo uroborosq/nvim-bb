@@ -373,6 +373,7 @@ local function open_comment_float(comments, line)
 	end
 
 	local lines = { string.format("PR comments for line %d", line), "" }
+	local comment_ids_by_line = {}
 	for idx, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local indent = string.rep("  ", depth)
@@ -392,6 +393,9 @@ local function open_comment_float(comments, line)
 			header = header .. string.format(" ↳ reply to #%d", reply_to)
 		end
 		table.insert(lines, header)
+		if comment_id > 0 then
+			comment_ids_by_line[#lines] = comment_id
+		end
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, indent .. "  " .. msg_line)
@@ -412,6 +416,7 @@ local function open_comment_float(comments, line)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].filetype = "markdown"
+	vim.b[buf].bb_pr_float_comment_ids_by_line = comment_ids_by_line
 	vim.diagnostic.enable(false, { bufnr = buf })
 
 	local base_win = vim.api.nvim_get_current_win()
@@ -1210,49 +1215,37 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.cmd("startinsert")
 end
 
-local function collect_current_thread_comments()
+local function resolve_reply_target_comment_id()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
-	local by_line = vim.b[bufnr].bb_pr_line_comments
-	if type(by_line) ~= "table" then
-		return nil
+
+	local float_ids = vim.b[bufnr].bb_pr_float_comment_ids_by_line
+	if type(float_ids) == "table" then
+		local cid = tonumber(float_ids[line] or 0) or 0
+		if cid > 0 then
+			return cid
+		end
 	end
-	local comments = by_line[line]
-	if type(comments) ~= "table" or #comments == 0 then
-		return nil
+
+	local overview_ids = vim.b[bufnr].bb_pr_overview_comment_ids_by_line
+	if type(overview_ids) == "table" then
+		local cid = tonumber(overview_ids[line] or 0) or 0
+		if cid > 0 then
+			return cid
+		end
 	end
-	return comments
+
+	return nil
 end
 
-local function pick_comment_for_reply(comments, cb)
-	vim.ui.select(comments, {
-		prompt = "Reply to comment:",
-		format_item = function(c)
-			local author = c.author or "unknown"
-			local id = tonumber(c.id or 0) or 0
-			local text = split_first_line(c.text or "")
-			return string.format("#%d %s: %s", id, author, text)
-		end,
-	}, function(item)
-		if not item then
-			return
-		end
-		local cid = tonumber(item.id or 0) or 0
-		if cid <= 0 then
-			vim.notify("bb_pr: invalid comment selected", vim.log.levels.WARN)
-			return
-		end
-		cb(cid)
-	end)
-end
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
 		return
 	end
-	local ctx = resolve_comment_context("auto")
-	if not ctx then
+	local ctx = resolve_comment_context(force_reply and "reply" or "auto")
+	if not ctx and not force_reply then
 		vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
 		return
 	end
@@ -1295,12 +1288,12 @@ local function post_comment_or_task(is_task, force_reply)
 	end
 
 	if force_reply then
-		local comments = collect_current_thread_comments()
-		if not comments then
-			vim.notify("bb_pr: put cursor on a commented line, then choose comment to reply", vim.log.levels.WARN)
+		local cid = resolve_reply_target_comment_id()
+		if not cid then
+			vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 			return
 		end
-		pick_comment_for_reply(comments, send_comment)
+		send_comment(cid)
 		return
 	end
 
