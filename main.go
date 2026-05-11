@@ -138,6 +138,8 @@ type PRComment struct {
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
 	Properties    Properties  `json:"properties,omitempty"`
+	Severity      string      `json:"severity,omitempty"`
+	State         string      `json:"state,omitempty"`
 	Author        User        `json:"author"`
 }
 
@@ -266,6 +268,8 @@ type PRCommentView struct {
 	FileType      string         `json:"file_type,omitempty"`
 	DiffType      string         `json:"diff_type,omitempty"`
 	Reactions     map[string]int `json:"reactions,omitempty"`
+	IsTask        bool           `json:"is_task,omitempty"`
+	TaskStatus    string         `json:"task_status,omitempty"`
 }
 
 type PullRequestComments struct {
@@ -579,6 +583,15 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
 			Reactions:   commentReactions,
+		}
+		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
+		if severity == "BLOCKER" {
+			view.IsTask = true
+			if strings.EqualFold(strings.TrimSpace(cmt.State), "RESOLVED") {
+				view.TaskStatus = "DONE"
+			} else {
+				view.TaskStatus = "OPEN"
+			}
 		}
 
 		if anchor != nil {
