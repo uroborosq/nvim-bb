@@ -401,6 +401,21 @@ local function jump_file_comment(direction)
 	end
 
 	if #lines == 0 then
+		local extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.comment_ns, 0, -1, { details = true })
+		local seen = {}
+		for _, mark in ipairs(extmarks) do
+			local row = tonumber(mark[2] or -1)
+			if row >= 0 then
+				local line = row + 1
+				if not seen[line] then
+					seen[line] = true
+					table.insert(lines, line)
+				end
+			end
+		end
+	end
+
+	if #lines == 0 then
 		vim.notify("bb_pr: no file comments in current buffer", vim.log.levels.INFO)
 		return
 	end
