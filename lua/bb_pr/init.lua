@@ -1,4 +1,5 @@
 local M = {}
+local reactions = require("bb_pr.reactions")
 
 M.config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
@@ -349,6 +350,11 @@ local function open_comment_float(comments, line)
 		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, indent .. "  " .. msg_line)
 		end
+		local reactions_line = reactions.format_line(c.reactions)
+		if reactions_line then
+			table.insert(lines, "")
+			table.insert(lines, indent .. "  " .. reactions_line)
+		end
 		table.insert(lines, "")
 	end
 
@@ -636,13 +642,13 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
-			run_comments_provider(pr.id, function(payload)
-				vim.schedule(function()
-					set_current_tab_comments(payload)
-						apply_comments_when_diffview_ready(payload)
-					end)
-				end, { notify_errors = false })
-			end
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_when_diffview_ready(payload)
+			end)
+		end, { notify_errors = false })
+	end
 
 	local fetch_cmd = {
 		"git",
@@ -1068,12 +1074,12 @@ function M.setup(opts)
 			return
 		end
 
-			run_comments_provider(pr.id, function(payload)
-				vim.schedule(function()
-					set_current_tab_comments(payload)
-					apply_comments_to_tab_windows(payload)
-				end)
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_to_tab_windows(payload)
 			end)
+		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
 
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
@@ -1088,7 +1094,12 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
-	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
+	vim.keymap.set(
+		"n",
+		"gc",
+		"<cmd>BBPROpenLineComments<CR>",
+		{ desc = "Open PR comments for current line", silent = true }
+	)
 	if M.config.comment_next_map and M.config.comment_next_map ~= "" then
 		vim.keymap.set("n", M.config.comment_next_map, function()
 			jump_comment(1)
