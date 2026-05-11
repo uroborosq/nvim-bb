@@ -358,7 +358,8 @@ local function open_comment_float(comments, line)
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
 		local checkbox = task_checkbox_prefix(c) or "- "
-		local header = string.format("%s%s%s %s", indent, checkbox, c.author or "unknown", c.created_at or "unknown time")
+		local header =
+			string.format("%s%s%s %s", indent, checkbox, c.author or "unknown", c.created_at or "unknown time")
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -766,7 +767,7 @@ local function build_approval_lines(pr)
 	for _, reviewer in ipairs(reviewers) do
 		local user = reviewer.user or {}
 		local name = user.displayName or user.name or user.slug or "unknown"
-		local status = normalize_status(reviewer)
+		local status = "**" .. normalize_status(reviewer) .. "**"
 		grouped[status] = grouped[status] or {}
 		table.insert(grouped[status], name)
 	end
