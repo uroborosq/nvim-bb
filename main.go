@@ -285,10 +285,29 @@ type FlatComment struct {
 	Depth    int
 }
 
+type CommentParent struct {
+	ID int64 `json:"id"`
+}
+
+type CreateCommentRequest struct {
+	Text     string         `json:"text"`
+	Severity string         `json:"severity,omitempty"`
+	Parent   *CommentParent `json:"parent,omitempty"`
+	Anchor   *Anchor        `json:"anchor,omitempty"`
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
+	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
+	commentText := flag.String("text", "", "comment/task text")
+	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
+	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
+	commentPath := flag.String("path", "", "repo-relative path for file comment")
+	commentLine := flag.Int("line", 0, "line number for file comment")
+	commentLineType := flag.String("line-type", "CONTEXT", "line type: ADDED|REMOVED|CONTEXT")
+	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	flag.Parse()
 
@@ -304,6 +323,42 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
 	defer cancel()
+
+	if *prCommentID > 0 {
+		text := strings.TrimSpace(*commentText)
+		if text == "" {
+			fatal(errors.New("-text is required with -pr-comment"))
+		}
+
+		req := CreateCommentRequest{Text: text}
+		if *commentTask {
+			req.Severity = "BLOCKER"
+		}
+		if *replyTo > 0 {
+			req.Parent = &CommentParent{ID: *replyTo}
+		}
+		if strings.TrimSpace(*commentPath) != "" || *commentLine > 0 {
+			req.Anchor = &Anchor{
+				Path:     strings.TrimSpace(*commentPath),
+				Line:     *commentLine,
+				LineType: strings.ToUpper(strings.TrimSpace(*commentLineType)),
+				FileType: strings.ToUpper(strings.TrimSpace(*commentFileType)),
+				DiffType: "EFFECTIVE",
+			}
+		}
+
+		created, err := client.CreatePullRequestComment(ctx, *prCommentID, req)
+		if err != nil {
+			fatal(err)
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(created); err != nil {
+			fatal(err)
+		}
+		return
+	}
 
 	if *prCommentsID > 0 {
 		comments, err := client.GetPullRequestComments(ctx, *prCommentsID)
@@ -668,6 +723,46 @@ func extractActivityComment(activity Activity) *PRComment {
 		return activity.Comment
 	}
 	return nil
+}
+
+func (c *Client) CreatePullRequestComment(ctx context.Context, prID int64, payload CreateCommentRequest) (*PRComment, error) {
+	u := *c.baseURL
+	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
+		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments",
+		url.PathEscape(c.cfg.Project),
+		url.PathEscape(c.cfg.Repo),
+		prID,
+	))
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal create comment payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s: %w", u.Redacted(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return nil, fmt.Errorf("BitBucket returned %s: %s", resp.Status, strings.TrimSpace(string(rb)))
+	}
+
+	var out PRComment
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket create comment response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
