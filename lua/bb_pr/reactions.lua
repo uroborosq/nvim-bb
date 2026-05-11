@@ -1,12 +1,22 @@
 local M = {}
 
+-- GitHub-style aliases taken from rxaviers emoji cheatsheet:
+-- https://gist.github.com/rxaviers/7360908#file-gistfile1-md
 local emoji_map = {
+	["+1"] = "👍",
 	THUMBS_UP = "👍",
+	THUMBSUP = "👍",
+	["-1"] = "👎",
 	THUMBS_DOWN = "👎",
+	THUMBSDOWN = "👎",
 	LAUGH = "😄",
+	SMILE = "😄",
+	SMILEY = "😃",
 	HOORAY = "🎉",
+	TADA = "🎉",
 	CONFUSED = "😕",
 	HEART = "❤️",
+	HEARTS = "♥️",
 	ROCKET = "🚀",
 	EYES = "👀",
 }
@@ -16,6 +26,14 @@ local function to_count(v)
 		return math.floor(v)
 	end
 	return 0
+end
+
+local function normalize_key(key)
+	local raw = tostring(key or "")
+	local trimmed = raw:gsub("^:+", ""):gsub(":+$", "")
+	trimmed = trimmed:gsub("%s+", "_")
+	local upper = trimmed:upper()
+	return upper, trimmed:lower()
 end
 
 function M.format_line(reactions)
@@ -44,8 +62,8 @@ function M.format_line(reactions)
 
 	local chunks = {}
 	for _, item in ipairs(items) do
-		local upper = item.key:upper()
-		local label = emoji_map[upper] or (":" .. item.key:lower() .. ":")
+		local upper, fallback = normalize_key(item.key)
+		local label = emoji_map[upper] or (":" .. fallback .. ":")
 		table.insert(chunks, string.format("%s %d", label, item.count))
 	end
 
