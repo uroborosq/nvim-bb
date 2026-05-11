@@ -36,56 +36,14 @@ local function format_pr_entry(pr)
 	local from_ref = (pr.fromRef and pr.fromRef.displayId) or "?"
 	local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
 
-	local function to_number(v)
-		if type(v) == "number" then
-			return math.floor(v)
-		end
-		if type(v) == "string" then
-			local n = tonumber(v)
-			if n then
-				return math.floor(n)
-			end
-		end
-		return nil
-	end
-
-	local function task_status_text()
-		local open = to_number(pr.openTaskCount)
-			or to_number(pr.open_tasks)
-			or to_number(pr.open_task_count)
-		local done = to_number(pr.resolvedTaskCount)
-			or to_number(pr.completedTaskCount)
-			or to_number(pr.resolved_tasks)
-			or to_number(pr.completed_tasks)
-
-		if open == nil and done == nil and type(pr.properties) == "table" then
-			open = to_number(pr.properties.openTaskCount)
-				or to_number(pr.properties.open_tasks)
-				or to_number(pr.properties.open_task_count)
-			done = to_number(pr.properties.resolvedTaskCount)
-				or to_number(pr.properties.completedTaskCount)
-				or to_number(pr.properties.resolved_tasks)
-				or to_number(pr.properties.completed_tasks)
-		end
-
-		if open == nil and done == nil then
-			return "tasks: нет"
-		end
-
-		open = open or 0
-		done = done or 0
-		return string.format("tasks: ✅%d ❌%d", done, open)
-	end
-
 	return string.format(
-		"#%s [%s] %s (%s → %s) — %s — %s",
+		"#%s [%s] %s (%s → %s) — %s",
 		pr.id,
 		pr.state or "-",
 		author,
 		from_ref,
 		to_ref,
-		pr.title or "",
-		task_status_text()
+		pr.title or ""
 	)
 end
 
@@ -168,6 +126,17 @@ local function split_first_line(text)
 		return "(empty)"
 	end
 	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
+end
+
+local function comment_task_status_label(c)
+	if type(c) ~= "table" or not c.is_task then
+		return nil
+	end
+	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+	if status == "DONE" or status == "RESOLVED" then
+		return "✅ выполнено"
+	end
+	return "❌ не выполнено"
 end
 
 local function as_array(value)
@@ -389,6 +358,10 @@ local function open_comment_float(comments, line)
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
 		local header = string.format("%s- %s @ %s", indent, c.author or "unknown", c.created_at or "unknown time")
+		local task_status = comment_task_status_label(c)
+		if task_status then
+			header = header .. " [" .. task_status .. "]"
+		end
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -918,6 +891,10 @@ local function build_overview_comment_lines(payload)
 			local comment_id = tonumber(c.id or 0) or 0
 			local reply_to = tonumber(c.parent_id or 0) or 0
 			local header = string.format("%s- %s @ %s", indent, author, created_at)
+			local task_status = comment_task_status_label(c)
+			if task_status then
+				header = header .. " [" .. task_status .. "]"
+			end
 			if comment_id > 0 then
 				header = header .. string.format(" (#%d)", comment_id)
 			end
