@@ -1081,6 +1081,8 @@ function M.open_list()
 
 			vim.keymap.set("n", "<CR>", function()
 				local line = vim.api.nvim_win_get_cursor(0)[1]
+	local start_line, end_line = get_selected_line_range(bufnr)
+	local start_line, end_line = get_selected_line_range(bufnr)
 				local idx = line - 2
 				local pr = state.prs[idx]
 				if pr then
@@ -1134,6 +1136,25 @@ local function detect_line_type_for_cursor(side, line)
 	end
 	return "CONTEXT"
 end
+
+local function get_selected_line_range(bufnr)
+	if type(bufnr) ~= "number" then
+		return nil, nil
+	end
+	local mode = vim.fn.mode()
+	if mode ~= "v" and mode ~= "V" and mode ~= "" then
+		return nil, nil
+	end
+	local srow = vim.api.nvim_buf_get_mark(bufnr, "<")[1]
+	local erow = vim.api.nvim_buf_get_mark(bufnr, ">")[1]
+	if srow <= 0 or erow <= 0 then
+		return nil, nil
+	end
+	if srow > erow then
+		srow, erow = erow, srow
+	end
+	return srow, erow
+end
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1170,11 +1191,21 @@ local function resolve_comment_context(mode)
 	local side = current_diff_side()
 	local file_type = side == "left" and "FROM" or "TO"
 	local line_type = detect_line_type_for_cursor(side, line) or "CONTEXT"
+	local range_start_line = nil
+	local range_start_line_type = nil
+	if start_line and end_line and end_line > start_line then
+		range_start_line = start_line
+		range_start_line_type = detect_line_type_for_cursor(side, start_line) or line_type
+		line = end_line
+		line_type = detect_line_type_for_cursor(side, end_line) or line_type
+	end
 	return {
 		mode = "new_file",
 		path = rel,
 		line = line,
+		start_line = range_start_line,
 		line_type = line_type,
+		start_line_type = range_start_line_type,
 		file_type = file_type,
 	}
 end
@@ -1209,6 +1240,12 @@ local function post_comment_or_task(is_task, force_reply)
 			table.insert(cmd, tostring(ctx.line or 0))
 			table.insert(cmd, "-line-type")
 			table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
+			if (tonumber(ctx.start_line or 0) or 0) > 0 then
+				table.insert(cmd, "-start-line")
+				table.insert(cmd, tostring(ctx.start_line))
+				table.insert(cmd, "-start-line-type")
+				table.insert(cmd, tostring(ctx.start_line_type or ctx.line_type or "CONTEXT"))
+			end
 			table.insert(cmd, "-file-type")
 			table.insert(cmd, tostring(ctx.file_type or "TO"))
 		end
