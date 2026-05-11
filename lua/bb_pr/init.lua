@@ -1219,24 +1219,41 @@ end
 local function resolve_reply_target_comment_id()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
+	local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
-	local float_ids = vim.b[bufnr].bb_pr_float_comment_ids_by_line
-	if type(float_ids) == "table" then
-		local cid = tonumber(float_ids[line] or 0) or 0
+	local function find_nearest_comment_id(ids_map)
+		if type(ids_map) ~= "table" then
+			return nil
+		end
+
+		local cid = tonumber(ids_map[line] or 0) or 0
 		if cid > 0 then
 			return cid
 		end
-	end
 
-	local overview_ids = vim.b[bufnr].bb_pr_overview_comment_ids_by_line
-	if type(overview_ids) == "table" then
-		local cid = tonumber(overview_ids[line] or 0) or 0
-		if cid > 0 then
-			return cid
+		for l = line - 1, 1, -1 do
+			local text = lines[l] or ""
+			if text:match("^%s*$") or text:match("^%s*###%s+Thread") or text:match("^%s*%-%-%-") then
+				break
+			end
+			local up_cid = tonumber(ids_map[l] or 0) or 0
+			if up_cid > 0 then
+				return up_cid
+			end
 		end
+
+		for l = line + 1, math.min(#lines, line + 3) do
+			local down_cid = tonumber(ids_map[l] or 0) or 0
+			if down_cid > 0 then
+				return down_cid
+			end
+		end
+
+		return nil
 	end
 
-	return nil
+	return find_nearest_comment_id(vim.b[bufnr].bb_pr_float_comment_ids_by_line)
+		or find_nearest_comment_id(vim.b[bufnr].bb_pr_overview_comment_ids_by_line)
 end
 
 local function post_comment_or_task(is_task, force_reply)
