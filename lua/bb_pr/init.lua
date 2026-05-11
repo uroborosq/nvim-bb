@@ -4,6 +4,8 @@ M.config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
 	diffview_cmd = "DiffviewOpen",
+	comment_prev_map = "[C",
+	comment_next_map = "]C",
 }
 
 local state = {
@@ -1053,12 +1055,16 @@ function M.setup(opts)
 	end, { desc = "Open floating window with comments for current line" })
 
 	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
-	vim.keymap.set("n", "]r", function()
-		jump_comment(1)
-	end, { desc = "Jump to next PR comment", silent = true })
-	vim.keymap.set("n", "[r", function()
-		jump_comment(-1)
-	end, { desc = "Jump to previous PR comment", silent = true })
+	if M.config.comment_next_map and M.config.comment_next_map ~= "" then
+		vim.keymap.set("n", M.config.comment_next_map, function()
+			jump_comment(1)
+		end, { desc = "Jump to next PR comment", silent = true })
+	end
+	if M.config.comment_prev_map and M.config.comment_prev_map ~= "" then
+		vim.keymap.set("n", M.config.comment_prev_map, function()
+			jump_comment(-1)
+		end, { desc = "Jump to previous PR comment", silent = true })
+	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
