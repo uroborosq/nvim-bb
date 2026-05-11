@@ -600,13 +600,53 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
+func isLikelyReactionKey(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if upper == "" {
+		return false
+	}
+
+	blocked := map[string]struct{}{
+		"REPOSITORYID": {},
+		"ID":           {},
+		"VERSION":      {},
+		"COUNT":        {},
+		"TOTAL":        {},
+		"VALUE":        {},
+	}
+	if _, bad := blocked[upper]; bad {
+		return false
+	}
+
+	if strings.Contains(upper, "REACTION") || strings.Contains(upper, "EMOJI") {
+		return true
+	}
+
+	known := map[string]struct{}{
+		"+1": {}, "-1": {}, "THUMBS_UP": {}, "THUMBS_DOWN": {}, "THUMBSUP": {}, "THUMBSDOWN": {},
+		"LAUGH": {}, "SMILE": {}, "SMILEY": {}, "HOORAY": {}, "TADA": {}, "CONFUSED": {},
+		"HEART": {}, "EYES": {}, "ROCKET": {},
+	}
+	if _, ok := known[upper]; ok {
+		return true
+	}
+
+	for _, r := range upper {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '+' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return false
+}
+
 func extractReactionCounts(raw any) map[string]int {
 	result := map[string]int{}
 	var walk func(any)
 
 	add := func(key string, count int) {
 		key = strings.TrimSpace(strings.ToUpper(key))
-		if key == "" || count <= 0 {
+		if key == "" || count <= 0 || !isLikelyReactionKey(key) {
 			return
 		}
 		result[key] += count
