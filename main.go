@@ -110,9 +110,164 @@ type User struct {
 	EmailAddress string `json:"emailAddress"`
 }
 
+type CommentPage struct {
+	Size          int         `json:"size"`
+	Limit         int         `json:"limit"`
+	IsLastPage    bool        `json:"isLastPage"`
+	Start         int         `json:"start"`
+	NextPageStart int         `json:"nextPageStart"`
+	Values        []PRComment `json:"values"`
+}
+
+type PRComment struct {
+	ID            int64       `json:"id"`
+	Text          string      `json:"text"`
+	CreatedDate   int64       `json:"createdDate"`
+	UpdatedDate   int64       `json:"updatedDate"`
+	Anchor        *Anchor     `json:"anchor,omitempty"`
+	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
+	Comments      []PRComment `json:"comments,omitempty"`
+	Author        User        `json:"author"`
+}
+
+type Anchor struct {
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
+	LineType string `json:"lineType"`
+	FileType string `json:"fileType"`
+	DiffType string `json:"diffType"`
+}
+
+func (a *Anchor) UnmarshalJSON(data []byte) error {
+	type alias Anchor
+	var direct alias
+	if err := json.Unmarshal(data, &direct); err == nil {
+		*a = Anchor(direct)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if a.Path == "" {
+		a.Path = pickString(raw, "path", "srcPath", "file", "filePath")
+		if a.Path == "" {
+			if p := pickNestedString(raw, "path", "toString"); p != "" {
+				a.Path = p
+			}
+		}
+	}
+	if a.Line == 0 {
+		a.Line = pickInt(raw, "line", "lineNumber", "line_num", "fromLine", "toLine")
+	}
+	if a.LineType == "" {
+		a.LineType = pickString(raw, "lineType")
+	}
+	if a.FileType == "" {
+		a.FileType = pickString(raw, "fileType")
+	}
+	if a.DiffType == "" {
+		a.DiffType = pickString(raw, "diffType")
+	}
+
+	return nil
+}
+
+func pickString(raw map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func pickNestedString(raw map[string]any, k1, k2 string) string {
+	v, ok := raw[k1]
+	if !ok {
+		return ""
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m[k2].(string)
+	return s
+}
+
+func pickInt(raw map[string]any, keys ...string) int {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				if int(n) != 0 {
+					return int(n)
+				}
+			case int:
+				if n != 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+type ActivityPage struct {
+	Size          int        `json:"size"`
+	Limit         int        `json:"limit"`
+	IsLastPage    bool       `json:"isLastPage"`
+	Start         int        `json:"start"`
+	NextPageStart int        `json:"nextPageStart"`
+	Values        []Activity `json:"values"`
+}
+
+type Activity struct {
+	Action        string     `json:"action"`
+	Anchor        *Anchor    `json:"anchor,omitempty"`
+	CommentAnchor *Anchor    `json:"commentAnchor,omitempty"`
+	CommentAction string     `json:"commentAction,omitempty"`
+	Comment       *PRComment `json:"comment"`
+}
+
+type PRCommentView struct {
+	ID            int64  `json:"id"`
+	ParentID      int64  `json:"parent_id,omitempty"`
+	Depth         int    `json:"depth,omitempty"`
+	Text          string `json:"text"`
+	Author        string `json:"author"`
+	CreatedDate   int64  `json:"created_date_ms"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedDate   int64  `json:"updated_date_ms"`
+	UpdatedAt     string `json:"updated_at"`
+	IsFileComment bool   `json:"is_file_comment"`
+	Path          string `json:"path,omitempty"`
+	Line          int    `json:"line,omitempty"`
+	LineType      string `json:"line_type,omitempty"`
+	FileType      string `json:"file_type,omitempty"`
+	DiffType      string `json:"diff_type,omitempty"`
+}
+
+type PullRequestComments struct {
+	PRID             int64           `json:"pr_id"`
+	FetchedAt        string          `json:"fetched_at"`
+	OverviewComments []PRCommentView `json:"overview_comments"`
+	FileComments     []PRCommentView `json:"file_comments"`
+}
+
+type FlatComment struct {
+	Comment  PRComment
+	ParentID int64
+	Depth    int
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
+	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	flag.Parse()
 
@@ -128,6 +283,22 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
 	defer cancel()
+
+	if *prCommentsID > 0 {
+		comments, err := client.GetPullRequestComments(ctx, *prCommentsID)
+		if err != nil {
+			fatal(err)
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+
+		if err := enc.Encode(comments); err != nil {
+			fatal(err)
+		}
+
+		return
+	}
 
 	prs, err := client.GetRepoPullRequests(ctx)
 	if err != nil {
@@ -325,6 +496,149 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 	}
 
 	return all, nil
+}
+
+func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
+	var all []FlatComment
+	start := 0
+
+	for {
+		page, err := c.fetchPullRequestActivityPage(ctx, prID, start)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, activity := range page.Values {
+			root := extractActivityComment(activity)
+			if root != nil {
+				if root.Anchor == nil {
+					root.Anchor = root.CommentAnchor
+				}
+				if root.Anchor == nil {
+					root.Anchor = activity.Anchor
+				}
+				if root.Anchor == nil {
+					root.Anchor = activity.CommentAnchor
+				}
+				all = append(all, flattenCommentTree(*root, 0, 0)...)
+			}
+		}
+
+		if page.IsLastPage {
+			break
+		}
+
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size > 0 {
+				next = start + page.Size
+			} else {
+				return nil, fmt.Errorf("comment pagination stuck: pr=%d start=%d next=%d size=%d", prID, start, page.NextPageStart, page.Size)
+			}
+		}
+		start = next
+	}
+
+	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
+	for _, item := range all {
+		cmt := item.Comment
+		anchor := cmt.Anchor
+		if anchor == nil {
+			anchor = cmt.CommentAnchor
+		}
+
+		view := PRCommentView{
+			ID:          cmt.ID,
+			ParentID:    item.ParentID,
+			Depth:       item.Depth,
+			Text:        cmt.Text,
+			Author:      displayUser(cmt.Author),
+			CreatedDate: cmt.CreatedDate,
+			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
+			UpdatedDate: cmt.UpdatedDate,
+			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+		}
+
+		if anchor != nil {
+			view.IsFileComment = true
+			view.Path = anchor.Path
+			view.Line = anchor.Line
+			view.LineType = anchor.LineType
+			view.FileType = anchor.FileType
+			view.DiffType = anchor.DiffType
+			out.FileComments = append(out.FileComments, view)
+			continue
+		}
+
+		out.OverviewComments = append(out.OverviewComments, view)
+	}
+
+	return out, nil
+}
+
+func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
+	out := []FlatComment{{Comment: root, ParentID: parentID, Depth: depth}}
+	for _, child := range root.Comments {
+		if child.Anchor == nil && child.CommentAnchor == nil {
+			child.Anchor = root.Anchor
+			child.CommentAnchor = root.CommentAnchor
+		}
+		out = append(out, flattenCommentTree(child, root.ID, depth+1)...)
+	}
+	return out
+}
+
+func extractActivityComment(activity Activity) *PRComment {
+	if activity.Comment != nil {
+		return activity.Comment
+	}
+	return nil
+}
+
+func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
+	u := *c.baseURL
+	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
+		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/activities",
+		url.PathEscape(c.cfg.Project),
+		url.PathEscape(c.cfg.Repo),
+		prID,
+	))
+
+	q := u.Query()
+	q.Set("limit", fmt.Sprintf("%d", c.cfg.Limit))
+	q.Set("start", fmt.Sprintf("%d", start))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", u.Redacted(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+
+		return nil, fmt.Errorf(
+			"BitBucket returned %s: %s",
+			resp.Status,
+			strings.TrimSpace(string(body)),
+		)
+	}
+
+	var page ActivityPage
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket activities response: %w", err)
+	}
+
+	return &page, nil
 }
 
 func (c *Client) fetchRepoPRPage(ctx context.Context, start int) (*PRPage, error) {
