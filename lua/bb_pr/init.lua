@@ -653,6 +653,44 @@ local function build_approval_lines(pr)
 	return lines
 end
 
+local function build_overview_comment_lines(payload)
+	local comments = as_array(payload and payload.overview_comments)
+	if #comments == 0 then
+		return { "None" }
+	end
+
+	local lines = {}
+	for idx, c in ipairs(comments) do
+		if idx > 1 then
+			table.insert(lines, "")
+		end
+
+		local author = c.author or "unknown"
+		local created_at = c.created_at or "unknown time"
+		local comment_id = tonumber(c.id or 0) or 0
+		local reply_to = tonumber(c.parent_id or 0) or 0
+		local header = string.format("- %s @ %s", author, created_at)
+		if comment_id > 0 then
+			header = header .. string.format(" (#%d)", comment_id)
+		end
+		if reply_to > 0 then
+			header = header .. string.format(" ↳ reply to #%d", reply_to)
+		end
+		table.insert(lines, header)
+
+		local text = vim.split(c.text or "", "\n", { plain = true })
+		if #text == 0 then
+			table.insert(lines, "  (empty)")
+		else
+			for _, text_line in ipairs(text) do
+				table.insert(lines, "  " .. text_line)
+			end
+		end
+	end
+
+	return lines
+end
+
 local function open_pr_info(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
@@ -675,6 +713,11 @@ local function open_pr_info(pr)
 	table.insert(info_lines, "Approvals:")
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
+	table.insert(info_lines, "")
+	table.insert(info_lines, "Overview comments:")
+
+	local comments_payload = get_current_tab_comments()
+	vim.list_extend(info_lines, build_overview_comment_lines(comments_payload))
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
