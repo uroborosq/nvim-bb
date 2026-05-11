@@ -391,11 +391,14 @@ end
 
 local function jump_file_comment(direction)
 	local bufnr = vim.api.nvim_get_current_buf()
-	local by_line = vim.b[bufnr].bb_pr_line_comments or {}
+	local by_line = vim.b[bufnr].bb_pr_line_comments
+	if type(by_line) ~= "table" then
+		by_line = {}
+	end
 	local current_line = vim.api.nvim_win_get_cursor(0)[1]
 	local lines = {}
 	for line, comments in pairs(by_line) do
-		if comments and #comments > 0 then
+		if type(comments) == "table" and #comments > 0 then
 			table.insert(lines, line)
 		end
 	end
