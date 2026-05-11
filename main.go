@@ -643,6 +643,17 @@ func mergeReactionCounts(dst map[string]int, src map[string]int) map[string]int 
 	return dst
 }
 
+func extractActivityReaction(activity Activity) (int64, string) {
+	if activity.Comment == nil || activity.Comment.ID <= 0 {
+		return 0, ""
+	}
+	reactions := extractReactionCounts(activity.Comment.Reactions)
+	for key := range reactions {
+		return activity.Comment.ID, key
+	}
+	return 0, ""
+}
+
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
 
 	out := []FlatComment{{Comment: root, ParentID: parentID, Depth: depth}}
