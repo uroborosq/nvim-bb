@@ -110,6 +110,16 @@ type User struct {
 	EmailAddress string `json:"emailAddress"`
 }
 
+type Emoticon struct {
+	Shortcut string `json:"shortcut"`
+	URL      string `json:"url"`
+}
+
+type Reaction struct {
+	Emoticon Emoticon `json:"emoticon"`
+	Users    []User   `json:"users"`
+}
+
 type CommentPage struct {
 	Size          int         `json:"size"`
 	Limit         int         `json:"limit"`
@@ -127,6 +137,7 @@ type PRComment struct {
 	Anchor        *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
+	Properties    Properties  `json:"properties,omitempty"`
 	Author        User        `json:"author"`
 }
 
@@ -225,30 +236,36 @@ type ActivityPage struct {
 	Values        []Activity `json:"values"`
 }
 
+type Properties struct {
+	Reactions []Reaction `json:"reactions"`
+}
+
 type Activity struct {
 	Action        string     `json:"action"`
 	Anchor        *Anchor    `json:"anchor,omitempty"`
 	CommentAnchor *Anchor    `json:"commentAnchor,omitempty"`
 	CommentAction string     `json:"commentAction,omitempty"`
 	Comment       *PRComment `json:"comment"`
+	User          User       `json:"user"`
 }
 
 type PRCommentView struct {
-	ID            int64  `json:"id"`
-	ParentID      int64  `json:"parent_id,omitempty"`
-	Depth         int    `json:"depth,omitempty"`
-	Text          string `json:"text"`
-	Author        string `json:"author"`
-	CreatedDate   int64  `json:"created_date_ms"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedDate   int64  `json:"updated_date_ms"`
-	UpdatedAt     string `json:"updated_at"`
-	IsFileComment bool   `json:"is_file_comment"`
-	Path          string `json:"path,omitempty"`
-	Line          int    `json:"line,omitempty"`
-	LineType      string `json:"line_type,omitempty"`
-	FileType      string `json:"file_type,omitempty"`
-	DiffType      string `json:"diff_type,omitempty"`
+	ID            int64          `json:"id"`
+	ParentID      int64          `json:"parent_id,omitempty"`
+	Depth         int            `json:"depth,omitempty"`
+	Text          string         `json:"text"`
+	Author        string         `json:"author"`
+	CreatedDate   int64          `json:"created_date_ms"`
+	CreatedAt     string         `json:"created_at"`
+	UpdatedDate   int64          `json:"updated_date_ms"`
+	UpdatedAt     string         `json:"updated_at"`
+	IsFileComment bool           `json:"is_file_comment"`
+	Path          string         `json:"path,omitempty"`
+	Line          int            `json:"line,omitempty"`
+	LineType      string         `json:"line_type,omitempty"`
+	FileType      string         `json:"file_type,omitempty"`
+	DiffType      string         `json:"diff_type,omitempty"`
+	Reactions     map[string]int `json:"reactions,omitempty"`
 }
 
 type PullRequestComments struct {
@@ -500,6 +517,7 @@ func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error)
 
 func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
 	var all []FlatComment
+	var activities []Activity
 	start := 0
 
 	for {
@@ -508,6 +526,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			return nil, err
 		}
 
+		activities = append(activities, page.Values...)
 		for _, activity := range page.Values {
 			root := extractActivityComment(activity)
 			if root != nil {
@@ -547,6 +566,8 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			anchor = cmt.CommentAnchor
 		}
 
+		commentReactions := extractReactionCounts(cmt.Properties.Reactions)
+
 		view := PRCommentView{
 			ID:          cmt.ID,
 			ParentID:    item.ParentID,
@@ -557,6 +578,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+			Reactions:   commentReactions,
 		}
 
 		if anchor != nil {
@@ -574,6 +596,46 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	}
 
 	return out, nil
+}
+
+func extractReactionCounts(reactions []Reaction) map[string]int {
+	result := map[string]int{}
+	for _, reaction := range reactions {
+		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
+		if key == "" {
+			continue
+		}
+		count := len(reaction.Users)
+		result[key] += count
+	}
+
+	return result
+}
+
+func mergeReactionCounts(dst map[string]int, src map[string]int) map[string]int {
+	if dst == nil {
+		dst = map[string]int{}
+	}
+	for k, v := range src {
+		if v > 0 {
+			dst[k] += v
+		}
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func extractActivityReaction(activity Activity) (int64, string) {
+	if activity.Comment == nil || activity.Comment.ID <= 0 {
+		return 0, ""
+	}
+	reactions := extractReactionCounts(activity.Comment.Properties.Reactions)
+	for key := range reactions {
+		return activity.Comment.ID, key
+	}
+	return 0, ""
 }
 
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
