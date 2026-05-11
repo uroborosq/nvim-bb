@@ -457,6 +457,17 @@ local function jump_overview_comment(direction)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local overview_lines = vim.b[bufnr].bb_pr_overview_comment_lines
 	if type(overview_lines) ~= "table" or #overview_lines == 0 then
+		overview_lines = {}
+		local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+		for idx, line in ipairs(all_lines) do
+			if type(line) == "string" and line:match("^%s*%- .+ @ .+") then
+				table.insert(overview_lines, idx)
+			end
+		end
+		vim.b[bufnr].bb_pr_overview_comment_lines = overview_lines
+	end
+
+	if #overview_lines == 0 then
 		vim.notify("bb_pr: no overview comments in current buffer", vim.log.levels.INFO)
 		return
 	end
