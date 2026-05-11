@@ -1035,6 +1035,21 @@ local function open_pr_info(pr)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
 
+
+local function open_pr_info_with_comments(pr)
+	local payload = get_current_tab_comments()
+	if payload then
+		open_pr_info(pr)
+		return
+	end
+
+	run_comments_provider(pr.id, function(fetched)
+		vim.schedule(function()
+			set_current_tab_comments(fetched)
+			open_pr_info(pr)
+		end)
+	end, { notify_errors = true })
+end
 local function open_telescope_picker(prs)
 	local ok_pickers, pickers = pcall(require, "telescope.pickers")
 	local ok_finders, finders = pcall(require, "telescope.finders")
@@ -1072,7 +1087,7 @@ local function open_telescope_picker(prs)
 				actions.select_horizontal:replace(function()
 					local selection = action_state.get_selected_entry()
 					if selection and selection.value then
-						open_pr_info(selection.value)
+						open_pr_info_with_comments(selection.value)
 					end
 				end)
 
@@ -1113,7 +1128,7 @@ function M.open_list()
 				local idx = line - 2
 				local pr = state.prs[idx]
 				if pr then
-					open_pr_info(pr)
+					open_pr_info_with_comments(pr)
 				end
 			end, { buffer = buf, silent = true })
 
@@ -1329,7 +1344,7 @@ function M.setup(opts)
 			return
 		end
 
-		open_pr_info(pr)
+		open_pr_info_with_comments(pr)
 	end, { desc = "Show info for PR opened in current tab" })
 
 	vim.api.nvim_create_user_command("BBPRLoadComments", function()
