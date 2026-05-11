@@ -7,6 +7,9 @@ M.config = {
 	diffview_cmd = "DiffviewOpen",
 	comment_prev_map = "[C",
 	comment_next_map = "]C",
+	create_comment_map = "cc",
+	create_task_map = "ct",
+	reply_comment_map = "cr",
 }
 
 local state = {
@@ -956,8 +959,15 @@ local function open_pr_info(pr)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 	vim.b[buf].bb_pr_overview_comment_lines = {}
-	for _, line in ipairs(comment_line_numbers) do
-		table.insert(vim.b[buf].bb_pr_overview_comment_lines, overview_start_line + line - 1)
+	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
+	local overview_comments = as_array(comments_payload and comments_payload.overview_comments)
+	for idx, line in ipairs(comment_line_numbers) do
+		local abs = overview_start_line + line - 1
+		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
+		local c = overview_comments[idx]
+		if c and c.id then
+			vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = tonumber(c.id) or 0
+		end
 	end
 
 	vim.diagnostic.enable(false, { bufnr = buf })
@@ -1070,6 +1080,82 @@ function M.open_list()
 	end)
 end
 
+
+
+local function resolve_comment_context(mode)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local line = vim.api.nvim_win_get_cursor(0)[1]
+	local by_line = vim.b[bufnr].bb_pr_line_comments or {}
+	local comments = by_line[line]
+	if comments and #comments > 0 then
+		local cid = tonumber(comments[1].id or 0) or 0
+		if cid > 0 then
+			return { mode = "reply", reply_to = cid }
+		end
+	end
+
+	local ov = vim.b[bufnr].bb_pr_overview_comment_ids_by_line or {}
+	local ocid = tonumber(ov[line] or 0) or 0
+	if ocid > 0 then
+		return { mode = "reply", reply_to = ocid }
+	end
+
+	if mode == "reply" then
+		return nil
+	end
+
+	if vim.bo[bufnr].filetype == "markdown" and type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
+		return { mode = "new_overview" }
+	end
+
+	local rel = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":.")
+	return { mode = "new_file", path = normalize_repo_path(rel), line = line }
+end
+
+local function post_comment_or_task(is_task, force_reply)
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local ctx = resolve_comment_context(force_reply and "reply" or "auto")
+	if not ctx then
+		vim.notify("bb_pr: cannot resolve comment to reply", vim.log.levels.WARN)
+		return
+	end
+	vim.ui.input({ prompt = is_task and "Task text: " or "Comment text: " }, function(input)
+		local text = vim.trim(input or "")
+		if text == "" then
+			return
+		end
+		local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
+		if is_task then
+			table.insert(cmd, "-task")
+		end
+		if ctx.mode == "reply" and ctx.reply_to then
+			table.insert(cmd, "-reply-to")
+			table.insert(cmd, tostring(ctx.reply_to))
+		elseif ctx.mode == "new_file" then
+			table.insert(cmd, "-path")
+			table.insert(cmd, tostring(ctx.path or ""))
+			table.insert(cmd, "-line")
+			table.insert(cmd, tostring(ctx.line or 0))
+		end
+		vim.system(cmd, { text = true }, function(res)
+			if res.code ~= 0 then
+				vim.schedule(function()
+					vim.notify("bb_pr: create comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+				return
+			end
+			vim.schedule(function()
+				vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
+				vim.cmd("BBPRLoadComments")
+			end)
+		end)
+	end)
+end
+
 function M.setup(opts)
 	merge_config(opts)
 
@@ -1129,6 +1215,28 @@ function M.setup(opts)
 		vim.keymap.set("n", M.config.comment_prev_map, function()
 			jump_comment(-1)
 		end, { desc = "Jump to previous PR comment", silent = true })
+	end
+
+	vim.api.nvim_create_user_command("BBPRCreateComment", function()
+		post_comment_or_task(false, false)
+	end, { desc = "Create or reply PR comment from cursor context" })
+
+	vim.api.nvim_create_user_command("BBPRCreateTask", function()
+		post_comment_or_task(true, false)
+	end, { desc = "Create or reply PR task from cursor context" })
+
+	vim.api.nvim_create_user_command("BBPRReplyComment", function()
+		post_comment_or_task(false, true)
+	end, { desc = "Reply to current PR comment" })
+
+	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
+		vim.keymap.set("n", M.config.create_comment_map, "<cmd>BBPRCreateComment<CR>", { desc = "Create PR comment", silent = true })
+	end
+	if M.config.create_task_map and M.config.create_task_map ~= "" then
+		vim.keymap.set("n", M.config.create_task_map, "<cmd>BBPRCreateTask<CR>", { desc = "Create PR task", silent = true })
+	end
+	if M.config.reply_comment_map and M.config.reply_comment_map ~= "" then
+		vim.keymap.set("n", M.config.reply_comment_map, "<cmd>BBPRReplyComment<CR>", { desc = "Reply PR comment", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
