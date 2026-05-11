@@ -1009,21 +1009,15 @@ local function open_pr_info(pr)
 		local cid = tonumber((comment_ids_by_line_order or {})[idx] or 0) or 0
 		if cid > 0 then
 			ids_by_line[abs] = cid
-			vim.notify(vim.inspect(vim.b[buf].bb_pr_overview_comment_ids_by_line))
 		end
 	end
 
 	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
 		local abs = overview_start_line + rel_line - 1
 		ids_by_line[abs] = tonumber(cid) or 0
-
-		vim.notify(tostring(cid))
-		vim.notify(vim.inspect(ids_by_line))
 	end
 
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
-
-	vim.notify(vim.inspect(vim.b[buf].bb_pr_overview_comment_ids_by_line))
 
 	vim.diagnostic.enable(false, { bufnr = buf })
 
