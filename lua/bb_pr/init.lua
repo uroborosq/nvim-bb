@@ -309,6 +309,13 @@ local function enable_markview(buf, win)
 	end
 end
 
+local function set_wrapped_window_options(win)
+	vim.api.nvim_set_option_value("wrap", true, { win = win })
+	vim.api.nvim_set_option_value("linebreak", true, { win = win })
+	vim.api.nvim_set_option_value("breakindent", true, { win = win })
+	vim.api.nvim_set_option_value("breakindentopt", "shift:2,sbr", { win = win })
+end
+
 local function open_comment_float(comments, line)
 	local function trim_edge_empty_lines(items)
 		local first = 1
@@ -389,8 +396,7 @@ local function open_comment_float(comments, line)
 		title_pos = "center",
 	})
 
-	vim.api.nvim_set_option_value("wrap", true, { win = win })
-	vim.api.nvim_set_option_value("linebreak", true, { win = win })
+	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
 end
@@ -956,8 +962,7 @@ local function open_pr_info(pr)
 		title_pos = "center",
 	})
 
-	vim.api.nvim_set_option_value("wrap", true, { win = win })
-	vim.api.nvim_set_option_value("linebreak", true, { win = win })
+	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
