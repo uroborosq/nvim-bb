@@ -2,6 +2,15 @@
 
 **This code was fully vibecoded**
 
+## Roadmap
+
+- autorefresh
+- put reactions
+- approve, needs work, unapproved statues
+- merge (is it possible?)
+
+## Overview
+
 Bitbucket PR helper CLI + Neovim plugin.
 
 - Provider command defaults to `bb -reviewers -json` (override via `setup({ provider_cmd = {...} })`).
