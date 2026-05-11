@@ -139,6 +139,7 @@ type PRComment struct {
 	Comments      []PRComment `json:"comments,omitempty"`
 	Properties    Properties  `json:"properties,omitempty"`
 	Severity      string      `json:"severity,omitempty"`
+	State         string      `json:"state,omitempty"`
 	Author        User        `json:"author"`
 }
 
@@ -586,7 +587,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
 		if severity == "BLOCKER" {
 			view.IsTask = true
-			if isResolvedComment(cmt) {
+			if strings.EqualFold(strings.TrimSpace(cmt.State), "RESOLVED") {
 				view.TaskStatus = "DONE"
 			} else {
 				view.TaskStatus = "OPEN"
@@ -608,18 +609,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	}
 
 	return out, nil
-}
-
-func isResolvedComment(cmt PRComment) bool {
-	if cmt.UpdatedDate <= 0 || cmt.CreatedDate <= 0 {
-		return false
-	}
-	updated := msToTime(cmt.UpdatedDate)
-	created := msToTime(cmt.CreatedDate)
-	if updated.IsZero() || created.IsZero() {
-		return false
-	}
-	return updated.After(created)
 }
 
 func extractReactionCounts(reactions []Reaction) map[string]int {
