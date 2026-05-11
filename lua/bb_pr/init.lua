@@ -897,6 +897,7 @@ local function build_overview_comment_lines(payload)
 
 	local lines = {}
 	local comment_line_numbers = {}
+	local comment_ids_by_line_order = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		if thread_idx > 1 then
@@ -928,6 +929,7 @@ local function build_overview_comment_lines(payload)
 			end
 			table.insert(lines, header)
 			table.insert(comment_line_numbers, #lines)
+			table.insert(comment_ids_by_line_order, comment_id)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
@@ -945,7 +947,7 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 	end
 
-	return lines, comment_line_numbers
+	return lines, comment_line_numbers, comment_ids_by_line_order
 end
 
 local function open_pr_info(pr)
@@ -978,7 +980,7 @@ local function open_pr_info(pr)
 
 	local comments_payload = get_current_tab_comments()
 	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers = build_overview_comment_lines(comments_payload)
+	local overview_lines, comment_line_numbers, comment_ids_by_line_order = build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -987,13 +989,12 @@ local function open_pr_info(pr)
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 	vim.b[buf].bb_pr_overview_comment_lines = {}
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
-	local overview_comments = as_array(comments_payload and comments_payload.overview_comments)
 	for idx, line in ipairs(comment_line_numbers) do
 		local abs = overview_start_line + line - 1
 		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
-		local c = overview_comments[idx]
-		if c and c.id then
-			vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = tonumber(c.id) or 0
+		local cid = tonumber((comment_ids_by_line_order or {})[idx] or 0) or 0
+		if cid > 0 then
+			vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = cid
 		end
 	end
 
