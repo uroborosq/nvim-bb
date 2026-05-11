@@ -461,6 +461,16 @@ local function jump_overview_comment(direction)
 	vim.api.nvim_win_set_cursor(0, { target, 0 })
 end
 
+local function jump_comment(direction)
+	local bufnr = vim.api.nvim_get_current_buf()
+	if type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
+		jump_overview_comment(direction)
+		return
+	end
+
+	jump_file_comment(direction)
+end
+
 apply_comments_to_current_buffer = function(comments_payload)
 	local bufnr = vim.api.nvim_get_current_buf()
 	if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
@@ -909,12 +919,6 @@ local function open_pr_info(pr)
 	enable_markview(buf, win)
 
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
-	vim.keymap.set("n", "]o", function()
-		jump_overview_comment(1)
-	end, { buffer = buf, silent = true, desc = "Jump to next overview comment" })
-	vim.keymap.set("n", "[o", function()
-		jump_overview_comment(-1)
-	end, { buffer = buf, silent = true, desc = "Jump to previous overview comment" })
 end
 
 local function open_telescope_picker(prs)
@@ -1049,12 +1053,12 @@ function M.setup(opts)
 	end, { desc = "Open floating window with comments for current line" })
 
 	vim.keymap.set("n", "gc", "<cmd>BBPROpenLineComments<CR>", { desc = "Open PR comments for current line", silent = true })
-	vim.keymap.set("n", "]c", function()
-		jump_file_comment(1)
-	end, { desc = "Jump to next file comment", silent = true })
-	vim.keymap.set("n", "[c", function()
-		jump_file_comment(-1)
-	end, { desc = "Jump to previous file comment", silent = true })
+	vim.keymap.set("n", "]r", function()
+		jump_comment(1)
+	end, { desc = "Jump to next PR comment", silent = true })
+	vim.keymap.set("n", "[r", function()
+		jump_comment(-1)
+	end, { desc = "Jump to previous PR comment", silent = true })
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
