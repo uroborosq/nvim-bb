@@ -1104,6 +1104,36 @@ end
 
 
 
+
+local function detect_line_type_for_cursor(side, line)
+	local ok, diff_hl = pcall(vim.fn.diff_hlID, line, 1)
+	if not ok then
+		return nil
+	end
+	local hl_id = tonumber(diff_hl or 0) or 0
+	if hl_id == 0 then
+		return "CONTEXT"
+	end
+	local hl_name = vim.fn.synIDattr(hl_id, "name")
+	hl_name = type(hl_name) == "string" and hl_name or ""
+	if hl_name:find("DiffDelete", 1, true) then
+		return "REMOVED"
+	end
+	if hl_name:find("DiffAdd", 1, true) then
+		return "ADDED"
+	end
+	if hl_name:find("DiffChange", 1, true) or hl_name:find("DiffText", 1, true) then
+		return "CONTEXT"
+	end
+
+	if side == "left" then
+		return "REMOVED"
+	end
+	if side == "right" then
+		return "ADDED"
+	end
+	return "CONTEXT"
+end
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1132,15 +1162,8 @@ local function resolve_comment_context(mode)
 
 	local rel = extract_repo_relative_path(vim.api.nvim_buf_get_name(bufnr))
 	local side = current_diff_side()
-	local file_type = "TO"
-	local line_type = "CONTEXT"
-	if side == "left" then
-		file_type = "FROM"
-		line_type = "REMOVED"
-	elseif side == "right" then
-		file_type = "TO"
-		line_type = "ADDED"
-	end
+	local file_type = side == "left" and "FROM" or "TO"
+	local line_type = detect_line_type_for_cursor(side, line) or "CONTEXT"
 	return {
 		mode = "new_file",
 		path = rel,
