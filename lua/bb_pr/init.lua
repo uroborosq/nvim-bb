@@ -407,6 +407,10 @@ local function jump_file_comment(direction)
 		local extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.comment_ns, 0, -1, { details = true })
 		local seen = {}
 		for _, mark in ipairs(extmarks) do
+			local details = mark[4] or {}
+			if details.sign_text ~= "💬" then
+				goto continue
+			end
 			local row = tonumber(mark[2] or -1)
 			if row >= 0 then
 				local line = row + 1
@@ -415,6 +419,7 @@ local function jump_file_comment(direction)
 					table.insert(lines, line)
 				end
 			end
+			::continue::
 		end
 	end
 
