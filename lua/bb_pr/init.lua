@@ -723,13 +723,17 @@ local function build_overview_comment_lines(payload)
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		if thread_idx > 1 then
-			table.insert(lines, "---")
 			table.insert(lines, "")
 		end
 		table.insert(lines, string.format("### Thread %d", thread_idx))
 		table.insert(lines, "")
 
-		for _, c in ipairs(thread_comments) do
+		for comment_idx, c in ipairs(thread_comments) do
+			if #thread_comments > 1 and comment_idx > 1 then
+				table.insert(lines, "---")
+				table.insert(lines, "")
+			end
+
 			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 			local indent = string.rep("  ", depth)
 			local author = c.author or "unknown"
