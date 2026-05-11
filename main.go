@@ -600,26 +600,12 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func isLikelyReactionKey(key string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(key))
-	if upper == "" {
-		return false
-	}
-	known := map[string]struct{}{
-		"+1": {}, "-1": {}, "THUMBSUP": {}, "THUMBSDOWN": {},
-		"THUMBS_UP": {}, "THUMBS_DOWN": {}, "LAUGH": {}, "SMILE": {}, "SMILEY": {},
-		"HOORAY": {}, "TADA": {}, "CONFUSED": {}, "HEART": {}, "EYES": {}, "ROCKET": {},
-	}
-	_, ok := known[upper]
-	return ok
-}
-
 func extractReactionCounts(raw any) map[string]int {
 	result := map[string]int{}
 
 	add := func(key string, count int) {
 		key = strings.ToUpper(strings.TrimSpace(key))
-		if key == "" || count <= 0 || !isLikelyReactionKey(key) {
+		if key == "" || count <= 0 {
 			return
 		}
 		result[key] += count
@@ -651,23 +637,6 @@ func extractReactionCounts(raw any) map[string]int {
 				count = pickInt(m, "count", "total", "value")
 			}
 			add(shortcut, count)
-		}
-	}
-
-	if m, ok := raw.(map[string]any); ok {
-		if s, ok := m["shortcut"].(string); ok {
-			add(s, pickInt(m, "count", "total", "value"))
-		}
-		if emoticon, ok := m["emoticon"].(map[string]any); ok {
-			if s, ok := emoticon["shortcut"].(string); ok {
-				count := pickInt(m, "count", "total", "value")
-				if count == 0 {
-					if users, ok := m["users"].([]any); ok {
-						count = len(users)
-					}
-				}
-				add(s, count)
-			}
 		}
 	}
 
