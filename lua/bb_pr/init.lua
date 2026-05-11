@@ -898,6 +898,7 @@ local function build_overview_comment_lines(payload)
 	local lines = {}
 	local comment_line_numbers = {}
 	local comment_ids_by_line_order = {}
+	local comment_ids_by_relative_line = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		if thread_idx > 1 then
@@ -930,13 +931,22 @@ local function build_overview_comment_lines(payload)
 			table.insert(lines, header)
 			table.insert(comment_line_numbers, #lines)
 			table.insert(comment_ids_by_line_order, comment_id)
+			if comment_id > 0 then
+				comment_ids_by_relative_line[#lines] = comment_id
+			end
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
 				table.insert(lines, indent .. "  (empty)")
+				if comment_id > 0 then
+					comment_ids_by_relative_line[#lines] = comment_id
+				end
 			else
 				for _, msg_line in ipairs(msg_lines) do
 					table.insert(lines, indent .. "  " .. msg_line)
+					if comment_id > 0 then
+						comment_ids_by_relative_line[#lines] = comment_id
+					end
 				end
 			end
 			table.insert(lines, "")
@@ -947,7 +957,7 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 	end
 
-	return lines, comment_line_numbers, comment_ids_by_line_order
+	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
 end
 
 local function open_pr_info(pr)
@@ -980,7 +990,7 @@ local function open_pr_info(pr)
 
 	local comments_payload = get_current_tab_comments()
 	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers, comment_ids_by_line_order = build_overview_comment_lines(comments_payload)
+	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line = build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -996,6 +1006,10 @@ local function open_pr_info(pr)
 		if cid > 0 then
 			vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = cid
 		end
+	end
+	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
+		local abs = overview_start_line + rel_line - 1
+		vim.b[buf].bb_pr_overview_comment_ids_by_line[abs] = tonumber(cid) or 0
 	end
 
 	vim.diagnostic.enable(false, { bufnr = buf })
