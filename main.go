@@ -127,6 +127,7 @@ type PRComment struct {
 	Anchor        *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
+	Reactions     any         `json:"reactions,omitempty"`
 	Author        User        `json:"author"`
 }
 
@@ -234,21 +235,22 @@ type Activity struct {
 }
 
 type PRCommentView struct {
-	ID            int64  `json:"id"`
-	ParentID      int64  `json:"parent_id,omitempty"`
-	Depth         int    `json:"depth,omitempty"`
-	Text          string `json:"text"`
-	Author        string `json:"author"`
-	CreatedDate   int64  `json:"created_date_ms"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedDate   int64  `json:"updated_date_ms"`
-	UpdatedAt     string `json:"updated_at"`
-	IsFileComment bool   `json:"is_file_comment"`
-	Path          string `json:"path,omitempty"`
-	Line          int    `json:"line,omitempty"`
-	LineType      string `json:"line_type,omitempty"`
-	FileType      string `json:"file_type,omitempty"`
-	DiffType      string `json:"diff_type,omitempty"`
+	ID            int64          `json:"id"`
+	ParentID      int64          `json:"parent_id,omitempty"`
+	Depth         int            `json:"depth,omitempty"`
+	Text          string         `json:"text"`
+	Author        string         `json:"author"`
+	CreatedDate   int64          `json:"created_date_ms"`
+	CreatedAt     string         `json:"created_at"`
+	UpdatedDate   int64          `json:"updated_date_ms"`
+	UpdatedAt     string         `json:"updated_at"`
+	IsFileComment bool           `json:"is_file_comment"`
+	Path          string         `json:"path,omitempty"`
+	Line          int            `json:"line,omitempty"`
+	LineType      string         `json:"line_type,omitempty"`
+	FileType      string         `json:"file_type,omitempty"`
+	DiffType      string         `json:"diff_type,omitempty"`
+	Reactions     map[string]int `json:"reactions,omitempty"`
 }
 
 type PullRequestComments struct {
@@ -557,6 +559,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+			Reactions:   extractReactionCounts(cmt.Reactions),
 		}
 
 		if anchor != nil {
@@ -574,6 +577,51 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	}
 
 	return out, nil
+}
+
+func extractReactionCounts(raw any) map[string]int {
+	result := map[string]int{}
+	var walk func(any)
+
+	add := func(key string, count int) {
+		key = strings.TrimSpace(strings.ToUpper(key))
+		if key == "" || count <= 0 {
+			return
+		}
+		result[key] += count
+	}
+
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if k, ok := x["key"].(string); ok {
+				add(k, pickInt(x, "count", "total", "value"))
+			}
+			if k, ok := x["name"].(string); ok {
+				add(k, pickInt(x, "count", "total", "value"))
+			}
+			for k, val := range x {
+				switch n := val.(type) {
+				case float64:
+					add(k, int(n))
+				case int:
+					add(k, n)
+				default:
+					walk(n)
+				}
+			}
+		case []any:
+			for _, item := range x {
+				walk(item)
+			}
+		}
+	}
+
+	walk(raw)
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
