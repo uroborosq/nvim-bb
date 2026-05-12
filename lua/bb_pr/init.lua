@@ -959,7 +959,7 @@ local function build_overview_comment_lines(payload)
 	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
 end
 
-local function open_pr_info(pr)
+local function build_pr_info_content(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
 			return { "(no description)" }
@@ -993,16 +993,23 @@ local function open_pr_info(pr)
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
-	local buf = vim.api.nvim_create_buf(false, true)
+	return info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
+end
+
+local function apply_pr_info_content(buf, pr)
+	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
+		build_pr_info_content(pr)
+
+	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 
+	vim.b[buf].bb_pr_info_pr = pr
 	vim.b[buf].bb_pr_overview_comment_lines = {}
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
 
 	local ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line or {}
-
 	for idx, line in ipairs(comment_line_numbers) do
 		local abs = overview_start_line + line - 1
 		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
@@ -1011,18 +1018,21 @@ local function open_pr_info(pr)
 			ids_by_line[abs] = cid
 		end
 	end
-
 	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
 		local abs = overview_start_line + rel_line - 1
 		ids_by_line[abs] = tonumber(cid) or 0
 	end
-
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
 
 	vim.diagnostic.enable(false, { bufnr = buf })
+end
+
+local function open_pr_info(pr)
+	local buf = vim.api.nvim_create_buf(false, true)
+	apply_pr_info_content(buf, pr)
 
 	local width = math.floor(vim.o.columns * 0.7)
-	local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
+	local height = math.min(vim.api.nvim_buf_line_count(buf) + 2, math.floor(vim.o.lines * 0.7))
 
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
@@ -1360,6 +1370,11 @@ function M.setup(opts)
 			vim.schedule(function()
 				set_current_tab_comments(payload)
 				apply_comments_to_tab_windows(payload)
+				local bufnr = vim.api.nvim_get_current_buf()
+				local info_pr = vim.b[bufnr].bb_pr_info_pr
+				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+					apply_pr_info_content(bufnr, info_pr)
+				end
 			end)
 		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
