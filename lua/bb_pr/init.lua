@@ -10,6 +10,7 @@ M.config = {
 	create_comment_map = "cc",
 	create_task_map = "ct",
 	reply_comment_map = "cr",
+	refresh_comments_map = "<leader>pr",
 }
 
 local state = {
@@ -1474,6 +1475,10 @@ function M.setup(opts)
 		post_comment_or_task(false, true)
 	end, { desc = "Reply to current PR comment" })
 
+	vim.api.nvim_create_user_command("BBPRRefreshComments", function()
+		vim.cmd("BBPRLoadComments")
+	end, { desc = "Force refresh PR comments from server" })
+
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
 			"n",
@@ -1496,6 +1501,14 @@ function M.setup(opts)
 			M.config.reply_comment_map,
 			"<cmd>BBPRReplyComment<CR>",
 			{ desc = "Reply PR comment", silent = true }
+		)
+	end
+	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.refresh_comments_map,
+			"<cmd>BBPRRefreshComments<CR>",
+			{ desc = "Force refresh PR comments", silent = true }
 		)
 	end
 
