@@ -358,6 +358,8 @@ local function set_wrapped_window_options(win)
 end
 
 local function open_comment_float(comments, line)
+	local source_win = vim.api.nvim_get_current_win()
+	local source_buf = vim.api.nvim_get_current_buf()
 	local function trim_edge_empty_lines(items)
 		local first = 1
 		local last = #items
@@ -421,6 +423,9 @@ local function open_comment_float(comments, line)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].filetype = "markdown"
 	vim.b[buf].bb_pr_float_comment_ids_by_line = comment_ids_by_line
+	vim.b[buf].bb_pr_float_source_win = source_win
+	vim.b[buf].bb_pr_float_source_bufnr = source_buf
+	vim.b[buf].bb_pr_float_source_line = line
 	vim.diagnostic.enable(false, { bufnr = buf })
 
 	local base_win = vim.api.nvim_get_current_win()
@@ -1318,6 +1323,11 @@ local function post_comment_or_task(is_task, force_reply)
 
 	local function send_comment(reply_to)
 		local source_tab = vim.api.nvim_get_current_tabpage()
+		local comment_win = vim.api.nvim_get_current_win()
+		local comment_bufnr = vim.api.nvim_get_current_buf()
+		local float_source_win = vim.b[comment_bufnr].bb_pr_float_source_win
+		local float_source_bufnr = vim.b[comment_bufnr].bb_pr_float_source_bufnr
+		local float_source_line = vim.b[comment_bufnr].bb_pr_float_source_line
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
@@ -1352,6 +1362,20 @@ local function post_comment_or_task(is_task, force_reply)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
 							apply_comments_to_specific_tab(source_tab, payload)
+							if float_source_bufnr and float_source_line then
+								if vim.api.nvim_win_is_valid(comment_win) then
+									pcall(vim.api.nvim_win_close, comment_win, true)
+								end
+								if float_source_win and vim.api.nvim_win_is_valid(float_source_win) then
+									vim.api.nvim_win_call(float_source_win, function()
+										local by_line = vim.b[float_source_bufnr].bb_pr_line_comments or {}
+										local updated_comments = by_line[float_source_line]
+										if updated_comments and #updated_comments > 0 then
+											open_comment_float(updated_comments, float_source_line)
+										end
+									end)
+								end
+							end
 						end)
 					end, { notify_errors = false })
 				end)
