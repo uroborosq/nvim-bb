@@ -24,6 +24,7 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `bb -pr-review <id> -review-action approve`
   - `bb -pr-review <id> -review-action disapprove`
   - `bb -pr-review <id> -review-action needs-work`
+  - Note: `needs-work` requires `user` to be set in config so the participant can be resolved.
 - Neovim integration:
   - In `:BBPRInfo` window:
     - `<leader>ra` approve PR
