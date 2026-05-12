@@ -942,10 +942,22 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 		return fmt.Errorf("bad -task-state %q; expected open|done", state)
 	}
 
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/tasks/%d", c.cfg.Project, c.cfg.Repo, prID, taskID)
 	body := taskStateUpdateRequest{State: normalized}
-	_, err := c.doJSON(ctx, http.MethodPut, path, body)
-	return err
+
+	paths := []string{
+		fmt.Sprintf("/rest/api/latest/tasks/%d", taskID),
+		fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/tasks/%d", c.cfg.Project, c.cfg.Repo, prID, taskID),
+	}
+
+	var lastErr error
+	for _, path := range paths {
+		if _, err := c.doJSON(ctx, http.MethodPut, path, body); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func (c *Client) SetPullRequestReview(ctx context.Context, prID int64, action string) error {
