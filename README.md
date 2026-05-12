@@ -6,7 +6,7 @@
 
 - autorefresh
 - put reactions
-- approve, needs work, unapproved statues
+- approve, needs work, unapproved statuses
 - merge (is it possible?)
 
 ## Overview
@@ -20,6 +20,10 @@ Bitbucket PR helper CLI + Neovim plugin.
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
 - CLI: `bb -pr-comments <id> -json` returns structured PR comments (overview + file anchors) with timestamps for Neovim overlays (virtual text / floating windows).
+- CLI review actions:
+  - `bb -pr-review <id> -review-action approve`
+  - `bb -pr-review <id> -review-action disapprove`
+  - `bb -pr-review <id> -review-action needs-work`
 - Neovim integration:
   - PR comments are auto-loaded when opening a PR diff and then auto-applied on buffer enter.
   - `:BBPRLoadComments` loads PR comments for the PR opened in current tab and renders virtual text on commented lines.
