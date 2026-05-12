@@ -251,6 +251,15 @@ type Activity struct {
 	User          User       `json:"user"`
 }
 
+type reviewStatusUpdateRequest struct {
+	Status string `json:"status"`
+}
+
+type selfUser struct {
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
 type PRCommentView struct {
 	ID            int64          `json:"id"`
 	ParentID      int64          `json:"parent_id,omitempty"`
@@ -301,6 +310,8 @@ func main() {
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
+	prReviewID := flag.Int64("pr-review", 0, "set your review state for the given PR id")
+	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	commentText := flag.String("text", "", "comment/task text")
 	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
 	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
@@ -357,6 +368,18 @@ func main() {
 		if err := enc.Encode(created); err != nil {
 			fatal(err)
 		}
+		return
+	}
+
+	if *prReviewID > 0 {
+		action := strings.ToLower(strings.TrimSpace(*reviewAction))
+		if action == "" {
+			fatal(errors.New("-review-action is required with -pr-review"))
+		}
+		if err := client.SetPullRequestReview(ctx, *prReviewID, action); err != nil {
+			fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"review_action\":%q,\"ok\":true}\n", *prReviewID, action)
 		return
 	}
 
@@ -883,6 +906,112 @@ func (c *Client) setAuth(req *http.Request) {
 	case "none":
 		return
 	}
+}
+
+func (c *Client) SetPullRequestReview(ctx context.Context, prID int64, action string) error {
+	switch action {
+	case "approve":
+		return c.approvePullRequest(ctx, prID)
+	case "disapprove":
+		return c.disapprovePullRequest(ctx, prID)
+	case "needs-work":
+		return c.setNeedsWork(ctx, prID)
+	default:
+		return fmt.Errorf("bad -review-action %q; expected approve|disapprove|needs-work", action)
+	}
+}
+
+func (c *Client) approvePullRequest(ctx context.Context, prID int64) error {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/approve", c.cfg.Project, c.cfg.Repo, prID)
+	_, err := c.doJSON(ctx, http.MethodPost, path, nil)
+	return err
+}
+
+func (c *Client) disapprovePullRequest(ctx context.Context, prID int64) error {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/approve", c.cfg.Project, c.cfg.Repo, prID)
+	_, err := c.doJSON(ctx, http.MethodDelete, path, nil)
+	return err
+}
+
+func (c *Client) setNeedsWork(ctx context.Context, prID int64) error {
+	user, err := c.getCurrentUser(ctx)
+	if err != nil {
+		return err
+	}
+	if user.Slug == "" {
+		return errors.New("failed to detect current user slug for needs-work")
+	}
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/participants/%s", c.cfg.Project, c.cfg.Repo, prID, url.PathEscape(user.Slug))
+	body := reviewStatusUpdateRequest{Status: "NEEDS_WORK"}
+	_, err = c.doJSON(ctx, http.MethodPut, path, body)
+	return err
+}
+
+func (c *Client) getCurrentUser(ctx context.Context) (selfUser, error) {
+	var out selfUser
+
+	// Bitbucket Server/Data Center instances may not support /users/~self.
+	// Resolve current user via configured username when available.
+	if strings.TrimSpace(c.cfg.User) != "" {
+		path := "/rest/api/latest/users/" + url.PathEscape(strings.TrimSpace(c.cfg.User))
+		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return out, err
+		}
+		if err := json.Unmarshal(b, &out); err != nil {
+			return out, fmt.Errorf("decode user %q: %w", c.cfg.User, err)
+		}
+		if out.Slug == "" {
+			out.Slug = out.Name
+		}
+		return out, nil
+	}
+
+	return out, errors.New("cannot resolve current user: set config.user for needs-work action")
+}
+
+func (c *Client) doJSON(ctx context.Context, method, path string, payload any) ([]byte, error) {
+	endpoint, err := c.baseURL.Parse(path)
+	if err != nil {
+		return nil, fmt.Errorf("parse endpoint %q: %w", path, err)
+	}
+
+	var body io.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("encode request JSON: %w", err)
+		}
+		body = strings.NewReader(string(data))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("new request %s %s: %w", method, endpoint.String(), err)
+	}
+	c.setAuth(req)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Atlassian-Token", "no-check")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, endpoint.String(), err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read %s response: %w", endpoint.String(), err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s %s: %s: %s", method, endpoint.String(), resp.Status, strings.TrimSpace(string(respBody)))
+	}
+
+	return respBody, nil
 }
 
 func printTable(prs []PullRequest, reviewersEnabled bool) {
