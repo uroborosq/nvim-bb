@@ -319,6 +319,10 @@ func main() {
 	prReviewID := flag.Int64("pr-review", 0, "set your review state for the given PR id")
 	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
+	prReactionID := flag.Int64("pr-reaction", 0, "set reaction on PR comment for the given PR id")
+	reactionCommentID := flag.Int64("comment-id", 0, "comment id for -pr-reaction")
+	reactionShortcut := flag.String("reaction", "", "reaction shortcut for -pr-reaction (e.g. THUMBS_UP, HEART)")
+	reactionAction := flag.String("reaction-action", "add", "reaction action: add|remove")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
 	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
@@ -381,6 +385,22 @@ func main() {
 		return
 	}
 
+	if *prReactionID > 0 {
+		commentID := *reactionCommentID
+		if commentID <= 0 {
+			fatal(errors.New("-comment-id is required with -pr-reaction"))
+		}
+		shortcut := strings.TrimSpace(*reactionShortcut)
+		if shortcut == "" {
+			fatal(errors.New("-reaction is required with -pr-reaction"))
+		}
+		action := strings.ToLower(strings.TrimSpace(*reactionAction))
+		if err := client.SetPullRequestCommentReaction(ctx, *prReactionID, commentID, shortcut, action); err != nil {
+			fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"comment_id\":%d,\"reaction\":%q,\"reaction_action\":%q,\"ok\":true}\n", *prReactionID, commentID, strings.ToUpper(shortcut), action)
+		return
+	}
 	if *prTaskStatusID > 0 {
 		id := *taskID
 		if id <= 0 {
@@ -932,6 +952,25 @@ func (c *Client) setAuth(req *http.Request) {
 
 	case "none":
 		return
+	}
+}
+
+func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, commentID int64, shortcut, action string) error {
+	shortcut = strings.ToUpper(strings.TrimSpace(shortcut))
+	if shortcut == "" {
+		return errors.New("reaction shortcut is required")
+	}
+	path := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/%s",
+		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID, url.PathEscape(shortcut))
+	switch action {
+	case "", "add":
+		_, err := c.doJSON(ctx, http.MethodPost, path, nil)
+		return err
+	case "remove", "delete":
+		_, err := c.doJSON(ctx, http.MethodDelete, path, nil)
+		return err
+	default:
+		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
 }
 
