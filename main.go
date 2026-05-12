@@ -134,7 +134,7 @@ type PRComment struct {
 	Text          string      `json:"text"`
 	CreatedDate   int64       `json:"createdDate"`
 	UpdatedDate   int64       `json:"updatedDate"`
-	Version       int         `json:"version,omitempty"`
+	Version       int         `json:"version"`
 	Anchor        *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
@@ -284,7 +284,7 @@ type PRCommentView struct {
 	Reactions     map[string]int `json:"reactions,omitempty"`
 	IsTask        bool           `json:"is_task,omitempty"`
 	TaskStatus    string         `json:"task_status,omitempty"`
-	Version       int            `json:"version,omitempty"`
+	Version       int            `json:"version"`
 }
 
 type PullRequestComments struct {
@@ -321,7 +321,7 @@ func main() {
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
-	taskVersion := flag.Int("task-version", -1, "comment version for task update (optimistic lock)")
+	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
 	commentText := flag.String("text", "", "comment/task text")
 	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
 	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
