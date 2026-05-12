@@ -11,6 +11,9 @@ M.config = {
 	create_task_map = "ct",
 	reply_comment_map = "cr",
 	refresh_comments_map = "<leader>pr",
+	pr_info_approve_map = "<leader>ra",
+	pr_info_disapprove_map = "<leader>rd",
+	pr_info_needs_work_map = "<leader>rn",
 }
 
 local state = {
@@ -73,6 +76,30 @@ local function run_provider(cb)
 		end
 
 		cb(decoded)
+	end)
+end
+
+local function refresh_current_pr(cb)
+	local current = get_current_tab_pr()
+	if type(current) ~= "table" then
+		cb(nil)
+		return
+	end
+	local current_id = tonumber(current.id or 0) or 0
+	if current_id <= 0 then
+		cb(nil)
+		return
+	end
+
+	run_provider(function(decoded)
+		local found = nil
+		for _, pr in ipairs(decoded) do
+			if tonumber(pr.id or 0) == current_id then
+				found = pr
+				break
+			end
+		end
+		cb(found)
 	end)
 end
 
@@ -1116,6 +1143,50 @@ local function open_pr_info(pr)
 	enable_markview(buf, win)
 
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+
+	local function apply_review_action(action)
+		local pr_id = tonumber(pr.id or 0) or 0
+		if pr_id <= 0 then
+			vim.notify("bb_pr: invalid PR id", vim.log.levels.ERROR)
+			return
+		end
+
+		local cmd = { "bb", "-pr-review", tostring(pr_id), "-review-action", action, "-json" }
+		vim.system(cmd, { text = true }, function(res)
+			if res.code ~= 0 then
+				vim.schedule(function()
+					vim.notify("bb_pr: review action failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+				return
+			end
+
+			refresh_current_pr(function(fresh_pr)
+				vim.schedule(function()
+					local updated = fresh_pr or pr
+					set_current_tab_pr(updated)
+					apply_pr_info_content(buf, updated)
+					local msg = string.format("bb_pr: %s sent for PR #%s", action, tostring(pr_id))
+					vim.notify(msg, vim.log.levels.INFO)
+				end)
+			end)
+		end)
+	end
+
+	if M.config.pr_info_approve_map and M.config.pr_info_approve_map ~= "" then
+		vim.keymap.set("n", M.config.pr_info_approve_map, function()
+			apply_review_action("approve")
+		end, { buffer = buf, silent = true, desc = "Approve PR" })
+	end
+	if M.config.pr_info_disapprove_map and M.config.pr_info_disapprove_map ~= "" then
+		vim.keymap.set("n", M.config.pr_info_disapprove_map, function()
+			apply_review_action("disapprove")
+		end, { buffer = buf, silent = true, desc = "Disapprove PR" })
+	end
+	if M.config.pr_info_needs_work_map and M.config.pr_info_needs_work_map ~= "" then
+		vim.keymap.set("n", M.config.pr_info_needs_work_map, function()
+			apply_review_action("needs-work")
+		end, { buffer = buf, silent = true, desc = "Mark PR needs work" })
+	end
 end
 
 local function open_pr_info_with_comments(pr)
