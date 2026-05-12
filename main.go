@@ -949,14 +949,25 @@ func (c *Client) setNeedsWork(ctx context.Context, prID int64) error {
 
 func (c *Client) getCurrentUser(ctx context.Context) (selfUser, error) {
 	var out selfUser
-	b, err := c.doJSON(ctx, http.MethodGet, "/rest/api/latest/users/~self", nil)
-	if err != nil {
-		return out, err
+
+	// Bitbucket Server/Data Center instances may not support /users/~self.
+	// Resolve current user via configured username when available.
+	if strings.TrimSpace(c.cfg.User) != "" {
+		path := "/rest/api/latest/users/" + url.PathEscape(strings.TrimSpace(c.cfg.User))
+		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return out, err
+		}
+		if err := json.Unmarshal(b, &out); err != nil {
+			return out, fmt.Errorf("decode user %q: %w", c.cfg.User, err)
+		}
+		if out.Slug == "" {
+			out.Slug = out.Name
+		}
+		return out, nil
 	}
-	if err := json.Unmarshal(b, &out); err != nil {
-		return out, fmt.Errorf("decode self user: %w", err)
-	}
-	return out, nil
+
+	return out, errors.New("cannot resolve current user: set config.user for needs-work action")
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, payload any) ([]byte, error) {
