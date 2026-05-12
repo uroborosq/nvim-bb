@@ -11,9 +11,9 @@ M.config = {
 	create_task_map = "ct",
 	reply_comment_map = "cr",
 	refresh_comments_map = "<leader>pr",
-	pr_info_approve_map = "ga",
-	pr_info_disapprove_map = "gd",
-	pr_info_needs_work_map = "gn",
+	pr_info_approve_map = "<leader>ra",
+	pr_info_disapprove_map = "<leader>rd",
+	pr_info_needs_work_map = "<leader>rn",
 }
 
 local state = {

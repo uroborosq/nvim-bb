@@ -26,9 +26,9 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `bb -pr-review <id> -review-action needs-work`
 - Neovim integration:
   - In `:BBPRInfo` window:
-    - `ga` approve PR
-    - `gd` disapprove PR
-    - `gn` mark PR as needs work
+    - `<leader>ra` approve PR
+    - `<leader>rd` disapprove PR
+    - `<leader>rn` mark PR as needs work
     - after action, PR info window auto-refreshes approval block
   - PR comments are auto-loaded when opening a PR diff and then auto-applied on buffer enter.
   - `:BBPRLoadComments` loads PR comments for the PR opened in current tab and renders virtual text on commented lines.
