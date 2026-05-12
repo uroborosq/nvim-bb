@@ -652,6 +652,41 @@ local function apply_comments_to_specific_tab(tabpage, comments_payload)
 	end
 end
 
+local function apply_comments_to_specific_tab_when_ready(tabpage, comments_payload, opts)
+	opts = opts or {}
+	local retries_left = opts.retries or 20
+	local delay_ms = opts.delay_ms or 100
+
+	local function attempt()
+		if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+			return
+		end
+
+		local has_stable_diff_side = false
+		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
+				local side = vim.api.nvim_win_call(win, current_diff_side)
+				if side == "left" or side == "right" then
+					has_stable_diff_side = true
+					break
+				end
+			end
+		end
+
+		if has_stable_diff_side then
+			apply_comments_to_specific_tab(tabpage, comments_payload)
+			return
+		end
+
+		retries_left = retries_left - 1
+		if retries_left > 0 then
+			vim.defer_fn(attempt, delay_ms)
+		end
+	end
+
+	attempt()
+end
+
 local function apply_comments_when_diffview_ready(comments_payload, opts)
 	opts = opts or {}
 	local retries_left = opts.retries or 20
@@ -1362,7 +1397,7 @@ local function post_comment_or_task(is_task, force_reply)
 					run_comments_provider(pr.id, function(payload)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
-							apply_comments_to_specific_tab(source_tab, payload)
+							apply_comments_to_specific_tab_when_ready(source_tab, payload)
 							if float_source_bufnr and float_source_line then
 								if vim.api.nvim_win_is_valid(comment_win) then
 									pcall(vim.api.nvim_win_close, comment_win, true)
@@ -1424,7 +1459,7 @@ function M.setup(opts)
 		run_comments_provider(pr.id, function(payload)
 			vim.schedule(function()
 				set_current_tab_comments(payload)
-				apply_comments_to_tab_windows(payload)
+				apply_comments_when_diffview_ready(payload)
 				local bufnr = vim.api.nvim_get_current_buf()
 				local info_pr = vim.b[bufnr].bb_pr_info_pr
 				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
