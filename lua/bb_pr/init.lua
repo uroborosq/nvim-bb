@@ -10,6 +10,7 @@ M.config = {
 	create_comment_map = "cc",
 	create_task_map = "ct",
 	reply_comment_map = "cr",
+	refresh_comments_map = "<leader>pr",
 }
 
 local state = {
@@ -77,6 +78,7 @@ end
 
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
+local apply_pr_info_content
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -107,10 +109,14 @@ local function run_comments_provider(pr_id, cb, opts)
 	end)
 end
 
-local function set_current_tab_comments(payload)
-	local key = tab_key(vim.api.nvim_get_current_tabpage())
+local function set_tab_comments(tabpage, payload)
+	local key = tab_key(tabpage)
 	state.comments_by_tab[key] = payload
 	state.pending_comments_by_tab[key] = payload
+end
+
+local function set_current_tab_comments(payload)
+	set_tab_comments(vim.api.nvim_get_current_tabpage(), payload)
 end
 
 local function get_current_tab_comments()
@@ -353,6 +359,8 @@ local function set_wrapped_window_options(win)
 end
 
 local function open_comment_float(comments, line)
+	local source_win = vim.api.nvim_get_current_win()
+	local source_buf = vim.api.nvim_get_current_buf()
 	local function trim_edge_empty_lines(items)
 		local first = 1
 		local last = #items
@@ -416,6 +424,9 @@ local function open_comment_float(comments, line)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].filetype = "markdown"
 	vim.b[buf].bb_pr_float_comment_ids_by_line = comment_ids_by_line
+	vim.b[buf].bb_pr_float_source_win = source_win
+	vim.b[buf].bb_pr_float_source_bufnr = source_buf
+	vim.b[buf].bb_pr_float_source_line = line
 	vim.diagnostic.enable(false, { bufnr = buf })
 
 	local base_win = vim.api.nvim_get_current_win()
@@ -442,6 +453,7 @@ local function open_comment_float(comments, line)
 	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+	return win
 end
 
 local function jump_file_comment(direction)
@@ -620,6 +632,60 @@ apply_comments_to_tab_windows = function(comments_payload)
 			end)
 		end
 	end
+end
+
+local function apply_comments_to_specific_tab(tabpage, comments_payload)
+	if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+		return
+	end
+
+	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+		if vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_win_call(win, function()
+				apply_comments_to_current_buffer(comments_payload)
+				local bufnr = vim.api.nvim_get_current_buf()
+				local info_pr = vim.b[bufnr].bb_pr_info_pr
+				if type(info_pr) == "table" then
+					apply_pr_info_content(bufnr, info_pr)
+				end
+			end)
+		end
+	end
+end
+
+local function apply_comments_to_specific_tab_when_ready(tabpage, comments_payload, opts)
+	opts = opts or {}
+	local retries_left = opts.retries or 20
+	local delay_ms = opts.delay_ms or 100
+
+	local function attempt()
+		if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+			return
+		end
+
+		local has_stable_diff_side = false
+		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
+				local side = vim.api.nvim_win_call(win, current_diff_side)
+				if side == "left" or side == "right" then
+					has_stable_diff_side = true
+					break
+				end
+			end
+		end
+
+		if has_stable_diff_side then
+			apply_comments_to_specific_tab(tabpage, comments_payload)
+			return
+		end
+
+		retries_left = retries_left - 1
+		if retries_left > 0 then
+			vim.defer_fn(attempt, delay_ms)
+		end
+	end
+
+	attempt()
 end
 
 local function apply_comments_when_diffview_ready(comments_payload, opts)
@@ -959,7 +1025,7 @@ local function build_overview_comment_lines(payload)
 	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
 end
 
-local function open_pr_info(pr)
+local function build_pr_info_content(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
 			return { "(no description)" }
@@ -993,16 +1059,23 @@ local function open_pr_info(pr)
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
-	local buf = vim.api.nvim_create_buf(false, true)
+	return info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
+end
+
+apply_pr_info_content = function(buf, pr)
+	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
+		build_pr_info_content(pr)
+
+	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 
+	vim.b[buf].bb_pr_info_pr = pr
 	vim.b[buf].bb_pr_overview_comment_lines = {}
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
 
 	local ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line or {}
-
 	for idx, line in ipairs(comment_line_numbers) do
 		local abs = overview_start_line + line - 1
 		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
@@ -1011,18 +1084,21 @@ local function open_pr_info(pr)
 			ids_by_line[abs] = cid
 		end
 	end
-
 	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
 		local abs = overview_start_line + rel_line - 1
 		ids_by_line[abs] = tonumber(cid) or 0
 	end
-
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
 
 	vim.diagnostic.enable(false, { bufnr = buf })
+end
+
+local function open_pr_info(pr)
+	local buf = vim.api.nvim_create_buf(false, true)
+	apply_pr_info_content(buf, pr)
 
 	local width = math.floor(vim.o.columns * 0.7)
-	local height = math.min(#info_lines + 2, math.floor(vim.o.lines * 0.7))
+	local height = math.min(vim.api.nvim_buf_line_count(buf) + 2, math.floor(vim.o.lines * 0.7))
 
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
@@ -1270,6 +1346,34 @@ local function resolve_reply_target_comment_id()
 	return nil
 end
 
+local function refresh_float_window_if_needed(win, buf)
+	local was_current = vim.api.nvim_get_current_win() == win
+	local source_win = vim.b[buf].bb_pr_float_source_win
+	local source_bufnr = vim.b[buf].bb_pr_float_source_bufnr
+	local source_line = vim.b[buf].bb_pr_float_source_line
+	if not (source_win and source_bufnr and source_line) then
+		return
+	end
+	if not (vim.api.nvim_win_is_valid(source_win) and vim.api.nvim_buf_is_valid(source_bufnr)) then
+		return
+	end
+
+	if vim.api.nvim_win_is_valid(win) then
+		pcall(vim.api.nvim_win_close, win, true)
+	end
+	local reopened_win = nil
+	vim.api.nvim_win_call(source_win, function()
+		local by_line = vim.b[source_bufnr].bb_pr_line_comments or {}
+		local updated_comments = by_line[source_line]
+		if updated_comments and #updated_comments > 0 then
+			reopened_win = open_comment_float(updated_comments, source_line)
+		end
+	end)
+	if was_current and reopened_win and vim.api.nvim_win_is_valid(reopened_win) then
+		pcall(vim.api.nvim_set_current_win, reopened_win)
+	end
+end
+
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1283,6 +1387,9 @@ local function post_comment_or_task(is_task, force_reply)
 	end
 
 	local function send_comment(reply_to)
+		local source_tab = vim.api.nvim_get_current_tabpage()
+		local comment_win = vim.api.nvim_get_current_win()
+		local comment_bufnr = vim.api.nvim_get_current_buf()
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
@@ -1313,8 +1420,14 @@ local function post_comment_or_task(is_task, force_reply)
 				end
 				vim.schedule(function()
 					vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
-					vim.cmd("BBPRLoadComments")
-				end)
+					run_comments_provider(pr.id, function(payload)
+						vim.schedule(function()
+							set_tab_comments(source_tab, payload)
+							apply_comments_to_specific_tab_when_ready(source_tab, payload)
+								refresh_float_window_if_needed(comment_win, comment_bufnr)
+							end)
+						end, { notify_errors = false })
+					end)
 			end)
 		end)
 	end
@@ -1356,10 +1469,20 @@ function M.setup(opts)
 			return
 		end
 
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_to_tab_windows(payload)
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					apply_comments_when_diffview_ready(payload)
+					local cur_win = vim.api.nvim_get_current_win()
+					local cur_buf = vim.api.nvim_get_current_buf()
+					vim.defer_fn(function()
+						refresh_float_window_if_needed(cur_win, cur_buf)
+					end, 150)
+					local bufnr = vim.api.nvim_get_current_buf()
+					local info_pr = vim.b[bufnr].bb_pr_info_pr
+					if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+					apply_pr_info_content(bufnr, info_pr)
+				end
 			end)
 		end)
 	end, { desc = "Load PR comments and render virtual text in current buffer" })
@@ -1405,6 +1528,10 @@ function M.setup(opts)
 		post_comment_or_task(false, true)
 	end, { desc = "Reply to current PR comment" })
 
+	vim.api.nvim_create_user_command("BBPRRefreshComments", function()
+		vim.cmd("BBPRLoadComments")
+	end, { desc = "Force refresh PR comments from server" })
+
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
 			"n",
@@ -1427,6 +1554,14 @@ function M.setup(opts)
 			M.config.reply_comment_map,
 			"<cmd>BBPRReplyComment<CR>",
 			{ desc = "Reply PR comment", silent = true }
+		)
+	end
+	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.refresh_comments_map,
+			"<cmd>BBPRRefreshComments<CR>",
+			{ desc = "Force refresh PR comments", silent = true }
 		)
 	end
 
