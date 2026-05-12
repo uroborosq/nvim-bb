@@ -134,6 +134,7 @@ type PRComment struct {
 	Text          string      `json:"text"`
 	CreatedDate   int64       `json:"createdDate"`
 	UpdatedDate   int64       `json:"updatedDate"`
+	Version       int         `json:"version,omitempty"`
 	Anchor        *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
 	Comments      []PRComment `json:"comments,omitempty"`
@@ -283,6 +284,7 @@ type PRCommentView struct {
 	Reactions     map[string]int `json:"reactions,omitempty"`
 	IsTask        bool           `json:"is_task,omitempty"`
 	TaskStatus    string         `json:"task_status,omitempty"`
+	Version       int            `json:"version,omitempty"`
 }
 
 type PullRequestComments struct {
@@ -319,6 +321,7 @@ func main() {
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
+	taskVersion := flag.Int("task-version", -1, "comment version for task update (optimistic lock)")
 	commentText := flag.String("text", "", "comment/task text")
 	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
 	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
@@ -387,7 +390,7 @@ func main() {
 		if state == "" {
 			fatal(errors.New("-task-state is required with -pr-task-status"))
 		}
-		if err := client.SetPullRequestTaskState(ctx, *prTaskStatusID, id, state); err != nil {
+		if err := client.SetPullRequestTaskState(ctx, *prTaskStatusID, id, state, *taskVersion); err != nil {
 			fatal(err)
 		}
 		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"task_id\":%d,\"task_state\":%q,\"ok\":true}\n", *prTaskStatusID, id, state)
@@ -684,6 +687,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
 			Reactions:   commentReactions,
+			Version:     cmt.Version,
 		}
 		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
 		if severity == "BLOCKER" {
@@ -931,7 +935,7 @@ func (c *Client) setAuth(req *http.Request) {
 	}
 }
 
-func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string) error {
+func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string, version int) error {
 	var normalized string
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "open":
@@ -943,7 +947,10 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 	}
 
 	path := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d", c.cfg.Project, c.cfg.Repo, prID, taskID)
-	body := taskStateUpdateRequest{State: normalized}
+	body := struct {
+		State   string `json:"state"`
+		Version int    `json:"version"`
+	}{State: normalized, Version: version}
 	_, err := c.doJSON(ctx, http.MethodPut, path, body)
 	return err
 }

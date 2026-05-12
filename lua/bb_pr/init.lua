@@ -1474,7 +1474,8 @@ local function toggle_task_status()
 	end
 	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
 	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
-	local cmd = { "bb", "-json", "-pr-task-status", tostring(pr.id), "-task-id", tostring(cid), "-task-state", next_state }
+	local version = tonumber(target.version or -1) or -1
+	local cmd = { "bb", "-json", "-pr-task-status", tostring(pr.id), "-task-id", tostring(cid), "-task-state", next_state, "-task-version", tostring(version) }
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
