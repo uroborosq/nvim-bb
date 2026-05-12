@@ -932,6 +932,8 @@ func (c *Client) setAuth(req *http.Request) {
 }
 
 func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string) error {
+	_ = prID // kept for CLI compatibility; Bitbucket task state endpoint is global by task id.
+
 	var normalized string
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "open":
@@ -942,22 +944,10 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 		return fmt.Errorf("bad -task-state %q; expected open|done", state)
 	}
 
+	path := fmt.Sprintf("/rest/api/latest/tasks/%d", taskID)
 	body := taskStateUpdateRequest{State: normalized}
-
-	paths := []string{
-		fmt.Sprintf("/rest/api/latest/tasks/%d", taskID),
-		fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/tasks/%d", c.cfg.Project, c.cfg.Repo, prID, taskID),
-	}
-
-	var lastErr error
-	for _, path := range paths {
-		if _, err := c.doJSON(ctx, http.MethodPut, path, body); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-	}
-	return lastErr
+	_, err := c.doJSON(ctx, http.MethodPut, path, body)
+	return err
 }
 
 func (c *Client) SetPullRequestReview(ctx context.Context, prID int64, action string) error {
