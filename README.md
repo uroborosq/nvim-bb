@@ -4,7 +4,6 @@
 
 ## Roadmap
 
-- autorefresh
 - put reactions
 - approve, needs work, unapproved statues
 - merge (is it possible?)
