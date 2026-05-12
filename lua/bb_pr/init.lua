@@ -453,6 +453,7 @@ local function open_comment_float(comments, line)
 	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+	return win
 end
 
 local function jump_file_comment(direction)
@@ -1346,6 +1347,7 @@ local function resolve_reply_target_comment_id()
 end
 
 local function refresh_float_window_if_needed(win, buf)
+	local was_current = vim.api.nvim_get_current_win() == win
 	local source_win = vim.b[buf].bb_pr_float_source_win
 	local source_bufnr = vim.b[buf].bb_pr_float_source_bufnr
 	local source_line = vim.b[buf].bb_pr_float_source_line
@@ -1359,13 +1361,17 @@ local function refresh_float_window_if_needed(win, buf)
 	if vim.api.nvim_win_is_valid(win) then
 		pcall(vim.api.nvim_win_close, win, true)
 	end
+	local reopened_win = nil
 	vim.api.nvim_win_call(source_win, function()
 		local by_line = vim.b[source_bufnr].bb_pr_line_comments or {}
 		local updated_comments = by_line[source_line]
 		if updated_comments and #updated_comments > 0 then
-			open_comment_float(updated_comments, source_line)
+			reopened_win = open_comment_float(updated_comments, source_line)
 		end
 	end)
+	if was_current and reopened_win and vim.api.nvim_win_is_valid(reopened_win) then
+		pcall(vim.api.nvim_set_current_win, reopened_win)
+	end
 end
 
 local function post_comment_or_task(is_task, force_reply)
