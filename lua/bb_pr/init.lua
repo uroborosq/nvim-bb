@@ -11,6 +11,7 @@ M.config = {
 	create_task_map = "ct",
 	reply_comment_map = "cr",
 	refresh_comments_map = "<leader>pr",
+	toggle_task_map = "<leader>pt",
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
@@ -1445,6 +1446,50 @@ local function refresh_float_window_if_needed(win, buf)
 	end
 end
 
+
+local function toggle_task_status()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a task line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+
+	local payload = get_current_tab_comments() or {}
+	local all_comments = {}
+	for _, c in ipairs(as_array(payload.overview_comments)) do
+		all_comments[tonumber(c.id or 0) or 0] = c
+	end
+	for _, c in ipairs(as_array(payload.file_comments)) do
+		all_comments[tonumber(c.id or 0) or 0] = c
+	end
+	local target = all_comments[cid]
+	if type(target) ~= "table" or not target.is_task then
+		vim.notify("bb_pr: selected comment is not a task", vim.log.levels.WARN)
+		return
+	end
+	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
+	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
+	local version = tonumber(target.version or 0) or 0
+	local cmd = { "bb", "-json", "-pr-task-status", tostring(pr.id), "-task-id", tostring(cid), "-task-state", next_state, "-task-version", tostring(version) }
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: toggle task failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		vim.schedule(function()
+			vim.notify("bb_pr: task marked " .. next_state, vim.log.levels.INFO)
+			vim.cmd("BBPRLoadComments")
+		end)
+	end)
+end
+
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1603,6 +1648,10 @@ function M.setup(opts)
 		vim.cmd("BBPRLoadComments")
 	end, { desc = "Force refresh PR comments from server" })
 
+	vim.api.nvim_create_user_command("BBPRToggleTask", function()
+		toggle_task_status()
+	end, { desc = "Toggle PR task done/open for comment under cursor" })
+
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
 			"n",
@@ -1625,6 +1674,14 @@ function M.setup(opts)
 			M.config.reply_comment_map,
 			"<cmd>BBPRReplyComment<CR>",
 			{ desc = "Reply PR comment", silent = true }
+		)
+	end
+	if M.config.toggle_task_map and M.config.toggle_task_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.toggle_task_map,
+			"<cmd>BBPRToggleTask<CR>",
+			{ desc = "Toggle PR task done/open", silent = true }
 		)
 	end
 	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then

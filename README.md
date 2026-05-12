@@ -35,3 +35,4 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line.
   - `[C` / `]C` jump between PR comments (works in both file diffs and PR overview comments).
   - `<leader>pr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
+  - `<leader>pt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
