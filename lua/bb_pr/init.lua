@@ -1345,6 +1345,29 @@ local function resolve_reply_target_comment_id()
 	return nil
 end
 
+local function refresh_float_window_if_needed(win, buf)
+	local source_win = vim.b[buf].bb_pr_float_source_win
+	local source_bufnr = vim.b[buf].bb_pr_float_source_bufnr
+	local source_line = vim.b[buf].bb_pr_float_source_line
+	if not (source_win and source_bufnr and source_line) then
+		return
+	end
+	if not (vim.api.nvim_win_is_valid(source_win) and vim.api.nvim_buf_is_valid(source_bufnr)) then
+		return
+	end
+
+	if vim.api.nvim_win_is_valid(win) then
+		pcall(vim.api.nvim_win_close, win, true)
+	end
+	vim.api.nvim_win_call(source_win, function()
+		local by_line = vim.b[source_bufnr].bb_pr_line_comments or {}
+		local updated_comments = by_line[source_line]
+		if updated_comments and #updated_comments > 0 then
+			open_comment_float(updated_comments, source_line)
+		end
+	end)
+end
+
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1361,9 +1384,6 @@ local function post_comment_or_task(is_task, force_reply)
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		local comment_win = vim.api.nvim_get_current_win()
 		local comment_bufnr = vim.api.nvim_get_current_buf()
-		local float_source_win = vim.b[comment_bufnr].bb_pr_float_source_win
-		local float_source_bufnr = vim.b[comment_bufnr].bb_pr_float_source_bufnr
-		local float_source_line = vim.b[comment_bufnr].bb_pr_float_source_line
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
@@ -1398,23 +1418,10 @@ local function post_comment_or_task(is_task, force_reply)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
 							apply_comments_to_specific_tab_when_ready(source_tab, payload)
-							if float_source_bufnr and float_source_line then
-								if vim.api.nvim_win_is_valid(comment_win) then
-									pcall(vim.api.nvim_win_close, comment_win, true)
-								end
-								if float_source_win and vim.api.nvim_win_is_valid(float_source_win) then
-									vim.api.nvim_win_call(float_source_win, function()
-										local by_line = vim.b[float_source_bufnr].bb_pr_line_comments or {}
-										local updated_comments = by_line[float_source_line]
-										if updated_comments and #updated_comments > 0 then
-											open_comment_float(updated_comments, float_source_line)
-										end
-									end)
-								end
-							end
-						end)
-					end, { notify_errors = false })
-				end)
+								refresh_float_window_if_needed(comment_win, comment_bufnr)
+							end)
+						end, { notify_errors = false })
+					end)
 			end)
 		end)
 	end
@@ -1456,13 +1463,18 @@ function M.setup(opts)
 			return
 		end
 
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_when_diffview_ready(payload)
-				local bufnr = vim.api.nvim_get_current_buf()
-				local info_pr = vim.b[bufnr].bb_pr_info_pr
-				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					apply_comments_when_diffview_ready(payload)
+					local cur_win = vim.api.nvim_get_current_win()
+					local cur_buf = vim.api.nvim_get_current_buf()
+					vim.defer_fn(function()
+						refresh_float_window_if_needed(cur_win, cur_buf)
+					end, 150)
+					local bufnr = vim.api.nvim_get_current_buf()
+					local info_pr = vim.b[bufnr].bb_pr_info_pr
+					if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
 					apply_pr_info_content(bufnr, info_pr)
 				end
 			end)
