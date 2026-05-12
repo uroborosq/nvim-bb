@@ -991,6 +991,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload any) (
 	}
 	c.setAuth(req)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Atlassian-Token", "no-check")
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
