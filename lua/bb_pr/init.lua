@@ -77,6 +77,7 @@ end
 
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
+local apply_pr_info_content
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -107,10 +108,14 @@ local function run_comments_provider(pr_id, cb, opts)
 	end)
 end
 
-local function set_current_tab_comments(payload)
-	local key = tab_key(vim.api.nvim_get_current_tabpage())
+local function set_tab_comments(tabpage, payload)
+	local key = tab_key(tabpage)
 	state.comments_by_tab[key] = payload
 	state.pending_comments_by_tab[key] = payload
+end
+
+local function set_current_tab_comments(payload)
+	set_tab_comments(vim.api.nvim_get_current_tabpage(), payload)
 end
 
 local function get_current_tab_comments()
@@ -622,6 +627,25 @@ apply_comments_to_tab_windows = function(comments_payload)
 	end
 end
 
+local function apply_comments_to_specific_tab(tabpage, comments_payload)
+	if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+		return
+	end
+
+	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+		if vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_win_call(win, function()
+				apply_comments_to_current_buffer(comments_payload)
+				local bufnr = vim.api.nvim_get_current_buf()
+				local info_pr = vim.b[bufnr].bb_pr_info_pr
+				if type(info_pr) == "table" then
+					apply_pr_info_content(bufnr, info_pr)
+				end
+			end)
+		end
+	end
+end
+
 local function apply_comments_when_diffview_ready(comments_payload, opts)
 	opts = opts or {}
 	local retries_left = opts.retries or 20
@@ -996,7 +1020,7 @@ local function build_pr_info_content(pr)
 	return info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
 end
 
-local function apply_pr_info_content(buf, pr)
+apply_pr_info_content = function(buf, pr)
 	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
 		build_pr_info_content(pr)
 
@@ -1293,6 +1317,7 @@ local function post_comment_or_task(is_task, force_reply)
 	end
 
 	local function send_comment(reply_to)
+		local source_tab = vim.api.nvim_get_current_tabpage()
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
@@ -1323,7 +1348,12 @@ local function post_comment_or_task(is_task, force_reply)
 				end
 				vim.schedule(function()
 					vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
-					vim.cmd("BBPRLoadComments")
+					run_comments_provider(pr.id, function(payload)
+						vim.schedule(function()
+							set_tab_comments(source_tab, payload)
+							apply_comments_to_specific_tab(source_tab, payload)
+						end)
+					end, { notify_errors = false })
 				end)
 			end)
 		end)
