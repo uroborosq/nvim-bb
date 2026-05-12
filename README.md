@@ -5,8 +5,11 @@
 ## Roadmap
 
 - put reactions
-- approve, needs work, unapproved statuses
 - merge (is it possible?)
+- pr creation
+- comments deletion
+- comments resolving
+- images (haha)
 
 ## Overview
 
