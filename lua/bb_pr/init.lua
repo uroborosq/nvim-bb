@@ -12,7 +12,7 @@ M.config = {
 	reply_comment_map = "cr",
 	react_comment_map = "<leader>re",
 	reaction_default = "THUMBS_UP",
-	reaction_choices = { "THUMBS_UP", "HEART", "LAUGH", "HOORAY", "EYES", "THUMBS_DOWN" },
+	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>pr",
 	toggle_task_map = "<leader>pt",
 	pr_info_approve_map = "<leader>ra",
@@ -1533,7 +1533,12 @@ local function react_to_comment()
 	if #normalized == 0 then
 		normalized = { string.upper(tostring(M.config.reaction_default or "THUMBS_UP")) }
 	end
-	vim.ui.select(normalized, { prompt = "Pick reaction" }, function(choice)
+	vim.ui.select(normalized, {
+		prompt = "Pick reaction",
+		format_item = function(item)
+			return reactions.render_choice(item)
+		end,
+	}, function(choice)
 		if not choice or choice == "" then
 			return
 		end
