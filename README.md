@@ -41,5 +41,7 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `<leader>pr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
   - `<leader>pt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
-  - `<leader>pe` (or `:BBPRReactComment`) adds a reaction to the comment under cursor, and can be customized via `setup({ react_comment_map = "..." })`.
+  - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
   - Reaction choices are configurable via `setup({ reaction_choices = { "THUMBS_UP", "HEART", "LAUGH" } })`.
+
+  - Your own reactions are marked with `(you)` in comment popups/overview so you can quickly see what you already added.
