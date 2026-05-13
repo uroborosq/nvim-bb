@@ -10,6 +10,9 @@ M.config = {
 	create_comment_map = "cc",
 	create_task_map = "ct",
 	reply_comment_map = "cr",
+	react_comment_map = "<leader>pe",
+	reaction_default = "THUMBS_UP",
+	reaction_choices = { "THUMBS_UP", "HEART", "LAUGH", "HOORAY", "EYES", "THUMBS_DOWN" },
 	refresh_comments_map = "<leader>pr",
 	toggle_task_map = "<leader>pt",
 	pr_info_approve_map = "<leader>ra",
@@ -1507,6 +1510,60 @@ local function toggle_task_status()
 	end)
 end
 
+
+local function react_to_comment()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+	local choices = as_array(M.config.reaction_choices)
+	local normalized = {}
+	for _, item in ipairs(choices) do
+		local v = tostring(item or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if v ~= "" then
+			table.insert(normalized, string.upper(v))
+		end
+	end
+	if #normalized == 0 then
+		normalized = { string.upper(tostring(M.config.reaction_default or "THUMBS_UP")) }
+	end
+	vim.ui.select(normalized, { prompt = "Pick reaction" }, function(choice)
+		if not choice or choice == "" then
+			return
+		end
+		local cmd = {
+			"bb",
+			"-json",
+			"-pr-reaction",
+			tostring(pr.id),
+			"-comment-id",
+			tostring(cid),
+			"-reaction",
+			choice,
+			"-reaction-action",
+			"add",
+		}
+		vim.system(cmd, { text = true }, function(res)
+			if res.code ~= 0 then
+				vim.schedule(function()
+					vim.notify("bb_pr: add reaction failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+				return
+			end
+			vim.schedule(function()
+				vim.notify("bb_pr: reaction added", vim.log.levels.INFO)
+				vim.cmd("BBPRLoadComments")
+			end)
+		end)
+	end)
+end
+
 local function post_comment_or_task(is_task, force_reply)
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1669,6 +1726,10 @@ function M.setup(opts)
 		toggle_task_status()
 	end, { desc = "Toggle PR task done/open for comment under cursor" })
 
+	vim.api.nvim_create_user_command("BBPRReactComment", function()
+		react_to_comment()
+	end, { desc = "Add reaction to comment under cursor" })
+
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
 			"n",
@@ -1691,6 +1752,14 @@ function M.setup(opts)
 			M.config.reply_comment_map,
 			"<cmd>BBPRReplyComment<CR>",
 			{ desc = "Reply PR comment", silent = true }
+		)
+	end
+	if M.config.react_comment_map and M.config.react_comment_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.react_comment_map,
+			"<cmd>BBPRReactComment<CR>",
+			{ desc = "React to PR comment", silent = true }
 		)
 	end
 	if M.config.toggle_task_map and M.config.toggle_task_map ~= "" then
