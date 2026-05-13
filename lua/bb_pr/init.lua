@@ -35,8 +35,18 @@ local function set_current_tab_pr(pr)
 	state.comments_by_tab[key] = nil
 end
 
+local function set_tab_pr(tabpage, pr)
+	local key = tab_key(tabpage)
+	state.pr_by_tab[key] = pr
+	state.comments_by_tab[key] = nil
+end
+
 local function get_current_tab_pr()
 	return state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
+
+local function get_tab_pr(tabpage)
+	return state.pr_by_tab[tab_key(tabpage)]
 end
 
 local function format_pr_entry(pr)
@@ -80,8 +90,8 @@ local function run_provider(cb)
 	end)
 end
 
-local function refresh_current_pr(cb)
-	local current = get_current_tab_pr()
+local function refresh_current_pr(cb, tabpage)
+	local current = tabpage and get_tab_pr(tabpage) or get_current_tab_pr()
 	if type(current) ~= "table" then
 		cb(nil)
 		return
@@ -1153,6 +1163,7 @@ local function open_pr_info(pr)
 		end
 
 		local cmd = { "bb", "-pr-review", tostring(pr_id), "-review-action", action, "-json" }
+		local source_tab = vim.api.nvim_get_current_tabpage()
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
 				vim.schedule(function()
@@ -1164,12 +1175,12 @@ local function open_pr_info(pr)
 			refresh_current_pr(function(fresh_pr)
 				vim.schedule(function()
 					local updated = fresh_pr or pr
-					set_current_tab_pr(updated)
+					set_tab_pr(source_tab, updated)
 					apply_pr_info_content(buf, updated)
 					local msg = string.format("bb_pr: %s sent for PR #%s", action, tostring(pr_id))
 					vim.notify(msg, vim.log.levels.INFO)
 				end)
-			end)
+			end, source_tab)
 		end)
 	end
 
