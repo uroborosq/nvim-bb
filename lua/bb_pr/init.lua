@@ -26,6 +26,8 @@ local state = {
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
+	reaction_usage_by_key = {},
+	reaction_usage_seq = 0,
 }
 
 local function tab_key(tabpage)
@@ -1511,6 +1513,19 @@ local function toggle_task_status()
 end
 
 
+
+local function sort_reactions_by_recent_use(choices)
+	table.sort(choices, function(a, b)
+		local sa = tonumber(state.reaction_usage_by_key[a] or 0) or 0
+		local sb = tonumber(state.reaction_usage_by_key[b] or 0) or 0
+		if sa ~= sb then
+			return sa > sb
+		end
+		return a < b
+	end)
+	return choices
+end
+
 local function react_to_comment()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1533,6 +1548,7 @@ local function react_to_comment()
 	if #normalized == 0 then
 		normalized = { string.upper(tostring(M.config.reaction_default or "THUMBS_UP")) }
 	end
+	sort_reactions_by_recent_use(normalized)
 	vim.ui.select(normalized, {
 		prompt = "Pick reaction",
 		format_item = function(item)
@@ -1582,6 +1598,8 @@ local function react_to_comment()
 				return
 			end
 			vim.schedule(function()
+				state.reaction_usage_seq = (tonumber(state.reaction_usage_seq or 0) or 0) + 1
+				state.reaction_usage_by_key[choice] = state.reaction_usage_seq
 				vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
 				vim.cmd("BBPRLoadComments")
 			end)
