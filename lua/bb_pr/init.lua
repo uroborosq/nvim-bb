@@ -31,6 +31,8 @@ local state = {
 	reaction_usage_seq = 0,
 }
 
+local format_opened_age
+
 local function tab_key(tabpage)
 	return tostring(tabpage)
 end
@@ -171,7 +173,6 @@ end
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
 local apply_pr_info_content
-local format_opened_age
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
