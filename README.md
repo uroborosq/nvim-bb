@@ -40,4 +40,4 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `<leader>pt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
   - `<leader>pe` (or `:BBPRReactComment`) adds a reaction to the comment under cursor, and can be customized via `setup({ react_comment_map = "..." })`.
-  - For Bitbucket Server 8.9.x self-hosted, reactions are implemented via comment likes; default choice is `THUMBS_UP`.
+  - Reaction choices are configurable via `setup({ reaction_choices = { "THUMBS_UP", "HEART", "LAUGH" } })`.

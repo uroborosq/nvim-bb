@@ -960,9 +960,11 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	if shortcut == "" {
 		return errors.New("reaction shortcut is required")
 	}
-	if shortcut != "THUMBS_UP" && shortcut != "+1" && shortcut != "LIKE" {
-		return fmt.Errorf("bitbucket server 8.9.x supports only like reaction; got %q", shortcut)
+	if shortcut == "+1" {
+		shortcut = "THUMBS_UP"
 	}
+	reactionPath := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/reactions/%s",
+		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID, url.PathEscape(shortcut))
 	likesPath := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/likes",
 		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
 
@@ -972,9 +974,21 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	}
 	switch action {
 	case "", "add":
-		return try(http.MethodPost, likesPath)
+		if err := try(http.MethodPost, reactionPath); err == nil {
+			return nil
+		}
+		if shortcut == "THUMBS_UP" || shortcut == "LIKE" {
+			return try(http.MethodPost, likesPath)
+		}
+		return try(http.MethodPost, reactionPath)
 	case "remove", "delete":
-		return try(http.MethodDelete, likesPath)
+		if err := try(http.MethodDelete, reactionPath); err == nil {
+			return nil
+		}
+		if shortcut == "THUMBS_UP" || shortcut == "LIKE" {
+			return try(http.MethodDelete, likesPath)
+		}
+		return try(http.MethodDelete, reactionPath)
 	default:
 		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
