@@ -974,13 +974,13 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	}
 	switch action {
 	case "", "add":
-		if err := try(http.MethodPost, reactionPath); err == nil {
+		if err := try(http.MethodPut, reactionPath); err == nil {
 			return nil
 		}
 		if shortcut == "THUMBS_UP" || shortcut == "LIKE" {
 			return try(http.MethodPost, likesPath)
 		}
-		return try(http.MethodPost, reactionPath)
+		return try(http.MethodPut, reactionPath)
 	case "remove", "delete":
 		if err := try(http.MethodDelete, reactionPath); err == nil {
 			return nil
