@@ -44,5 +44,6 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
   - Reaction choices are configurable via `setup({ reaction_choices = { "THUMBS_UP", "HEART", "LAUGH" } })`, and now default to the full rxaviers GitHub emoji reaction list.
   - Reaction picker entries are rendered as emoji/symbol + alias (for example `👍  THUMBS_UP`) so large reaction sets stay readable.
+  - Reaction picker ordering is recency-based during the session: the most recently applied reactions are shown first.
 
   - Your own reactions are marked with `(you)` in comment popups/overview so you can quickly see what you already added.
