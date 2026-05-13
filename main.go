@@ -956,7 +956,7 @@ func (c *Client) setAuth(req *http.Request) {
 }
 
 func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, commentID int64, shortcut, action string) error {
-	shortcut = strings.ToUpper(strings.TrimSpace(shortcut))
+	shortcut = strings.ToLower(strings.TrimSpace(shortcut))
 	if shortcut == "" {
 		return errors.New("reaction shortcut is required")
 	}

@@ -8,6 +8,8 @@
 - pr creation
 - comments deletion
 - comments resolving
+- all comments overview
+- etwa dashboard
 - images (haha)
 
 ## Overview
