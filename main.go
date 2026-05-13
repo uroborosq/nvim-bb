@@ -266,25 +266,26 @@ type selfUser struct {
 }
 
 type PRCommentView struct {
-	ID            int64          `json:"id"`
-	ParentID      int64          `json:"parent_id,omitempty"`
-	Depth         int            `json:"depth,omitempty"`
-	Text          string         `json:"text"`
-	Author        string         `json:"author"`
-	CreatedDate   int64          `json:"created_date_ms"`
-	CreatedAt     string         `json:"created_at"`
-	UpdatedDate   int64          `json:"updated_date_ms"`
-	UpdatedAt     string         `json:"updated_at"`
-	IsFileComment bool           `json:"is_file_comment"`
-	Path          string         `json:"path,omitempty"`
-	Line          int            `json:"line,omitempty"`
-	LineType      string         `json:"line_type,omitempty"`
-	FileType      string         `json:"file_type,omitempty"`
-	DiffType      string         `json:"diff_type,omitempty"`
-	Reactions     map[string]int `json:"reactions,omitempty"`
-	IsTask        bool           `json:"is_task,omitempty"`
-	TaskStatus    string         `json:"task_status,omitempty"`
-	Version       int            `json:"version"`
+	ID            int64           `json:"id"`
+	ParentID      int64           `json:"parent_id,omitempty"`
+	Depth         int             `json:"depth,omitempty"`
+	Text          string          `json:"text"`
+	Author        string          `json:"author"`
+	CreatedDate   int64           `json:"created_date_ms"`
+	CreatedAt     string          `json:"created_at"`
+	UpdatedDate   int64           `json:"updated_date_ms"`
+	UpdatedAt     string          `json:"updated_at"`
+	IsFileComment bool            `json:"is_file_comment"`
+	Path          string          `json:"path,omitempty"`
+	Line          int             `json:"line,omitempty"`
+	LineType      string          `json:"line_type,omitempty"`
+	FileType      string          `json:"file_type,omitempty"`
+	DiffType      string          `json:"diff_type,omitempty"`
+	Reactions     map[string]int  `json:"reactions,omitempty"`
+	MyReactions   map[string]bool `json:"my_reactions,omitempty"`
+	IsTask        bool            `json:"is_task,omitempty"`
+	TaskStatus    string          `json:"task_status,omitempty"`
+	Version       int             `json:"version"`
 }
 
 type PullRequestComments struct {
@@ -647,6 +648,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	var all []FlatComment
 	var activities []Activity
 	start := 0
+	self, _ := c.getCurrentUser(ctx)
 
 	for {
 		page, err := c.fetchPullRequestActivityPage(ctx, prID, start)
@@ -695,6 +697,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 
 		commentReactions := extractReactionCounts(cmt.Properties.Reactions)
+		myReactions := extractMyReactions(cmt.Properties.Reactions, self)
 
 		view := PRCommentView{
 			ID:          cmt.ID,
@@ -707,6 +710,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			UpdatedDate: cmt.UpdatedDate,
 			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
 			Reactions:   commentReactions,
+			MyReactions: myReactions,
 			Version:     cmt.Version,
 		}
 		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
@@ -747,6 +751,28 @@ func extractReactionCounts(reactions []Reaction) map[string]int {
 		result[key] += count
 	}
 
+	return result
+}
+
+func extractMyReactions(reactions []Reaction, self selfUser) map[string]bool {
+	result := map[string]bool{}
+	selfName := strings.TrimSpace(self.Name)
+	selfSlug := strings.TrimSpace(self.Slug)
+	for _, reaction := range reactions {
+		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
+		if key == "" {
+			continue
+		}
+		for _, u := range reaction.Users {
+			if (selfName != "" && strings.EqualFold(strings.TrimSpace(u.Name), selfName)) || (selfSlug != "" && strings.EqualFold(strings.TrimSpace(u.Slug), selfSlug)) {
+				result[key] = true
+				break
+			}
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
 	return result
 }
 

@@ -10,7 +10,7 @@ M.config = {
 	create_comment_map = "cc",
 	create_task_map = "ct",
 	reply_comment_map = "cr",
-	react_comment_map = "<leader>pe",
+	react_comment_map = "<leader>re",
 	reaction_default = "THUMBS_UP",
 	reaction_choices = { "THUMBS_UP", "HEART", "LAUGH", "HOORAY", "EYES", "THUMBS_DOWN" },
 	refresh_comments_map = "<leader>pr",
@@ -454,7 +454,7 @@ local function open_comment_float(comments, line)
 		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, indent .. "  " .. msg_line)
 		end
-		local reactions_line = reactions.format_line(c.reactions)
+		local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
 		if reactions_line then
 			table.insert(lines, "")
 			table.insert(lines, indent .. "  " .. reactions_line)
@@ -1537,6 +1537,26 @@ local function react_to_comment()
 		if not choice or choice == "" then
 			return
 		end
+		local payload = get_current_tab_comments() or {}
+		local existing = nil
+		for _, c in ipairs(as_array(payload.overview_comments)) do
+			if tonumber(c.id or 0) == cid then
+				existing = c
+				break
+			end
+		end
+		if not existing then
+			for _, c in ipairs(as_array(payload.file_comments)) do
+				if tonumber(c.id or 0) == cid then
+					existing = c
+					break
+				end
+			end
+		end
+		local action = "add"
+		if type(existing) == "table" and type(existing.my_reactions) == "table" and existing.my_reactions[choice] then
+			action = "remove"
+		end
 		local cmd = {
 			"bb",
 			"-json",
@@ -1547,7 +1567,7 @@ local function react_to_comment()
 			"-reaction",
 			choice,
 			"-reaction-action",
-			"add",
+			action,
 		}
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
@@ -1557,7 +1577,7 @@ local function react_to_comment()
 				return
 			end
 			vim.schedule(function()
-				vim.notify("bb_pr: reaction added", vim.log.levels.INFO)
+				vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
 				vim.cmd("BBPRLoadComments")
 			end)
 		end)

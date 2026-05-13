@@ -36,7 +36,7 @@ local function normalize_key(key)
 	return upper, trimmed:lower()
 end
 
-function M.format_line(reactions)
+function M.format_line(reactions, my_reactions)
 	if type(reactions) ~= "table" then
 		return nil
 	end
@@ -62,9 +62,14 @@ function M.format_line(reactions)
 
 	local chunks = {}
 	for _, item in ipairs(items) do
+		local mine = type(my_reactions) == "table" and my_reactions[string.upper(item.key)]
 		local upper, fallback = normalize_key(item.key)
 		local label = emoji_map[upper] or (":" .. fallback .. ":")
-		table.insert(chunks, string.format("%s %d", label, item.count))
+				if mine then
+			table.insert(chunks, string.format("%s %d (you)", label, item.count))
+		else
+			table.insert(chunks, string.format("%s %d", label, item.count))
+		end
 	end
 
 	return table.concat(chunks, "  ")
