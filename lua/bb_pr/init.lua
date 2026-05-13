@@ -29,16 +29,22 @@ local function tab_key(tabpage)
 	return tostring(tabpage)
 end
 
-local function set_current_tab_pr(pr)
+local function set_current_tab_pr(pr, opts)
+	opts = opts or {}
 	local key = tab_key(vim.api.nvim_get_current_tabpage())
 	state.pr_by_tab[key] = pr
-	state.comments_by_tab[key] = nil
+	if not opts.preserve_comments then
+		state.comments_by_tab[key] = nil
+	end
 end
 
-local function set_tab_pr(tabpage, pr)
+local function set_tab_pr(tabpage, pr, opts)
+	opts = opts or {}
 	local key = tab_key(tabpage)
 	state.pr_by_tab[key] = pr
-	state.comments_by_tab[key] = nil
+	if not opts.preserve_comments then
+		state.comments_by_tab[key] = nil
+	end
 end
 
 local function get_current_tab_pr()
@@ -1175,7 +1181,7 @@ local function open_pr_info(pr)
 			refresh_current_pr(function(fresh_pr)
 				vim.schedule(function()
 					local updated = fresh_pr or pr
-					set_tab_pr(source_tab, updated)
+					set_tab_pr(source_tab, updated, { preserve_comments = true })
 					apply_pr_info_content(buf, updated)
 					local msg = string.format("bb_pr: %s sent for PR #%s", action, tostring(pr_id))
 					vim.notify(msg, vim.log.levels.INFO)
