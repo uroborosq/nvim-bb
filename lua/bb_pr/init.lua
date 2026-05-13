@@ -63,17 +63,27 @@ end
 
 local function format_pr_entry(pr)
 	local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
-	local from_ref = (pr.fromRef and pr.fromRef.displayId) or "?"
-	local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
+	local approvals = 0
+	local has_needs_work = false
+	for _, reviewer in ipairs(pr.reviewers or {}) do
+		if reviewer.approved or reviewer.status == "APPROVED" then
+			approvals = approvals + 1
+		end
+		local reviewer_status = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
+		if reviewer_status == "NEEDS_WORK" then
+			has_needs_work = true
+		end
+	end
+	local needs_work_status = has_needs_work and "needs work" or "no needs work"
 
 	return string.format(
-		"#%s [%s] %s (%s → %s) — %s",
-		pr.id,
-		pr.state or "-",
+		"%s — %s • open %s • approvals: %d • %s • last comment %s",
 		author,
-		from_ref,
-		to_ref,
-		pr.title or ""
+		pr.title or "",
+		format_opened_age(pr.createdDate),
+		approvals,
+		needs_work_status,
+		format_opened_age(pr.updatedDate)
 	)
 end
 
@@ -160,6 +170,7 @@ end
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
 local apply_pr_info_content
+local format_opened_age
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -884,7 +895,7 @@ local function format_opened_date(ms)
 	return os.date("%Y-%m-%d %H:%M:%S %Z", math.floor(ms / 1000))
 end
 
-local function format_opened_age(ms)
+format_opened_age = function(ms)
 	if type(ms) ~= "number" or ms <= 0 then
 		return "unknown"
 	end
