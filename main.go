@@ -960,15 +960,32 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	if shortcut == "" {
 		return errors.New("reaction shortcut is required")
 	}
-	path := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/%s",
-		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID, url.PathEscape(shortcut))
+	basePath := fmt.Sprintf("/rest/comment-likes/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
+	reactionsPath := basePath + "/reactions/" + url.PathEscape(shortcut)
+	likesPath := strings.Replace(basePath, "/latest/", "/1.0/", 1) + "/likes"
+
+	try := func(method, path string) error {
+		_, err := c.doJSON(ctx, method, path, nil)
+		return err
+	}
 	switch action {
 	case "", "add":
-		_, err := c.doJSON(ctx, http.MethodPost, path, nil)
-		return err
+		if err := try(http.MethodPut, reactionsPath); err == nil {
+			return nil
+		}
+		if err := try(http.MethodPost, likesPath); err == nil {
+			return nil
+		}
+		return try(http.MethodPut, reactionsPath)
 	case "remove", "delete":
-		_, err := c.doJSON(ctx, http.MethodDelete, path, nil)
-		return err
+		if err := try(http.MethodDelete, reactionsPath); err == nil {
+			return nil
+		}
+		if err := try(http.MethodDelete, likesPath); err == nil {
+			return nil
+		}
+		return try(http.MethodDelete, reactionsPath)
 	default:
 		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
