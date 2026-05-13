@@ -18,6 +18,7 @@ M.config = {
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
+	current_user = "",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
 
@@ -89,6 +90,66 @@ end
 
 local function merge_config(user)
 	M.config = vim.tbl_deep_extend("force", M.config, user or {})
+end
+
+local function normalize_identity(value)
+	if type(value) ~= "string" then
+		return ""
+	end
+	return vim.trim(string.lower(value))
+end
+
+local function is_current_user(user)
+	local candidates = {
+		normalize_identity(M.config.current_user),
+		normalize_identity(vim.env.BB_USER),
+		normalize_identity(vim.env.USER),
+	}
+	local target_slug = normalize_identity(user and user.slug)
+	local target_name = normalize_identity(user and user.name)
+	local target_display = normalize_identity(user and user.displayName)
+
+	for _, candidate in ipairs(candidates) do
+		if candidate ~= "" and (candidate == target_slug or candidate == target_name or candidate == target_display) then
+			return true
+		end
+	end
+	return false
+end
+
+local function pr_sort_bucket(pr)
+	local author_user = pr.author and pr.author.user or {}
+	if is_current_user(author_user) then
+		return 4
+	end
+
+	local my_status = ""
+	for _, reviewer in ipairs(pr.reviewers or {}) do
+		if is_current_user(reviewer.user or {}) then
+			my_status = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
+			if reviewer.approved or my_status == "APPROVED" then
+				return 3
+			end
+			if my_status == "NEEDS_WORK" then
+				return 2
+			end
+		end
+	end
+
+	return 1
+end
+
+local function sort_prs(prs)
+	local sorted = vim.deepcopy(prs or {})
+	table.sort(sorted, function(a, b)
+		local bucket_a = pr_sort_bucket(a)
+		local bucket_b = pr_sort_bucket(b)
+		if bucket_a ~= bucket_b then
+			return bucket_a < bucket_b
+		end
+		return (tonumber(a.updatedDate or 0) or 0) > (tonumber(b.updatedDate or 0) or 0)
+	end)
+	return sorted
 end
 
 local function load_reaction_recency_state()
@@ -1320,10 +1381,11 @@ end
 
 function M.open_list()
 	run_provider(function(prs)
-		state.prs = prs
+		local sorted_prs = sort_prs(prs)
+		state.prs = sorted_prs
 
 		vim.schedule(function()
-			if open_telescope_picker(prs) then
+			if open_telescope_picker(sorted_prs) then
 				return
 			end
 
@@ -1331,7 +1393,7 @@ function M.open_list()
 			vim.api.nvim_buf_set_name(buf, "bb_pr://pull_requests")
 			vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
 			vim.api.nvim_set_option_value("filetype", "bb_pr", { buf = buf })
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(prs))
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs))
 
 			vim.keymap.set("n", "<CR>", function()
 				local line = vim.api.nvim_win_get_cursor(0)[1]
