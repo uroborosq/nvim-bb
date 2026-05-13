@@ -12,12 +12,13 @@ M.config = {
 	reply_comment_map = "cr",
 	react_comment_map = "<leader>re",
 	reaction_default = "THUMBS_UP",
-	reaction_choices = { "THUMBS_UP", "HEART", "LAUGH", "HOORAY", "EYES", "THUMBS_DOWN" },
+	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>pr",
 	toggle_task_map = "<leader>pt",
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
+	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
 
 local state = {
@@ -26,6 +27,8 @@ local state = {
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
+	reaction_usage_by_key = {},
+	reaction_usage_seq = 0,
 }
 
 local function tab_key(tabpage)
@@ -76,6 +79,37 @@ end
 
 local function merge_config(user)
 	M.config = vim.tbl_deep_extend("force", M.config, user or {})
+end
+
+local function load_reaction_recency_state()
+	local path = tostring(M.config.reaction_recency_store_path or "")
+	if path == "" then
+		return
+	end
+	local ok_read, lines = pcall(vim.fn.readfile, path)
+	if not ok_read or type(lines) ~= "table" or #lines == 0 then
+		return
+	end
+	local ok_json, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+	if not ok_json or type(decoded) ~= "table" then
+		return
+	end
+	state.reaction_usage_by_key = type(decoded.by_key) == "table" and decoded.by_key or {}
+	state.reaction_usage_seq = tonumber(decoded.seq or 0) or 0
+end
+
+local function persist_reaction_recency_state()
+	local path = tostring(M.config.reaction_recency_store_path or "")
+	if path == "" then
+		return
+	end
+	local dir = vim.fn.fnamemodify(path, ":h")
+	pcall(vim.fn.mkdir, dir, "p")
+	local payload = vim.json.encode({
+		seq = tonumber(state.reaction_usage_seq or 0) or 0,
+		by_key = state.reaction_usage_by_key or {},
+	})
+	pcall(vim.fn.writefile, { payload }, path)
 end
 
 local function run_provider(cb)
@@ -1511,6 +1545,19 @@ local function toggle_task_status()
 end
 
 
+
+local function sort_reactions_by_recent_use(choices)
+	table.sort(choices, function(a, b)
+		local sa = tonumber(state.reaction_usage_by_key[a] or 0) or 0
+		local sb = tonumber(state.reaction_usage_by_key[b] or 0) or 0
+		if sa ~= sb then
+			return sa > sb
+		end
+		return a < b
+	end)
+	return choices
+end
+
 local function react_to_comment()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1533,7 +1580,13 @@ local function react_to_comment()
 	if #normalized == 0 then
 		normalized = { string.upper(tostring(M.config.reaction_default or "THUMBS_UP")) }
 	end
-	vim.ui.select(normalized, { prompt = "Pick reaction" }, function(choice)
+	sort_reactions_by_recent_use(normalized)
+	vim.ui.select(normalized, {
+		prompt = "Pick reaction",
+		format_item = function(item)
+			return reactions.render_choice(item)
+		end,
+	}, function(choice)
 		if not choice or choice == "" then
 			return
 		end
@@ -1577,6 +1630,9 @@ local function react_to_comment()
 				return
 			end
 			vim.schedule(function()
+				state.reaction_usage_seq = (tonumber(state.reaction_usage_seq or 0) or 0) + 1
+				state.reaction_usage_by_key[choice] = state.reaction_usage_seq
+				persist_reaction_recency_state()
 				vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
 				vim.cmd("BBPRLoadComments")
 			end)
@@ -1657,6 +1713,7 @@ end
 
 function M.setup(opts)
 	merge_config(opts)
+	load_reaction_recency_state()
 
 	vim.api.nvim_create_user_command("BBPRList", function()
 		M.open_list()
