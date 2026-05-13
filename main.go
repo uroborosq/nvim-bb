@@ -960,11 +960,11 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	if shortcut == "" {
 		return errors.New("reaction shortcut is required")
 	}
-	basePath := fmt.Sprintf("/rest/comment-likes/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+	if shortcut != "THUMBS_UP" && shortcut != "+1" && shortcut != "LIKE" {
+		return fmt.Errorf("bitbucket server 8.9.x supports only like reaction; got %q", shortcut)
+	}
+	likesPath := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/likes",
 		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
-	reactionsLatestPath := basePath + "/reactions/" + url.PathEscape(shortcut)
-	reactionsLegacyPath := strings.Replace(reactionsLatestPath, "/latest/", "/1.0/", 1)
-	likesPath := strings.Replace(basePath, "/latest/", "/1.0/", 1) + "/likes"
 
 	try := func(method, path string) error {
 		_, err := c.doJSON(ctx, method, path, nil)
@@ -972,45 +972,9 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	}
 	switch action {
 	case "", "add":
-		for _, attempt := range []struct {
-			method string
-			path   string
-		}{
-			{http.MethodPut, reactionsLatestPath},
-			{http.MethodPost, reactionsLatestPath},
-			{http.MethodPut, reactionsLegacyPath},
-			{http.MethodPost, reactionsLegacyPath},
-		} {
-			if err := try(attempt.method, attempt.path); err == nil {
-				return nil
-			}
-		}
-
-		if shortcut == "THUMBS_UP" || shortcut == "+1" {
-			if err := try(http.MethodPost, likesPath); err == nil {
-				return nil
-			}
-		}
-		return fmt.Errorf("failed to add reaction %q: server likely supports only likes", shortcut)
+		return try(http.MethodPost, likesPath)
 	case "remove", "delete":
-		for _, attempt := range []struct {
-			method string
-			path   string
-		}{
-			{http.MethodDelete, reactionsLatestPath},
-			{http.MethodDelete, reactionsLegacyPath},
-		} {
-			if err := try(attempt.method, attempt.path); err == nil {
-				return nil
-			}
-		}
-
-		if shortcut == "THUMBS_UP" || shortcut == "+1" {
-			if err := try(http.MethodDelete, likesPath); err == nil {
-				return nil
-			}
-		}
-		return fmt.Errorf("failed to remove reaction %q: server likely supports only likes", shortcut)
+		return try(http.MethodDelete, likesPath)
 	default:
 		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
