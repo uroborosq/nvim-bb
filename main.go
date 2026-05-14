@@ -34,7 +34,6 @@ type Config struct {
 	Timeout     string `json:"timeout"`
 	InsecureTLS bool   `json:"insecure_tls"`
 	JSONOutput  bool   `json:"json_output"`
-	CurrentUser string `json:"current_user"`
 }
 
 type RuntimeConfig struct {
@@ -452,7 +451,9 @@ func main() {
 		fatal(err)
 	}
 
-	sortPullRequests(prs, cfg)
+	sort.Slice(prs, func(i, j int) bool {
+		return prs[i].CreatedDate > prs[j].CreatedDate
+	})
 
 	if cfg.JSONOutput || *jsonEnabled {
 		enc := json.NewEncoder(os.Stdout)
@@ -508,7 +509,6 @@ func (cfg *Config) normalize() {
 	cfg.User = strings.TrimSpace(cfg.User)
 	cfg.Password = strings.TrimSpace(cfg.Password)
 	cfg.Token = strings.TrimSpace(cfg.Token)
-	cfg.CurrentUser = strings.TrimSpace(cfg.CurrentUser)
 
 	cfg.State = strings.ToUpper(strings.TrimSpace(cfg.State))
 	cfg.At = strings.TrimSpace(cfg.At)
@@ -531,73 +531,6 @@ func (cfg *Config) applyDefaults() {
 	if cfg.Timeout == "" {
 		cfg.Timeout = "60s"
 	}
-}
-
-func normalizeIdentity(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
-func userCandidates(cfg RuntimeConfig) []string {
-	candidates := []string{}
-	seen := map[string]struct{}{}
-	for _, raw := range []string{cfg.CurrentUser, cfg.User} {
-		norm := normalizeIdentity(raw)
-		if norm == "" {
-			continue
-		}
-		if _, ok := seen[norm]; ok {
-			continue
-		}
-		seen[norm] = struct{}{}
-		candidates = append(candidates, norm)
-	}
-	return candidates
-}
-
-func isCurrentUser(u User, candidates []string) bool {
-	if len(candidates) == 0 {
-		return false
-	}
-	targets := []string{normalizeIdentity(u.Slug), normalizeIdentity(u.Name), normalizeIdentity(u.DisplayName)}
-	for _, c := range candidates {
-		for _, t := range targets {
-			if t != "" && c == t {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func prSortBucket(pr PullRequest, candidates []string) int {
-	if isCurrentUser(pr.Author.User, candidates) {
-		return 4
-	}
-	for _, reviewer := range pr.Reviewers {
-		if !isCurrentUser(reviewer.User, candidates) {
-			continue
-		}
-		status := strings.ToUpper(strings.TrimSpace(reviewer.Status))
-		if reviewer.Approved || status == "APPROVED" {
-			return 3
-		}
-		if status == "NEEDS_WORK" {
-			return 2
-		}
-	}
-	return 1
-}
-
-func sortPullRequests(prs []PullRequest, cfg RuntimeConfig) {
-	candidates := userCandidates(cfg)
-	sort.Slice(prs, func(i, j int) bool {
-		bucketI := prSortBucket(prs[i], candidates)
-		bucketJ := prSortBucket(prs[j], candidates)
-		if bucketI != bucketJ {
-			return bucketI < bucketJ
-		}
-		return prs[i].UpdatedDate > prs[j].UpdatedDate
-	})
 }
 
 func validateConfig(cfg RuntimeConfig) error {
