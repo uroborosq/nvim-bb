@@ -11,6 +11,7 @@ M.config = {
 	create_task_map = "ct",
 	reply_comment_map = "cr",
 	react_comment_map = "<leader>re",
+	insert_suggestion_map = "<leader>rs",
 	reaction_default = "THUMBS_UP",
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>pr",
@@ -1487,10 +1488,35 @@ local function open_multiline_comment_input(opts, on_submit)
 		end
 	end
 
+	local function insert_suggestion_block()
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		local suggestion_line = tostring(opts.suggestion_line or "")
+		if suggestion_line == "" then
+			vim.notify("bb_pr: no source line available for suggestion", vim.log.levels.WARN)
+			return
+		end
+		local block = {
+			"```suggestion",
+			suggestion_line,
+			"```",
+		}
+		local line_nr = vim.api.nvim_win_get_cursor(win)[1]
+		vim.api.nvim_buf_set_lines(buf, line_nr, line_nr, false, block)
+	end
+
 	vim.keymap.set("n", "q", function()
 		pcall(vim.api.nvim_win_close, win, true)
 	end, { buffer = buf, silent = true })
 	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	if M.config.insert_suggestion_map and M.config.insert_suggestion_map ~= "" then
+		vim.keymap.set({ "n", "i" }, M.config.insert_suggestion_map, insert_suggestion_block, {
+			buffer = buf,
+			silent = true,
+			desc = "Insert suggestion block",
+		})
+	end
 	vim.cmd("startinsert")
 end
 
@@ -1701,9 +1727,17 @@ local function post_comment_or_task(is_task, force_reply)
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		local comment_win = vim.api.nvim_get_current_win()
 		local comment_bufnr = vim.api.nvim_get_current_buf()
+		local suggestion_line = ""
+		if ctx and ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
+			local current_line = vim.api.nvim_buf_get_lines(comment_bufnr, ctx.line - 1, ctx.line, false)[1]
+			if type(current_line) == "string" then
+				suggestion_line = current_line
+			end
+		end
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
+			suggestion_line = suggestion_line,
 		}, function(text)
 			local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
 			if is_task then
