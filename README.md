@@ -6,9 +6,9 @@
 
 - pr creation
 - merge (is it possible?)
+- code suggestions
 - comments deletion
 - comments resolving
-- all comments overview
 - etwa dashboard
 - images (haha)
 - jira issues resolving
