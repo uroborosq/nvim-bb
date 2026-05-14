@@ -31,8 +31,6 @@ local state = {
 	reaction_usage_seq = 0,
 }
 
-local format_opened_age
-
 local function tab_key(tabpage)
 	return tostring(tabpage)
 end
@@ -65,26 +63,16 @@ end
 
 local function format_pr_entry(pr)
 	local author = (pr.author and pr.author.user and (pr.author.user.displayName or pr.author.user.name)) or "unknown"
-	local approvals = 0
-	local has_needs_work = false
-	for _, reviewer in ipairs(pr.reviewers or {}) do
-		if reviewer.approved or reviewer.status == "APPROVED" then
-			approvals = approvals + 1
-		end
-		local reviewer_status = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
-		if reviewer_status == "NEEDS_WORK" then
-			has_needs_work = true
-		end
-	end
-	local needs_work_status = has_needs_work and "NW" or "OK"
+	local from_ref = (pr.fromRef and pr.fromRef.displayId) or "?"
+	local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
 
 	return string.format(
-		"appr: %d %s • open %s, comm %s • %s - %s",
-		approvals,
-		needs_work_status,
-		format_opened_age(pr.createdDate),
-		format_opened_age(pr.updatedDate),
+		"#%s [%s] %s (%s → %s) — %s",
+		pr.id,
+		pr.state or "-",
 		author,
+		from_ref,
+		to_ref,
 		pr.title or ""
 	)
 end
@@ -896,7 +884,7 @@ local function format_opened_date(ms)
 	return os.date("%Y-%m-%d %H:%M:%S %Z", math.floor(ms / 1000))
 end
 
-format_opened_age = function(ms)
+local function format_opened_age(ms)
 	if type(ms) ~= "number" or ms <= 0 then
 		return "unknown"
 	end
@@ -1152,11 +1140,7 @@ local function build_pr_info_content(pr)
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
-	return info_lines,
-		overview_start_line,
-		comment_line_numbers,
-		comment_ids_by_line_order,
-		comment_ids_by_relative_line
+	return info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
 end
 
 apply_pr_info_content = function(buf, pr)
@@ -1325,11 +1309,10 @@ end
 
 function M.open_list()
 	run_provider(function(prs)
-		local sorted_prs = prs or {}
-		state.prs = sorted_prs
+		state.prs = prs
 
 		vim.schedule(function()
-			if open_telescope_picker(sorted_prs) then
+			if open_telescope_picker(prs) then
 				return
 			end
 
@@ -1337,7 +1320,7 @@ function M.open_list()
 			vim.api.nvim_buf_set_name(buf, "bb_pr://pull_requests")
 			vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
 			vim.api.nvim_set_option_value("filetype", "bb_pr", { buf = buf })
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs))
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(prs))
 
 			vim.keymap.set("n", "<CR>", function()
 				local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1517,6 +1500,7 @@ local function refresh_float_window_if_needed(win, buf)
 	end
 end
 
+
 local function toggle_task_status()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1545,18 +1529,7 @@ local function toggle_task_status()
 	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
 	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
 	local version = tonumber(target.version or 0) or 0
-	local cmd = {
-		"bb",
-		"-json",
-		"-pr-task-status",
-		tostring(pr.id),
-		"-task-id",
-		tostring(cid),
-		"-task-state",
-		next_state,
-		"-task-version",
-		tostring(version),
-	}
+	local cmd = { "bb", "-json", "-pr-task-status", tostring(pr.id), "-task-id", tostring(cid), "-task-state", next_state, "-task-version", tostring(version) }
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
@@ -1570,6 +1543,8 @@ local function toggle_task_status()
 		end)
 	end)
 end
+
+
 
 local function sort_reactions_by_recent_use(choices)
 	table.sort(choices, function(a, b)
@@ -1715,10 +1690,10 @@ local function post_comment_or_task(is_task, force_reply)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
 							apply_comments_to_specific_tab_when_ready(source_tab, payload)
-							refresh_float_window_if_needed(comment_win, comment_bufnr)
-						end)
-					end, { notify_errors = false })
-				end)
+								refresh_float_window_if_needed(comment_win, comment_bufnr)
+							end)
+						end, { notify_errors = false })
+					end)
 			end)
 		end)
 	end
@@ -1761,18 +1736,18 @@ function M.setup(opts)
 			return
 		end
 
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_when_diffview_ready(payload)
-				local cur_win = vim.api.nvim_get_current_win()
-				local cur_buf = vim.api.nvim_get_current_buf()
-				vim.defer_fn(function()
-					refresh_float_window_if_needed(cur_win, cur_buf)
-				end, 150)
-				local bufnr = vim.api.nvim_get_current_buf()
-				local info_pr = vim.b[bufnr].bb_pr_info_pr
-				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+			run_comments_provider(pr.id, function(payload)
+				vim.schedule(function()
+					set_current_tab_comments(payload)
+					apply_comments_when_diffview_ready(payload)
+					local cur_win = vim.api.nvim_get_current_win()
+					local cur_buf = vim.api.nvim_get_current_buf()
+					vim.defer_fn(function()
+						refresh_float_window_if_needed(cur_win, cur_buf)
+					end, 150)
+					local bufnr = vim.api.nvim_get_current_buf()
+					local info_pr = vim.b[bufnr].bb_pr_info_pr
+					if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
 					apply_pr_info_content(bufnr, info_pr)
 				end
 			end)
