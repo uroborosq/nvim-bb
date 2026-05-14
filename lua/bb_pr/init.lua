@@ -76,23 +76,22 @@ local function format_pr_entry(pr)
 			has_needs_work = true
 		end
 	end
-	local needs_work_status = has_needs_work and "needs work" or "no needs work"
+	local needs_work_status = has_needs_work and "NW" or "OK"
 
 	return string.format(
-		"%s — %s • open %s • approvals: %d • %s • last comment %s",
-		author,
-		pr.title or "",
-		format_opened_age(pr.createdDate),
+		"appr: %d %s • open %s, comm %s • %s - %s",
 		approvals,
 		needs_work_status,
-		format_opened_age(pr.updatedDate)
+		format_opened_age(pr.createdDate),
+		format_opened_age(pr.updatedDate),
+		author,
+		pr.title or ""
 	)
 end
 
 local function merge_config(user)
 	M.config = vim.tbl_deep_extend("force", M.config, user or {})
 end
-
 
 local function load_reaction_recency_state()
 	local path = tostring(M.config.reaction_recency_store_path or "")
@@ -1153,7 +1152,11 @@ local function build_pr_info_content(pr)
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
-	return info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
+	return info_lines,
+		overview_start_line,
+		comment_line_numbers,
+		comment_ids_by_line_order,
+		comment_ids_by_relative_line
 end
 
 apply_pr_info_content = function(buf, pr)
@@ -1514,7 +1517,6 @@ local function refresh_float_window_if_needed(win, buf)
 	end
 end
 
-
 local function toggle_task_status()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -1543,7 +1545,18 @@ local function toggle_task_status()
 	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
 	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
 	local version = tonumber(target.version or 0) or 0
-	local cmd = { "bb", "-json", "-pr-task-status", tostring(pr.id), "-task-id", tostring(cid), "-task-state", next_state, "-task-version", tostring(version) }
+	local cmd = {
+		"bb",
+		"-json",
+		"-pr-task-status",
+		tostring(pr.id),
+		"-task-id",
+		tostring(cid),
+		"-task-state",
+		next_state,
+		"-task-version",
+		tostring(version),
+	}
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
@@ -1557,8 +1570,6 @@ local function toggle_task_status()
 		end)
 	end)
 end
-
-
 
 local function sort_reactions_by_recent_use(choices)
 	table.sort(choices, function(a, b)
@@ -1704,10 +1715,10 @@ local function post_comment_or_task(is_task, force_reply)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
 							apply_comments_to_specific_tab_when_ready(source_tab, payload)
-								refresh_float_window_if_needed(comment_win, comment_bufnr)
-							end)
-						end, { notify_errors = false })
-					end)
+							refresh_float_window_if_needed(comment_win, comment_bufnr)
+						end)
+					end, { notify_errors = false })
+				end)
 			end)
 		end)
 	end
@@ -1750,18 +1761,18 @@ function M.setup(opts)
 			return
 		end
 
-			run_comments_provider(pr.id, function(payload)
-				vim.schedule(function()
-					set_current_tab_comments(payload)
-					apply_comments_when_diffview_ready(payload)
-					local cur_win = vim.api.nvim_get_current_win()
-					local cur_buf = vim.api.nvim_get_current_buf()
-					vim.defer_fn(function()
-						refresh_float_window_if_needed(cur_win, cur_buf)
-					end, 150)
-					local bufnr = vim.api.nvim_get_current_buf()
-					local info_pr = vim.b[bufnr].bb_pr_info_pr
-					if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+		run_comments_provider(pr.id, function(payload)
+			vim.schedule(function()
+				set_current_tab_comments(payload)
+				apply_comments_when_diffview_ready(payload)
+				local cur_win = vim.api.nvim_get_current_win()
+				local cur_buf = vim.api.nvim_get_current_buf()
+				vim.defer_fn(function()
+					refresh_float_window_if_needed(cur_win, cur_buf)
+				end, 150)
+				local bufnr = vim.api.nvim_get_current_buf()
+				local info_pr = vim.b[bufnr].bb_pr_info_pr
+				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
 					apply_pr_info_content(bufnr, info_pr)
 				end
 			end)
