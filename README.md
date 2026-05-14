@@ -43,6 +43,11 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `<leader>pt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
   - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
+  - `<leader>rs` (or `:BBPRCreateSuggestion`) opens the comment editor with a prefilled Markdown suggestion block for the commented line in one step:
+    ```suggestion
+    <current line text>
+    ```
+    Mapping is configurable via `setup({ create_suggestion_map = "..." })`.
   - Reaction choices are configurable via `setup({ reaction_choices = { "THUMBS_UP", "HEART", "LAUGH" } })`, and now default to the full rxaviers GitHub emoji reaction list.
   - Reaction picker entries are rendered as emoji/symbol + alias (for example `👍  THUMBS_UP`) so large reaction sets stay readable.
   - Reaction picker ordering is recency-based and persistent: the most recently applied reactions are shown first across Neovim restarts (path configurable via `reaction_recency_store_path`).
