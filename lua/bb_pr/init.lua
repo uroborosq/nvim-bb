@@ -979,14 +979,12 @@ local function build_overview_comment_lines(payload)
 	local function trim_edge_empty_lines(items)
 		local first = 1
 		local last = #items
-
 		while first <= last and (items[first] or ""):match("^%s*$") do
 			first = first + 1
 		end
 		while last >= first and (items[last] or ""):match("^%s*$") do
 			last = last - 1
 		end
-
 		local out = {}
 		for i = first, last do
 			table.insert(out, items[i])
@@ -994,7 +992,17 @@ local function build_overview_comment_lines(payload)
 		return out
 	end
 
-	local comments = as_array(payload and payload.overview_comments)
+	local overview_comments = as_array(payload and payload.overview_comments)
+	local file_comments = as_array(payload and payload.file_comments)
+	local comments = {}
+	for _, c in ipairs(overview_comments) do
+		c.__scope = "overview"
+		table.insert(comments, c)
+	end
+	for _, c in ipairs(file_comments) do
+		c.__scope = "file"
+		table.insert(comments, c)
+	end
 	if #comments == 0 then
 		return { "None" }
 	end
@@ -1047,10 +1055,28 @@ local function build_overview_comment_lines(payload)
 	local comment_ids_by_relative_line = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
+		local root_comment = thread_comments[1] or {}
 		if thread_idx > 1 then
 			table.insert(lines, "")
 		end
 		table.insert(lines, string.format("### Thread %d", thread_idx))
+		if root_comment.__scope == "file" then
+			local path = root_comment.path or "(unknown file)"
+			local line = tonumber(root_comment.line or 0) or 0
+			local side = root_comment.file_type or ""
+			local line_type = root_comment.line_type or ""
+			local loc = line > 0 and string.format(":%d", line) or ""
+			table.insert(lines, string.format("_Scope: file • `%s%s` %s %s_", path, loc, side, line_type))
+			if root_comment.diff_hunk and root_comment.diff_hunk ~= "" then
+				table.insert(lines, "```diff")
+				for _, hline in ipairs(vim.split(root_comment.diff_hunk, "\n", { plain = true })) do
+					table.insert(lines, hline)
+				end
+				table.insert(lines, "```")
+			end
+		else
+			table.insert(lines, "_Scope: overview_")
+		end
 		table.insert(lines, "")
 
 		for comment_idx, c in ipairs(thread_comments) do
