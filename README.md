@@ -4,13 +4,14 @@
 
 ## Roadmap
 
-- merge (is it possible?)
 - pr creation
+- merge (is it possible?)
 - comments deletion
 - comments resolving
 - all comments overview
 - etwa dashboard
 - images (haha)
+- jira issues resolving
 
 ## Overview
 
