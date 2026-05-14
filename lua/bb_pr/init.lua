@@ -11,6 +11,7 @@ M.config = {
 	create_task_map = "ct",
 	reply_comment_map = "cr",
 	react_comment_map = "<leader>re",
+	create_suggestion_map = "<leader>rs",
 	reaction_default = "THUMBS_UP",
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>pr",
@@ -1453,7 +1454,11 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].filetype = "markdown"
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "", "", "" })
+	local initial_lines = { "", "", "", "" }
+	if type(opts.initial_text) == "string" and opts.initial_text ~= "" then
+		initial_lines = vim.split(opts.initial_text, "\n", { plain = true })
+	end
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
 	local width = math.max(80, math.floor(vim.o.columns * 0.7))
 	local height = math.max(12, math.floor(vim.o.lines * 0.35))
@@ -1685,7 +1690,8 @@ local function react_to_comment()
 	end)
 end
 
-local function post_comment_or_task(is_task, force_reply)
+local function post_comment_or_task(is_task, force_reply, opts)
+	opts = opts or {}
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
@@ -1701,9 +1707,17 @@ local function post_comment_or_task(is_task, force_reply)
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		local comment_win = vim.api.nvim_get_current_win()
 		local comment_bufnr = vim.api.nvim_get_current_buf()
+		local suggestion_line = ""
+		if ctx and ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
+			local current_line = vim.api.nvim_buf_get_lines(comment_bufnr, ctx.line - 1, ctx.line, false)[1]
+			if type(current_line) == "string" then
+				suggestion_line = current_line
+			end
+		end
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
+			initial_text = opts.initial_text,
 		}, function(text)
 			local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
 			if is_task then
@@ -1754,6 +1768,13 @@ local function post_comment_or_task(is_task, force_reply)
 	end
 
 	send_comment(nil)
+end
+
+local function suggestion_prefill_for_context(ctx, suggestion_line)
+	if ctx and ctx.mode == "new_file" and suggestion_line ~= "" then
+		return string.format("```suggestion\n%s\n```", suggestion_line)
+	end
+	return "```suggestion\n\n```"
 end
 
 function M.setup(opts)
@@ -1836,6 +1857,25 @@ function M.setup(opts)
 		post_comment_or_task(true, false)
 	end, { desc = "Create or reply PR task from cursor context" })
 
+	vim.api.nvim_create_user_command("BBPRCreateSuggestion", function()
+		local ctx = resolve_comment_context("auto")
+		if not ctx then
+			vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
+			return
+		end
+		local suggestion_line = ""
+		if ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
+			local bufnr = vim.api.nvim_get_current_buf()
+			local line = vim.api.nvim_buf_get_lines(bufnr, ctx.line - 1, ctx.line, false)[1]
+			if type(line) == "string" then
+				suggestion_line = line
+			end
+		end
+		post_comment_or_task(false, false, {
+			initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
+		})
+	end, { desc = "Create PR comment with prefilled suggestion block" })
+
 	vim.api.nvim_create_user_command("BBPRReplyComment", function()
 		post_comment_or_task(false, true)
 	end, { desc = "Reply to current PR comment" })
@@ -1866,6 +1906,14 @@ function M.setup(opts)
 			M.config.create_task_map,
 			"<cmd>BBPRCreateTask<CR>",
 			{ desc = "Create PR task", silent = true }
+		)
+	end
+	if M.config.create_suggestion_map and M.config.create_suggestion_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.create_suggestion_map,
+			"<cmd>BBPRCreateSuggestion<CR>",
+			{ desc = "Create PR suggestion comment", silent = true }
 		)
 	end
 	if M.config.reply_comment_map and M.config.reply_comment_map ~= "" then
