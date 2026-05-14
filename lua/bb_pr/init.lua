@@ -1048,6 +1048,25 @@ local function build_overview_comment_lines(payload)
 		end
 		table.insert(comments_by_thread[root], c)
 	end
+	local function thread_last_created_at(root)
+		local thread_comments = comments_by_thread[root] or {}
+		local latest = ""
+		for _, c in ipairs(thread_comments) do
+			local created_at = tostring(c.created_at or "")
+			if created_at > latest then
+				latest = created_at
+			end
+		end
+		return latest
+	end
+	table.sort(thread_order, function(a, b)
+		local a_last = thread_last_created_at(a)
+		local b_last = thread_last_created_at(b)
+		if a_last == b_last then
+			return tostring(a) < tostring(b)
+		end
+		return a_last > b_last
+	end)
 
 	local lines = {}
 	local comment_line_numbers = {}
