@@ -1,7 +1,7 @@
 local M = {}
 local reactions = require("bb_pr.reactions")
 
-M.config = {
+local default_config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
 	diffview_cmd = "DiffviewOpen",
@@ -24,6 +24,7 @@ M.config = {
 	create_pr_body_template = "",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
+M.config = vim.deepcopy(default_config)
 
 local state = {
 	prs = {},
@@ -82,7 +83,7 @@ local function format_pr_entry(pr)
 end
 
 local function merge_config(user)
-	M.config = vim.tbl_deep_extend("force", M.config, user or {})
+	M.config = vim.tbl_deep_extend("force", vim.deepcopy(default_config), user or {})
 end
 
 local function load_reaction_recency_state()
