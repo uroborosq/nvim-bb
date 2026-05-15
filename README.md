@@ -27,7 +27,8 @@ Bitbucket PR helper CLI + Neovim plugin.
     - project repo style (for example `.../scm/PROJ/repo.git`)
 - Comment jump mappings default to `[C` / `]C` and can be changed via `setup({ comment_prev_map = "...", comment_next_map = "..." })`.
 - In Neovim plugin, you can force CLI repo autodetection for all bb commands via:
-  - `setup({ force_repo_autodetect = true })`
+  - by default it is enabled (`force_repo_autodetect = true`)
+  - you can disable it explicitly: `setup({ force_repo_autodetect = false })`
   - optional flag override: `setup({ force_repo_autodetect_flag = "-force-autodetect-repo" })`
 - Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
