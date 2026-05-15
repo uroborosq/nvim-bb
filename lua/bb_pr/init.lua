@@ -1,7 +1,7 @@
 local M = {}
 local reactions = require("bb_pr.reactions")
 
-M.config = {
+local default_config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
 	diffview_cmd = "DiffviewOpen",
@@ -19,8 +19,12 @@ M.config = {
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
+	create_pr_map = "<leader>rc",
+	create_pr_toggle_draft_map = "<leader>rt",
+	create_pr_body_template = "",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
+M.config = vim.deepcopy(default_config)
 
 local state = {
 	prs = {},
@@ -79,7 +83,7 @@ local function format_pr_entry(pr)
 end
 
 local function merge_config(user)
-	M.config = vim.tbl_deep_extend("force", M.config, user or {})
+	M.config = vim.tbl_deep_extend("force", vim.deepcopy(default_config), user or {})
 end
 
 local function load_reaction_recency_state()
@@ -1499,6 +1503,215 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.cmd("startinsert")
 end
 
+local function get_current_git_branch()
+	local out = vim.fn.system({ "git", "rev-parse", "--abbrev-ref", "HEAD" })
+	if vim.v.shell_error ~= 0 then
+		return nil
+	end
+	local branch = vim.trim(out or "")
+	if branch == "" then
+		return nil
+	end
+	return branch
+end
+
+local function ensure_branch_synced_with_origin(branch)
+	local fetch = vim.fn.system({ "git", "fetch", "origin", branch })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: failed to fetch origin/" .. branch .. ": " .. vim.trim(fetch or "")
+	end
+
+	local remote_ref = "refs/remotes/origin/" .. branch
+	local remote_check = vim.fn.system({ "git", "rev-parse", "--verify", remote_ref })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: branch does not exist in origin: " .. branch
+	end
+
+	local local_sha = vim.trim(vim.fn.system({ "git", "rev-parse", "HEAD" }) or "")
+	if vim.v.shell_error ~= 0 or local_sha == "" then
+		return false, "bb_pr: failed to resolve local HEAD"
+	end
+
+	local remote_sha = vim.trim(vim.fn.system({ "git", "rev-parse", remote_ref }) or "")
+	if vim.v.shell_error ~= 0 or remote_sha == "" then
+		return false, "bb_pr: failed to resolve origin branch commit"
+	end
+
+	if local_sha ~= remote_sha then
+		return false, "bb_pr: branch is not synced with origin/" .. branch .. " (push/pull required)"
+	end
+
+	return true
+end
+
+local function toggle_draft_in_title_line(line)
+	if line:match("^%[DRAFT%]%s+") then
+		return (line:gsub("^%[DRAFT%]%s+", "", 1))
+	end
+	return "[DRAFT] " .. line
+end
+
+local function open_create_pr_editor(source_branch, target_branch)
+	local function resolve_pr_body_template_lines()
+		local template = M.config.create_pr_body_template
+		if type(template) == "string" then
+			if vim.trim(template) == "" then
+				return { "" }
+			end
+			return vim.split(template, "\n", { plain = true })
+		end
+		if type(template) == "table" then
+			local lines = {}
+			for _, item in ipairs(template) do
+				table.insert(lines, tostring(item or ""))
+			end
+			if #lines == 0 then
+				return { "" }
+			end
+			return lines
+		end
+		return { "" }
+	end
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "markdown"
+	local default_title = string.format("%s -> %s", source_branch, target_branch)
+	local initial_lines = {
+		"Title: " .. default_title,
+		"",
+		"Body:",
+	}
+	vim.list_extend(initial_lines, resolve_pr_body_template_lines())
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
+
+	local width = math.max(90, math.floor(vim.o.columns * 0.7))
+	local height = math.max(14, math.floor(vim.o.lines * 0.4))
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = "Create PR (<C-s> submit)",
+		title_pos = "center",
+	})
+
+	local function submit()
+		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+		local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
+		local body_lines = {}
+		for i = 4, #lines do
+			table.insert(body_lines, lines[i])
+		end
+		local body = vim.trim(table.concat(body_lines, "\n"))
+		if title == "" then
+			vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
+			return
+		end
+		pcall(vim.api.nvim_win_close, win, true)
+		local cmd = {
+			"bb",
+			"-json",
+			"-pr-create",
+			"-pr-title",
+			title,
+			"-pr-body",
+			body,
+			"-pr-source",
+			source_branch,
+			"-pr-target",
+			target_branch,
+		}
+		vim.system(cmd, { text = true }, function(res)
+			if res.code ~= 0 then
+				vim.schedule(function()
+					vim.notify("bb_pr: create PR failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+				return
+			end
+			vim.schedule(function()
+				vim.notify("bb_pr: pull request created", vim.log.levels.INFO)
+			end)
+		end)
+	end
+
+	local function toggle_draft()
+		local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
+		local prefix = "Title: "
+		local raw = line:gsub("^Title:%s*", "", 1)
+		vim.api.nvim_buf_set_lines(buf, 0, 1, false, { prefix .. toggle_draft_in_title_line(raw) })
+	end
+
+	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set("n", "q", function()
+		pcall(vim.api.nvim_win_close, win, true)
+	end, { buffer = buf, silent = true })
+	if M.config.create_pr_toggle_draft_map and M.config.create_pr_toggle_draft_map ~= "" then
+		vim.keymap.set("n", M.config.create_pr_toggle_draft_map, toggle_draft, { buffer = buf, silent = true, desc = "Toggle [DRAFT]" })
+	end
+	vim.cmd("startinsert")
+end
+
+local function create_pr()
+	local source_branch = get_current_git_branch()
+	if not source_branch then
+		vim.notify("bb_pr: failed to detect current git branch", vim.log.levels.ERROR)
+		return
+	end
+	local synced, sync_err = ensure_branch_synced_with_origin(source_branch)
+	if not synced then
+		vim.notify(sync_err, vim.log.levels.ERROR)
+		return
+	end
+	vim.system({ "bb", "-json", "-target-branches" }, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: failed to load target branches: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		local ok, decoded = pcall(vim.json.decode, res.stdout)
+		if not ok or type(decoded) ~= "table" then
+			vim.schedule(function()
+				vim.notify("bb_pr: invalid target branches JSON", vim.log.levels.ERROR)
+			end)
+			return
+		end
+		local options = {}
+		for _, b in ipairs(decoded) do
+			local name = tostring(b.displayId or "")
+			if name ~= "" then
+				table.insert(options, name)
+			end
+		end
+		if #options == 0 then
+			table.insert(options, "main")
+			table.insert(options, "master")
+		end
+		table.sort(options, function(a, b)
+			local pa = (a == "main" or a == "master") and 0 or 1
+			local pb = (b == "main" or b == "master") and 0 or 1
+			if pa ~= pb then
+				return pa < pb
+			end
+			return a < b
+		end)
+		vim.schedule(function()
+			vim.ui.select(options, { prompt = "Select target branch" }, function(choice)
+				if not choice then
+					return
+				end
+				open_create_pr_editor(source_branch, choice)
+			end)
+		end)
+	end)
+end
+
 local function resolve_reply_target_comment_id()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1892,6 +2105,10 @@ function M.setup(opts)
 		react_to_comment()
 	end, { desc = "Add reaction to comment under cursor" })
 
+	vim.api.nvim_create_user_command("BBPRCreatePR", function()
+		create_pr()
+	end, { desc = "Create pull request from current branch" })
+
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
 			"n",
@@ -1947,6 +2164,9 @@ function M.setup(opts)
 			"<cmd>BBPRRefreshComments<CR>",
 			{ desc = "Force refresh PR comments", silent = true }
 		)
+	end
+	if M.config.create_pr_map and M.config.create_pr_map ~= "" then
+		vim.keymap.set("n", M.config.create_pr_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
