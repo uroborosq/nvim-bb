@@ -371,13 +371,14 @@ func main() {
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	projectOverride := flag.String("project", "", "override project key (auto-detected from git remote when omitted)")
 	repoOverride := flag.String("repo", "", "override repo slug (auto-detected from git remote when omitted)")
+	forceAutodetectRepo := flag.Bool("force-autodetect-repo", false, "force auto-detection of project/repo from git remote (ignores config.project/config.repo unless -project/-repo are passed)")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		fatal(err)
 	}
-	cfg = applyRepoSelection(cfg, strings.TrimSpace(*projectOverride), strings.TrimSpace(*repoOverride))
+	cfg = applyRepoSelection(cfg, strings.TrimSpace(*projectOverride), strings.TrimSpace(*repoOverride), *forceAutodetectRepo)
 	if err := validateRepoSelection(cfg); err != nil {
 		fatal(err)
 	}
@@ -540,12 +541,22 @@ func main() {
 	printTable(prs, cfg, *reviewersEnabled)
 }
 
-func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string) RuntimeConfig {
+func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string, forceAutodetect bool) RuntimeConfig {
 	if projectOverride != "" {
 		cfg.Project = projectOverride
 	}
 	if repoOverride != "" {
 		cfg.Repo = repoOverride
+	}
+	if forceAutodetect {
+		cfg.Project = ""
+		cfg.Repo = ""
+		if projectOverride != "" {
+			cfg.Project = projectOverride
+		}
+		if repoOverride != "" {
+			cfg.Repo = repoOverride
+		}
 	}
 	if cfg.Project != "" && cfg.Repo != "" {
 		return cfg
