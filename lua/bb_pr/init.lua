@@ -1515,6 +1515,35 @@ local function get_current_git_branch()
 	return branch
 end
 
+local function ensure_branch_synced_with_origin(branch)
+	local fetch = vim.fn.system({ "git", "fetch", "origin", branch })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: failed to fetch origin/" .. branch .. ": " .. vim.trim(fetch or "")
+	end
+
+	local remote_ref = "refs/remotes/origin/" .. branch
+	local remote_check = vim.fn.system({ "git", "rev-parse", "--verify", remote_ref })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: branch does not exist in origin: " .. branch
+	end
+
+	local local_sha = vim.trim(vim.fn.system({ "git", "rev-parse", "HEAD" }) or "")
+	if vim.v.shell_error ~= 0 or local_sha == "" then
+		return false, "bb_pr: failed to resolve local HEAD"
+	end
+
+	local remote_sha = vim.trim(vim.fn.system({ "git", "rev-parse", remote_ref }) or "")
+	if vim.v.shell_error ~= 0 or remote_sha == "" then
+		return false, "bb_pr: failed to resolve origin branch commit"
+	end
+
+	if local_sha ~= remote_sha then
+		return false, "bb_pr: branch is not synced with origin/" .. branch .. " (push/pull required)"
+	end
+
+	return true
+end
+
 local function toggle_draft_in_title_line(line)
 	if line:match("^%[DRAFT%]%s+") then
 		return (line:gsub("^%[DRAFT%]%s+", "", 1))
@@ -1632,6 +1661,11 @@ local function create_pr()
 	local source_branch = get_current_git_branch()
 	if not source_branch then
 		vim.notify("bb_pr: failed to detect current git branch", vim.log.levels.ERROR)
+		return
+	end
+	local synced, sync_err = ensure_branch_synced_with_origin(source_branch)
+	if not synced then
+		vim.notify(sync_err, vim.log.levels.ERROR)
 		return
 	end
 	vim.system({ "bb", "-json", "-target-branches" }, { text = true }, function(res)
