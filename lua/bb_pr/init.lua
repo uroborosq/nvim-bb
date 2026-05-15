@@ -7,15 +7,15 @@ local default_config = {
 	diffview_cmd = "DiffviewOpen",
 	comment_prev_map = "[C",
 	comment_next_map = "]C",
-	create_comment_map = "cc",
-	create_task_map = "ct",
-	reply_comment_map = "cr",
+	create_comment_map = "<leader>rC",
+	create_task_map = "<leader>rT",
+	reply_comment_map = "<leader>rR",
 	react_comment_map = "<leader>re",
 	create_suggestion_map = "<leader>rs",
 	reaction_default = "THUMBS_UP",
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
-	refresh_comments_map = "<leader>pr",
-	toggle_task_map = "<leader>pt",
+	refresh_comments_map = "<leader>rr",
+	toggle_task_map = "<leader>rt",
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
@@ -2048,6 +2048,35 @@ local function suggestion_prefill_for_context(ctx, suggestion_line)
 	return "```suggestion\n\n```"
 end
 
+local function create_suggestion_comment()
+	local ctx = resolve_comment_context("auto")
+	if not ctx then
+		vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
+		return
+	end
+
+	local suggestion_line = ""
+	if ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
+		local bufnr = vim.api.nvim_get_current_buf()
+		local line = vim.api.nvim_buf_get_lines(bufnr, ctx.line - 1, ctx.line, false)[1]
+		if type(line) == "string" then
+			suggestion_line = line
+		end
+	end
+
+	local target_comment_id = resolve_reply_target_comment_id()
+	if target_comment_id then
+		post_comment_or_task(false, true, {
+			initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
+		})
+		return
+	end
+
+	post_comment_or_task(false, false, {
+		initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
+	})
+end
+
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
@@ -2129,22 +2158,7 @@ function M.setup(opts)
 	end, { desc = "Create or reply PR task from cursor context" })
 
 	vim.api.nvim_create_user_command("BBPRCreateSuggestion", function()
-		local ctx = resolve_comment_context("auto")
-		if not ctx then
-			vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
-			return
-		end
-		local suggestion_line = ""
-		if ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
-			local bufnr = vim.api.nvim_get_current_buf()
-			local line = vim.api.nvim_buf_get_lines(bufnr, ctx.line - 1, ctx.line, false)[1]
-			if type(line) == "string" then
-				suggestion_line = line
-			end
-		end
-		post_comment_or_task(false, false, {
-			initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
-		})
+		create_suggestion_comment()
 	end, { desc = "Create PR comment with prefilled suggestion block" })
 
 	vim.api.nvim_create_user_command("BBPRReplyComment", function()

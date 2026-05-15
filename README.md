@@ -19,7 +19,7 @@ Bitbucket PR helper CLI + Neovim plugin.
 
 - Provider command defaults to `bb -reviewers -json` (override via `setup({ provider_cmd = {...} })`).
 - Comment jump mappings default to `[C` / `]C` and can be changed via `setup({ comment_prev_map = "...", comment_next_map = "..." })`.
-- Force refresh mapping defaults to `<leader>pr` and can be changed via `setup({ refresh_comments_map = "..." })`.
+- Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
@@ -39,12 +39,11 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `:BBPRLoadComments` loads PR comments for the PR opened in current tab and renders virtual text on commented lines.
   - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line.
   - `[C` / `]C` jump between PR comments (works in both file diffs and PR overview comments).
-  - `<leader>pr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
-  - `<leader>pt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
+  - `<leader>rr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
+  - `<leader>rt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
   - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
-  - `<leader>rs` (or `:BBPRCreateSuggestion`) opens the comment editor with a prefilled Markdown suggestion block for the commented line in one step:
-
+  - `<leader>rs` (or `:BBPRCreateSuggestion`) opens the comment editor with a prefilled Markdown suggestion block for the commented line in one step. If cursor is on an existing overview or file-scoped comment, it creates a suggestion **reply** to that comment:
     ```suggestion
     <current line text>
     ```
