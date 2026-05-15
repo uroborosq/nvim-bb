@@ -107,12 +107,12 @@ end
 local function format_my_review_marker(pr)
 	local st = normalize_my_review_status(pr)
 	if st == "APPROVED" then
-		return "ME:+"
+		return "+"
 	end
 	if st == "NOT_REVIEWER" or st == "UNKNOWN" then
-		return "ME:-"
+		return "-"
 	end
-	return "ME:!"
+	return "!"
 end
 
 local function format_pr_entry(pr)
