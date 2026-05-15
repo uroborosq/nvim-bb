@@ -92,6 +92,32 @@ local function format_opened_age(ms)
 	return string.format("%dm", math.floor(seconds / 60))
 end
 
+
+local function normalize_my_review_status(pr)
+	local raw = type(pr.my_review_status) == "string" and string.upper(pr.my_review_status) or ""
+	if raw ~= "" then
+		return raw
+	end
+	if pr.my_approved == true then
+		return "APPROVED"
+	end
+	return "UNKNOWN"
+end
+
+local function format_my_review_marker(pr)
+	local st = normalize_my_review_status(pr)
+	if st == "APPROVED" then
+		return "+"
+	end
+	if st == "NEEDS_WORK" then
+		return "x"
+	end
+	if st == "NOT_REVIEWER" or st == "UNKNOWN" then
+		return "-"
+	end
+	return "?"
+end
+
 local function format_pr_entry(pr)
 	local approvals = 0
 	local has_needs_work = false
@@ -107,9 +133,10 @@ local function format_pr_entry(pr)
 	local needs_work_status = has_needs_work and "NW" or "OK"
 
 	return string.format(
-		"appr: %d %s • open %s, comm %s • %s - %s",
+		"appr: %d %s %s • open %s, comm %s • %s - %s",
 		approvals,
 		needs_work_status,
+		format_my_review_marker(pr),
 		format_opened_age(pr.createdDate),
 		format_opened_age(pr.updatedDate),
 		pr.author.user.displayName,
@@ -1184,6 +1211,10 @@ local function build_pr_info_content(pr)
 	}
 
 	vim.list_extend(info_lines, to_lines(pr.description))
+	table.insert(info_lines, "")
+	table.insert(info_lines, "## My Review")
+	table.insert(info_lines, "")
+	table.insert(info_lines, string.format("Status: %s", normalize_my_review_status(pr)))
 	table.insert(info_lines, "")
 	table.insert(info_lines, "## Approvals")
 	table.insert(info_lines, "")
