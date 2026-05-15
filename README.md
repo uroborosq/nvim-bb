@@ -18,6 +18,12 @@
 Bitbucket PR helper CLI + Neovim plugin.
 
 - Provider command defaults to `bb -reviewers -json` (override via `setup({ provider_cmd = {...} })`).
+- Repository/project selection for CLI calls:
+  - explicit override flags: `-project <PROJECT_KEY> -repo <repo-slug>`
+  - auto-detection from local git remote (`origin`, fallback `upstream`) when config/flags omit project or repo
+  - supports both Bitbucket URL styles:
+    - user repo style (for example `.../scm/~username/repo.git`)
+    - project repo style (for example `.../scm/PROJ/repo.git`)
 - Comment jump mappings default to `[C` / `]C` and can be changed via `setup({ comment_prev_map = "...", comment_next_map = "..." })`.
 - Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
