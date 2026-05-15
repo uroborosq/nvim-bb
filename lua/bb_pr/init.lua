@@ -115,7 +115,7 @@ local function format_my_review_marker(pr)
 	if st == "NOT_REVIEWER" or st == "UNKNOWN" then
 		return "-"
 	end
-	return "!"
+	return "?"
 end
 
 local function format_pr_entry(pr)
