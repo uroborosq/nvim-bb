@@ -18,7 +18,18 @@
 Bitbucket PR helper CLI + Neovim plugin.
 
 - Provider command defaults to `bb -reviewers -json` (override via `setup({ provider_cmd = {...} })`).
+- Repository/project selection for CLI calls:
+  - explicit override flags: `-project <PROJECT_KEY> -repo <repo-slug>`
+  - force auto-detection from git remote: `-force-autodetect-repo` (ignores `config.project`/`config.repo` unless explicit `-project`/`-repo` are passed)
+  - auto-detection from local git remote (`origin`, fallback `upstream`) when config/flags omit project or repo
+  - supports both Bitbucket URL styles:
+    - user repo style (for example `.../scm/~username/repo.git`)
+    - project repo style (for example `.../scm/PROJ/repo.git`)
 - Comment jump mappings default to `[C` / `]C` and can be changed via `setup({ comment_prev_map = "...", comment_next_map = "..." })`.
+- In Neovim plugin, you can force CLI repo autodetection for all bb commands via:
+  - by default it is enabled (`force_repo_autodetect = true`)
+  - you can disable it explicitly: `setup({ force_repo_autodetect = false })`
+  - optional flag override: `setup({ force_repo_autodetect_flag = "-force-autodetect-repo" })`
 - Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
