@@ -109,6 +109,9 @@ local function format_my_review_marker(pr)
 	if st == "APPROVED" then
 		return "+"
 	end
+	if st == "NEEDS_WORK" then
+		return "x"
+	end
 	if st == "NOT_REVIEWER" or st == "UNKNOWN" then
 		return "-"
 	end
