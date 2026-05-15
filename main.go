@@ -70,7 +70,9 @@ type PullRequest struct {
 		User User `json:"user"`
 	} `json:"author"`
 
-	Reviewers []Reviewer `json:"reviewers"`
+	Reviewers      []Reviewer `json:"reviewers"`
+	MyReviewStatus string     `json:"my_review_status,omitempty"`
+	MyApproved     bool       `json:"my_approved,omitempty"`
 
 	FromRef Ref `json:"fromRef"`
 	ToRef   Ref `json:"toRef"`
@@ -514,6 +516,7 @@ func main() {
 	}
 
 	sortPullRequests(prs, cfg)
+	enrichPullRequests(prs, cfg)
 
 	if cfg.JSONOutput || *jsonEnabled {
 		enc := json.NewEncoder(os.Stdout)
@@ -526,7 +529,7 @@ func main() {
 		return
 	}
 
-	printTable(prs, *reviewersEnabled)
+	printTable(prs, cfg, *reviewersEnabled)
 }
 
 func LoadConfig(path string) (RuntimeConfig, error) {
@@ -1238,10 +1241,10 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload any) (
 	return respBody, nil
 }
 
-func printTable(prs []PullRequest, reviewersEnabled bool) {
+func printTable(prs []PullRequest, cfg RuntimeConfig, reviewersEnabled bool) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-	_, _ = fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tAUTHOR\tTITLE")
+	_, _ = fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tAUTHOR\tTITLE")
 
 	now := time.Now()
 
@@ -1260,15 +1263,17 @@ func printTable(prs []PullRequest, reviewersEnabled bool) {
 
 		needsWork := needsWorkStatus(pr.Reviewers)
 		approvals := countApprovals(pr.Reviewers)
+		mine := myApprovalMarker(pr, cfg)
 
 		_, _ = fmt.Fprintf(
 			w,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n",
 			ageStr,
 			lastCommentStr,
 			pr.CommentCount,
 			needsWork,
 			approvals,
+			mine,
 			displayUser(pr.Author.User),
 			sanitizeCell(pr.Title),
 		)
@@ -1400,6 +1405,52 @@ func prSortBucket(pr PullRequest, candidates []string) int {
 		}
 	}
 	return 1
+}
+
+func reviewStatusForCurrentUser(pr PullRequest, cfg RuntimeConfig) (status string, approved bool) {
+	candidates := userCandidates(cfg)
+	if len(candidates) == 0 {
+		return "UNKNOWN", false
+	}
+	for _, reviewer := range pr.Reviewers {
+		if !isCurrentUser(reviewer.User, candidates) {
+			continue
+		}
+		st := strings.ToUpper(strings.TrimSpace(reviewer.Status))
+		if reviewer.Approved || st == "APPROVED" {
+			return "APPROVED", true
+		}
+		if st == "NEEDS_WORK" {
+			return "NEEDS_WORK", false
+		}
+		if st == "UNAPPROVED" {
+			return "UNAPPROVED", false
+		}
+		if st != "" {
+			return st, false
+		}
+		return "PENDING", false
+	}
+	return "NOT_REVIEWER", false
+}
+
+func enrichPullRequests(prs []PullRequest, cfg RuntimeConfig) {
+	for i := range prs {
+		status, approved := reviewStatusForCurrentUser(prs[i], cfg)
+		prs[i].MyReviewStatus = status
+		prs[i].MyApproved = approved
+	}
+}
+
+func myApprovalMarker(pr PullRequest, cfg RuntimeConfig) string {
+	status, approved := reviewStatusForCurrentUser(pr, cfg)
+	if approved {
+		return "yes"
+	}
+	if status == "NOT_REVIEWER" || status == "UNKNOWN" {
+		return "-"
+	}
+	return "no"
 }
 
 func sortPullRequests(prs []PullRequest, cfg RuntimeConfig) {
