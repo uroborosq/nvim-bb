@@ -21,6 +21,7 @@ M.config = {
 	pr_info_needs_work_map = "<leader>rn",
 	create_pr_map = "<leader>rc",
 	create_pr_toggle_draft_map = "<leader>rt",
+	create_pr_body_template = "",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
 
@@ -1521,18 +1522,40 @@ local function toggle_draft_in_title_line(line)
 end
 
 local function open_create_pr_editor(source_branch, target_branch)
+	local function resolve_pr_body_template_lines()
+		local template = M.config.create_pr_body_template
+		if type(template) == "string" then
+			if vim.trim(template) == "" then
+				return { "" }
+			end
+			return vim.split(template, "\n", { plain = true })
+		end
+		if type(template) == "table" then
+			local lines = {}
+			for _, item in ipairs(template) do
+				table.insert(lines, tostring(item or ""))
+			end
+			if #lines == 0 then
+				return { "" }
+			end
+			return lines
+		end
+		return { "" }
+	end
+
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].buftype = "nofile"
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].filetype = "markdown"
 	local default_title = string.format("%s -> %s", source_branch, target_branch)
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+	local initial_lines = {
 		"Title: " .. default_title,
 		"",
 		"Body:",
-		"",
-	})
+	}
+	vim.list_extend(initial_lines, resolve_pr_body_template_lines())
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
 	local width = math.max(90, math.floor(vim.o.columns * 0.7))
 	local height = math.max(14, math.floor(vim.o.lines * 0.4))
