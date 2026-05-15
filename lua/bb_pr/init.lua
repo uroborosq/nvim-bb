@@ -4,6 +4,8 @@ local reactions = require("bb_pr.reactions")
 local default_config = {
 	provider_cmd = { "bb", "-reviewers", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
+	force_repo_autodetect = false,
+	force_repo_autodetect_flag = "-force-autodetect-repo",
 	diffview_cmd = "DiffviewOpen",
 	comment_prev_map = "[C",
 	comment_next_map = "]C",
@@ -179,8 +181,34 @@ local function persist_reaction_recency_state()
 	pcall(vim.fn.writefile, { payload }, path)
 end
 
+local function with_repo_autodetect_flag(cmd)
+	local out = vim.deepcopy(cmd or {})
+	if not M.config.force_repo_autodetect then
+		return out
+	end
+	if type(out[1]) ~= "string" or out[1] ~= "bb" then
+		return out
+	end
+	local wanted = tostring(M.config.force_repo_autodetect_flag or "-force-autodetect-repo")
+	for _, part in ipairs(out) do
+		if part == wanted then
+			return out
+		end
+	end
+	table.insert(out, wanted)
+	return out
+end
+
+local function bb_cmd(parts)
+	local cmd = { "bb" }
+	for _, part in ipairs(parts or {}) do
+		table.insert(cmd, part)
+	end
+	return with_repo_autodetect_flag(cmd)
+end
+
 local function run_provider(cb)
-	vim.system(M.config.provider_cmd, { text = true }, function(res)
+	vim.system(with_repo_autodetect_flag(M.config.provider_cmd), { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
 				vim.notify("bb_pr: provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
@@ -231,6 +259,7 @@ local apply_pr_info_content
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
 	local cmd = vim.deepcopy(M.config.comments_cmd)
+	cmd = with_repo_autodetect_flag(cmd)
 	table.insert(cmd, tostring(pr_id))
 
 	vim.system(cmd, { text = true }, function(res)
@@ -1299,7 +1328,7 @@ local function open_pr_info(pr)
 			return
 		end
 
-		local cmd = { "bb", "-pr-review", tostring(pr_id), "-review-action", action, "-json" }
+		local cmd = bb_cmd({ "-pr-review", tostring(pr_id), "-review-action", action, "-json" })
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
@@ -1659,8 +1688,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 			return
 		end
 		pcall(vim.api.nvim_win_close, win, true)
-		local cmd = {
-			"bb",
+		local cmd = bb_cmd({
 			"-json",
 			"-pr-create",
 			"-pr-title",
@@ -1671,7 +1699,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 			source_branch,
 			"-pr-target",
 			target_branch,
-		}
+		})
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
 				vim.schedule(function()
@@ -1718,7 +1746,7 @@ local function create_pr()
 		vim.notify(sync_err, vim.log.levels.ERROR)
 		return
 	end
-	vim.system({ "bb", "-json", "-target-branches" }, { text = true }, function(res)
+	vim.system(bb_cmd({ "-json", "-target-branches" }), { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
 				vim.notify("bb_pr: failed to load target branches: " .. (res.stderr or ""), vim.log.levels.ERROR)
@@ -1841,8 +1869,7 @@ local function toggle_task_status()
 	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
 	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
 	local version = tonumber(target.version or 0) or 0
-	local cmd = {
-		"bb",
+	local cmd = bb_cmd({
 		"-json",
 		"-pr-task-status",
 		tostring(pr.id),
@@ -1852,7 +1879,7 @@ local function toggle_task_status()
 		next_state,
 		"-task-version",
 		tostring(version),
-	}
+	})
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
@@ -1931,8 +1958,7 @@ local function react_to_comment()
 		if type(existing) == "table" and type(existing.my_reactions) == "table" and existing.my_reactions[choice] then
 			action = "remove"
 		end
-		local cmd = {
-			"bb",
+		local cmd = bb_cmd({
 			"-json",
 			"-pr-reaction",
 			tostring(pr.id),
@@ -1942,7 +1968,7 @@ local function react_to_comment()
 			choice,
 			"-reaction-action",
 			action,
-		}
+		})
 		vim.system(cmd, { text = true }, function(res)
 			if res.code ~= 0 then
 				vim.schedule(function()
@@ -1990,7 +2016,7 @@ local function post_comment_or_task(is_task, force_reply, opts)
 			prompt = "Write multiline text. <C-s> submit, q cancel",
 			initial_text = opts.initial_text,
 		}, function(text)
-			local cmd = { "bb", "-json", "-pr-comment", tostring(pr.id), "-text", text }
+			local cmd = bb_cmd({ "-json", "-pr-comment", tostring(pr.id), "-text", text })
 			if is_task then
 				table.insert(cmd, "-task")
 			end
