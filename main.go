@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -367,10 +369,16 @@ func main() {
 	commentLineType := flag.String("line-type", "CONTEXT", "line type: ADDED|REMOVED|CONTEXT")
 	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
+	projectOverride := flag.String("project", "", "override project key (auto-detected from git remote when omitted)")
+	repoOverride := flag.String("repo", "", "override repo slug (auto-detected from git remote when omitted)")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
+		fatal(err)
+	}
+	cfg = applyRepoSelection(cfg, strings.TrimSpace(*projectOverride), strings.TrimSpace(*repoOverride))
+	if err := validateRepoSelection(cfg); err != nil {
 		fatal(err)
 	}
 
@@ -532,6 +540,78 @@ func main() {
 	printTable(prs, cfg, *reviewersEnabled)
 }
 
+func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string) RuntimeConfig {
+	if projectOverride != "" {
+		cfg.Project = projectOverride
+	}
+	if repoOverride != "" {
+		cfg.Repo = repoOverride
+	}
+	if cfg.Project != "" && cfg.Repo != "" {
+		return cfg
+	}
+	project, repo, err := detectProjectRepoFromGitRemote()
+	if err != nil {
+		return cfg
+	}
+	if cfg.Project == "" {
+		cfg.Project = project
+	}
+	if cfg.Repo == "" {
+		cfg.Repo = repo
+	}
+	return cfg
+}
+
+func validateRepoSelection(cfg RuntimeConfig) error {
+	if strings.TrimSpace(cfg.Project) == "" {
+		return errors.New("project is required: set config.project, pass -project, or run inside a git repo with a Bitbucket remote")
+	}
+	if strings.TrimSpace(cfg.Repo) == "" {
+		return errors.New("repo is required: set config.repo, pass -repo, or run inside a git repo with a Bitbucket remote")
+	}
+	return nil
+}
+
+func detectProjectRepoFromGitRemote() (project, repo string, err error) {
+	remote, err := gitRemoteURL()
+	if err != nil {
+		return "", "", err
+	}
+	project, repo = parseProjectRepoFromRemote(remote)
+	if project == "" || repo == "" {
+		return "", "", fmt.Errorf("cannot parse project/repo from git remote %q", remote)
+	}
+	return project, repo, nil
+}
+
+func gitRemoteURL() (string, error) {
+	candidates := []string{"origin", "upstream"}
+	for _, name := range candidates {
+		out, err := exec.Command("git", "remote", "get-url", name).Output()
+		if err != nil {
+			continue
+		}
+		remote := strings.TrimSpace(string(out))
+		if remote != "" {
+			return remote, nil
+		}
+	}
+	return "", errors.New("git remote origin/upstream not found")
+}
+
+func parseProjectRepoFromRemote(remote string) (string, string) {
+	clean := strings.TrimSpace(remote)
+	clean = strings.TrimSuffix(clean, ".git")
+	clean = strings.ReplaceAll(clean, "\\", "/")
+	re := regexp.MustCompile(`(?:/|:)(?:scm/)?([^/]+)/([^/]+)$`)
+	match := re.FindStringSubmatch(clean)
+	if len(match) != 3 {
+		return "", ""
+	}
+	return strings.ToUpper(match[1]), match[2]
+}
+
 func LoadConfig(path string) (RuntimeConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -600,14 +680,6 @@ func (cfg *Config) applyDefaults() {
 func validateConfig(cfg RuntimeConfig) error {
 	if cfg.BaseURL == "" {
 		return errors.New("config.base_url is required")
-	}
-
-	if cfg.Project == "" {
-		return errors.New("config.project is required")
-	}
-
-	if cfg.Repo == "" {
-		return errors.New("config.repo is required")
 	}
 
 	switch cfg.Auth {
