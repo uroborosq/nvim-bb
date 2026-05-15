@@ -312,6 +312,29 @@ type CreateCommentRequest struct {
 	Anchor   *Anchor        `json:"anchor,omitempty"`
 }
 
+type BranchRef struct {
+	ID        string `json:"id"`
+	DisplayID string `json:"displayId"`
+}
+
+type BranchPage struct {
+	Values        []BranchRef `json:"values"`
+	IsLastPage    bool        `json:"isLastPage"`
+	NextPageStart int         `json:"nextPageStart"`
+	Size          int         `json:"size"`
+}
+
+type CreatePullRequestRequest struct {
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	FromRef     struct {
+		ID string `json:"id"`
+	} `json:"fromRef"`
+	ToRef struct {
+		ID string `json:"id"`
+	} `json:"toRef"`
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
@@ -321,6 +344,12 @@ func main() {
 	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
 	prReactionID := flag.Int64("pr-reaction", 0, "set reaction on PR comment for the given PR id")
+	prCreate := flag.Bool("pr-create", false, "create pull request")
+	targetBranches := flag.Bool("target-branches", false, "list target branches for PR creation")
+	prTitle := flag.String("pr-title", "", "pull request title for -pr-create")
+	prBody := flag.String("pr-body", "", "pull request description for -pr-create")
+	prSource := flag.String("pr-source", "", "source branch for -pr-create, e.g. feature/my-branch")
+	prTarget := flag.String("pr-target", "", "target branch for -pr-create, e.g. main")
 	reactionCommentID := flag.Int64("comment-id", 0, "comment id for -pr-reaction")
 	reactionShortcut := flag.String("reaction", "", "reaction shortcut for -pr-reaction (e.g. THUMBS_UP, HEART)")
 	reactionAction := flag.String("reaction-action", "add", "reaction action: add|remove")
@@ -378,6 +407,38 @@ func main() {
 			fatal(err)
 		}
 
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(created); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if *targetBranches {
+		branches, err := client.GetRepoBranches(ctx)
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(branches); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if *prCreate {
+		title := strings.TrimSpace(*prTitle)
+		source := strings.TrimSpace(*prSource)
+		target := strings.TrimSpace(*prTarget)
+		if title == "" || source == "" || target == "" {
+			fatal(errors.New("-pr-title, -pr-source and -pr-target are required with -pr-create"))
+		}
+		created, err := client.CreatePullRequest(ctx, title, strings.TrimSpace(*prBody), source, target)
+		if err != nil {
+			fatal(err)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(created); err != nil {
@@ -1018,6 +1079,37 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	default:
 		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
+}
+
+func (c *Client) GetRepoBranches(ctx context.Context) ([]BranchRef, error) {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/branches?limit=1000", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo))
+	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var page BranchPage
+	if err := json.Unmarshal(b, &page); err != nil {
+		return nil, fmt.Errorf("decode branches response: %w", err)
+	}
+	return page.Values, nil
+}
+
+func (c *Client) CreatePullRequest(ctx context.Context, title, description, sourceBranch, targetBranch string) (*PullRequest, error) {
+	var req CreatePullRequestRequest
+	req.Title = title
+	req.Description = description
+	req.FromRef.ID = "refs/heads/" + strings.TrimPrefix(sourceBranch, "refs/heads/")
+	req.ToRef.ID = "refs/heads/" + strings.TrimPrefix(targetBranch, "refs/heads/")
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo))
+	b, err := c.doJSON(ctx, http.MethodPost, path, req)
+	if err != nil {
+		return nil, err
+	}
+	var out PullRequest
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode create PR response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string, version int) error {
