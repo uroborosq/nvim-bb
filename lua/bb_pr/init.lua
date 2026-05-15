@@ -195,7 +195,7 @@ local function with_repo_autodetect_flag(cmd)
 			return out
 		end
 	end
-	table.insert(out, wanted)
+	table.insert(out, 2, wanted)
 	return out
 end
 
