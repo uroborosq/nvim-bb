@@ -412,6 +412,24 @@ local function resolve_apply_target_bufnr()
 	end
 	return cur
 end
+
+local function apply_suggestion_lines(buf, line, replacement_lines)
+	if not (type(buf) == "number" and vim.api.nvim_buf_is_valid(buf)) then
+		return false, "invalid target buffer"
+	end
+	local was_modifiable = vim.bo[buf].modifiable
+	if not was_modifiable then
+		vim.bo[buf].modifiable = true
+	end
+	local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, line - 1, line, false, replacement_lines)
+	if not was_modifiable then
+		vim.bo[buf].modifiable = false
+	end
+	if not ok then
+		return false, tostring(err or "failed to apply suggestion")
+	end
+	return true, nil
+end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
@@ -1991,7 +2009,11 @@ local function accept_suggestion()
 		return
 	end
 	local replacement_lines = vim.split(replacement, "\n", { plain = true })
-	vim.api.nvim_buf_set_lines(buf, line - 1, line, false, replacement_lines)
+	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
+	if not ok_apply then
+		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
+		return
+	end
 	vim.notify("bb_pr: suggestion applied. Commit and push manually (git add/commit/push).", vim.log.levels.INFO)
 end
 
