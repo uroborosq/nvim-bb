@@ -403,6 +403,15 @@ local function current_buffer_repo_path(bufnr)
 
 	return ""
 end
+
+local function resolve_apply_target_bufnr()
+	local cur = vim.api.nvim_get_current_buf()
+	local source = vim.b[cur].bb_pr_float_source_bufnr
+	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
+		return source
+	end
+	return cur
+end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
@@ -1967,7 +1976,7 @@ local function accept_suggestion()
 		return
 	end
 	local target_path = normalize_repo_path(comment.path or "")
-	local buf = vim.api.nvim_get_current_buf()
+	local buf = resolve_apply_target_bufnr()
 	local cur_buf_path = current_buffer_repo_path(buf)
 	if target_path == "" or not path_matches(cur_buf_path, target_path) then
 		vim.notify(
