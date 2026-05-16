@@ -383,6 +383,26 @@ local function extract_repo_relative_path(bufname)
 	local rel = vim.fn.fnamemodify(name, ":.")
 	return normalize_repo_path(rel)
 end
+
+local function current_buffer_repo_path(bufnr)
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	local primary = normalize_repo_path(extract_repo_relative_path(name))
+	if primary ~= "" then
+		return primary
+	end
+
+	local alt_expand = normalize_repo_path(vim.fn.expand("%:."))
+	if alt_expand ~= "" then
+		return alt_expand
+	end
+
+	local alt_name = normalize_repo_path(name)
+	if alt_name ~= "" then
+		return alt_name
+	end
+
+	return ""
+end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
@@ -1948,13 +1968,14 @@ local function accept_suggestion()
 	end
 	local target_path = normalize_repo_path(comment.path or "")
 	local buf = vim.api.nvim_get_current_buf()
-	local cur_buf_path = normalize_repo_path(extract_repo_relative_path(vim.api.nvim_buf_get_name(buf)))
+	local cur_buf_path = current_buffer_repo_path(buf)
 	if target_path == "" or not path_matches(cur_buf_path, target_path) then
 		vim.notify(
 			string.format(
-				"bb_pr: open commented file before accepting suggestion (anchor=%s current=%s)",
+				"bb_pr: open commented file before accepting suggestion (anchor=%s current=%s buf=%s)",
 				target_path,
-				cur_buf_path
+				cur_buf_path,
+				vim.api.nvim_buf_get_name(buf)
 			),
 			vim.log.levels.WARN
 		)
