@@ -14,6 +14,7 @@ local default_config = {
 	reply_comment_map = "<leader>rR",
 	react_comment_map = "<leader>re",
 	create_suggestion_map = "<leader>rs",
+	accept_suggestion_map = "<leader>rA",
 	reaction_default = "THUMBS_UP",
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>rr",
@@ -1894,6 +1895,76 @@ local function toggle_task_status()
 	end)
 end
 
+local function find_comment_by_id(cid)
+	local payload = get_current_tab_comments() or {}
+	for _, c in ipairs(as_array(payload.overview_comments)) do
+		if tonumber(c.id or 0) == cid then
+			return c
+		end
+	end
+	for _, c in ipairs(as_array(payload.file_comments)) do
+		if tonumber(c.id or 0) == cid then
+			return c
+		end
+	end
+	return nil
+end
+
+local function extract_first_suggestion_block(text)
+	if type(text) ~= "string" or text == "" then
+		return nil
+	end
+	local block = text:match("```suggestion%s*\n(.-)\n```")
+	if type(block) ~= "string" then
+		return nil
+	end
+	return block
+end
+
+local function accept_suggestion()
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+	local comment = find_comment_by_id(cid)
+	if type(comment) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	if not comment.is_file_comment then
+		vim.notify("bb_pr: selected comment is overview-only, no file location to apply suggestion", vim.log.levels.WARN)
+		return
+	end
+	local replacement = extract_first_suggestion_block(comment.text)
+	if not replacement then
+		vim.notify("bb_pr: selected comment has no ```suggestion``` block", vim.log.levels.WARN)
+		return
+	end
+	local line = tonumber(comment.line or 0) or 0
+	if line <= 0 then
+		vim.notify("bb_pr: selected comment has invalid line anchor", vim.log.levels.WARN)
+		return
+	end
+	local target_path = normalize_repo_path(comment.path or "")
+	local buf = vim.api.nvim_get_current_buf()
+	local cur_buf_path = normalize_repo_path(extract_repo_relative_path(vim.api.nvim_buf_get_name(buf)))
+	if target_path == "" or not path_matches(cur_buf_path, target_path) then
+		vim.notify(
+			string.format(
+				"bb_pr: open commented file before accepting suggestion (anchor=%s current=%s)",
+				target_path,
+				cur_buf_path
+			),
+			vim.log.levels.WARN
+		)
+		return
+	end
+	local replacement_lines = vim.split(replacement, "\n", { plain = true })
+	vim.api.nvim_buf_set_lines(buf, line - 1, line, false, replacement_lines)
+	vim.notify("bb_pr: suggestion applied. Commit and push manually (git add/commit/push).", vim.log.levels.INFO)
+end
+
 local function sort_reactions_by_recent_use(choices)
 	table.sort(choices, function(a, b)
 		local sa = tonumber(state.reaction_usage_by_key[a] or 0) or 0
@@ -2187,6 +2258,10 @@ function M.setup(opts)
 		create_suggestion_comment()
 	end, { desc = "Create PR comment with prefilled suggestion block" })
 
+	vim.api.nvim_create_user_command("BBPRAcceptSuggestion", function()
+		accept_suggestion()
+	end, { desc = "Apply suggestion from comment under cursor to current file" })
+
 	vim.api.nvim_create_user_command("BBPRReplyComment", function()
 		post_comment_or_task(false, true)
 	end, { desc = "Reply to current PR comment" })
@@ -2229,6 +2304,14 @@ function M.setup(opts)
 			M.config.create_suggestion_map,
 			"<cmd>BBPRCreateSuggestion<CR>",
 			{ desc = "Create PR suggestion comment", silent = true }
+		)
+	end
+	if M.config.accept_suggestion_map and M.config.accept_suggestion_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.accept_suggestion_map,
+			"<cmd>BBPRAcceptSuggestion<CR>",
+			{ desc = "Accept PR suggestion", silent = true }
 		)
 	end
 	if M.config.reply_comment_map and M.config.reply_comment_map ~= "" then
