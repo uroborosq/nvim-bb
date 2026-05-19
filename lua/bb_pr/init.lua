@@ -20,6 +20,7 @@ local default_config = {
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>rr",
 	toggle_task_map = "<leader>rt",
+	resolve_comment_map = "<leader>rv",
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
@@ -2034,7 +2035,7 @@ local function refresh_float_window_if_needed(win, buf)
 	end
 end
 
-local function toggle_task_status()
+local function toggle_comment_resolution()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
@@ -2042,7 +2043,7 @@ local function toggle_task_status()
 	end
 	local cid = resolve_reply_target_comment_id()
 	if not cid then
-		vim.notify("bb_pr: move cursor to a task line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
 
@@ -2055,8 +2056,8 @@ local function toggle_task_status()
 		all_comments[tonumber(c.id or 0) or 0] = c
 	end
 	local target = all_comments[cid]
-	if type(target) ~= "table" or not target.is_task then
-		vim.notify("bb_pr: selected comment is not a task", vim.log.levels.WARN)
+	if type(target) ~= "table" then
+		vim.notify("bb_pr: selected comment not found in loaded payload", vim.log.levels.WARN)
 		return
 	end
 	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
@@ -2076,12 +2077,12 @@ local function toggle_task_status()
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
 			vim.schedule(function()
-				vim.notify("bb_pr: toggle task failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				vim.notify("bb_pr: toggle comment resolution failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
 			end)
 			return
 		end
 		vim.schedule(function()
-			vim.notify("bb_pr: task marked " .. next_state, vim.log.levels.INFO)
+			vim.notify("bb_pr: comment marked " .. next_state, vim.log.levels.INFO)
 			vim.cmd("BBPRLoadComments")
 		end)
 	end)
@@ -2515,8 +2516,12 @@ function M.setup(opts)
 	end, { desc = "Force refresh PR comments from server" })
 
 	vim.api.nvim_create_user_command("BBPRToggleTask", function()
-		toggle_task_status()
-	end, { desc = "Toggle PR task done/open for comment under cursor" })
+		toggle_comment_resolution()
+	end, { desc = "Toggle PR comment open/resolved for comment under cursor" })
+
+	vim.api.nvim_create_user_command("BBPRResolveComment", function()
+		toggle_comment_resolution()
+	end, { desc = "Toggle PR comment open/resolved for comment under cursor" })
 
 	vim.api.nvim_create_user_command("BBPRReactComment", function()
 		react_to_comment()
@@ -2593,7 +2598,15 @@ function M.setup(opts)
 			"n",
 			M.config.toggle_task_map,
 			"<cmd>BBPRToggleTask<CR>",
-			{ desc = "Toggle PR task done/open", silent = true }
+			{ desc = "Toggle PR comment open/resolved", silent = true }
+		)
+	end
+	if M.config.resolve_comment_map and M.config.resolve_comment_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.resolve_comment_map,
+			"<cmd>BBPRResolveComment<CR>",
+			{ desc = "Toggle PR comment open/resolved", silent = true }
 		)
 	end
 	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then

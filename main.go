@@ -401,7 +401,7 @@ func main() {
 	deleteCommentID := flag.Int64("delete-comment-id", 0, "comment id for -pr-delete-comment")
 	deleteCommentVersion := flag.Int("delete-comment-version", -1, "comment version for -pr-delete-comment (optimistic lock)")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
-	taskState := flag.String("task-state", "", "task state: open|done")
+	taskState := flag.String("task-state", "", "comment state: open|done|resolved")
 	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
 	commentText := flag.String("text", "", "comment/task text")
 	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
@@ -1407,7 +1407,7 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 	case "done", "resolved":
 		normalized = "RESOLVED"
 	default:
-		return fmt.Errorf("bad -task-state %q; expected open|done", state)
+		return fmt.Errorf("bad -task-state %q; expected open|done|resolved", state)
 	}
 
 	path := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d", c.cfg.Project, c.cfg.Repo, prID, taskID)
