@@ -25,6 +25,8 @@ local default_config = {
 	create_pr_map = "<leader>rc",
 	create_pr_toggle_draft_map = "<leader>rt",
 	create_pr_body_template = "",
+	merge_pr_map = "<leader>rm",
+	merge_pr_body_template_fn = nil,
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 }
 M.config = vim.deepcopy(default_config)
@@ -1878,6 +1880,82 @@ local function create_pr()
 	end)
 end
 
+local function get_last_commit_title(commits)
+	if type(commits) ~= "table" or #commits == 0 then
+		return ""
+	end
+	local msg = tostring((commits[1] or {}).message or "")
+	return vim.split(msg, "\n", { plain = true })[1] or ""
+end
+
+local function merge_current_pr()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	vim.system(bb_cmd({ "-json", "-pr-commits", tostring(pr.id) }), { text = true }, function(commits_res)
+		if commits_res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: failed to load PR commits: " .. (commits_res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		local ok, commits = pcall(vim.json.decode, commits_res.stdout)
+		if not ok or type(commits) ~= "table" then
+			vim.schedule(function()
+				vim.notify("bb_pr: invalid PR commits JSON", vim.log.levels.ERROR)
+			end)
+			return
+		end
+		local title = get_last_commit_title(commits)
+		if title == "" then
+			title = tostring(pr.title or "")
+		end
+		local body_lines = { "" }
+		if type(M.config.merge_pr_body_template_fn) == "function" then
+			local ok_tpl, tpl = pcall(M.config.merge_pr_body_template_fn, commits)
+			if ok_tpl then
+				if type(tpl) == "string" then
+					body_lines = vim.split(tpl, "\n", { plain = true })
+				elseif type(tpl) == "table" then
+					body_lines = tpl
+				end
+			end
+		end
+		vim.schedule(function()
+			open_text_editor("Merge PR #" .. tostring(pr.id), function(text)
+				local body = ""
+				if text:find("\n", 1, true) then
+					local lines = vim.split(text, "\n", { plain = true })
+					title = vim.trim(lines[1] or "")
+					body = vim.trim(table.concat(vim.list_slice(lines, 2), "\n"))
+				else
+					title = vim.trim(text)
+				end
+				if title == "" then
+					vim.notify("bb_pr: merge commit title is required", vim.log.levels.WARN)
+					return
+				end
+				local cmd = bb_cmd({ "-json", "-pr-merge", tostring(pr.id), "-merge-title", title, "-merge-body", body })
+				vim.system(cmd, { text = true }, function(res)
+					if res.code ~= 0 then
+						vim.schedule(function()
+							vim.notify("bb_pr: merge failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+						end)
+						return
+					end
+					vim.schedule(function()
+						vim.notify("bb_pr: pull request merged", vim.log.levels.INFO)
+					end)
+				end)
+			end)
+			local buf = vim.api.nvim_get_current_buf()
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ title }, body_lines))
+		end)
+	end)
+end
+
 local function resolve_reply_target_comment_id()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -2376,6 +2454,9 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPRCreatePR", function()
 		create_pr()
 	end, { desc = "Create pull request from current branch" })
+	vim.api.nvim_create_user_command("BBPRMerge", function()
+		merge_current_pr()
+	end, { desc = "Merge pull request opened in current tab" })
 
 	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
 		vim.keymap.set(
@@ -2443,6 +2524,9 @@ function M.setup(opts)
 	end
 	if M.config.create_pr_map and M.config.create_pr_map ~= "" then
 		vim.keymap.set("n", M.config.create_pr_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
+	end
+	if M.config.merge_pr_map and M.config.merge_pr_map ~= "" then
+		vim.keymap.set("n", M.config.merge_pr_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })

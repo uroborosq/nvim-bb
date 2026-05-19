@@ -61,6 +61,7 @@ type PRPage struct {
 
 type PullRequest struct {
 	ID           int64  `json:"id"`
+	Version      int    `json:"version"`
 	Title        string `json:"title"`
 	Description  string `json:"description"`
 	State        string `json:"state"`
@@ -340,6 +341,31 @@ type CreatePullRequestRequest struct {
 	} `json:"toRef"`
 }
 
+type MergePullRequestRequest struct {
+	Version            int    `json:"version"`
+	Message            string `json:"message,omitempty"`
+	CommitMessage      string `json:"commitMessage,omitempty"`
+	AutoSubject        bool   `json:"autoSubject"`
+	AutoMerge          bool   `json:"autoMerge"`
+	AutoMergeBranch    bool   `json:"autoMergeBranch"`
+	StrategyID         string `json:"strategyId,omitempty"`
+	TransitionToMerged bool   `json:"transitionToMerged"`
+}
+
+type PRCommit struct {
+	ID         string `json:"id"`
+	DisplayID  string `json:"displayId"`
+	Message    string `json:"message"`
+	Author     User   `json:"author"`
+	AuthorTime int64  `json:"authorTimestamp"`
+}
+
+type PRCommitPage struct {
+	Values        []PRCommit `json:"values"`
+	IsLastPage    bool       `json:"isLastPage"`
+	NextPageStart int        `json:"nextPageStart"`
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
@@ -350,11 +376,15 @@ func main() {
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
 	prReactionID := flag.Int64("pr-reaction", 0, "set reaction on PR comment for the given PR id")
 	prCreate := flag.Bool("pr-create", false, "create pull request")
+	prMergeID := flag.Int64("pr-merge", 0, "merge pull request by id")
+	prCommitsID := flag.Int64("pr-commits", 0, "print pull request commits as JSON for the given PR id")
 	targetBranches := flag.Bool("target-branches", false, "list target branches for PR creation")
 	prTitle := flag.String("pr-title", "", "pull request title for -pr-create")
 	prBody := flag.String("pr-body", "", "pull request description for -pr-create")
 	prSource := flag.String("pr-source", "", "source branch for -pr-create, e.g. feature/my-branch")
 	prTarget := flag.String("pr-target", "", "target branch for -pr-create, e.g. main")
+	mergeTitle := flag.String("merge-title", "", "merge commit title for -pr-merge")
+	mergeBody := flag.String("merge-body", "", "merge commit body for -pr-merge")
 	reactionCommentID := flag.Int64("comment-id", 0, "comment id for -pr-reaction")
 	reactionShortcut := flag.String("reaction", "", "reaction shortcut for -pr-reaction (e.g. THUMBS_UP, HEART)")
 	reactionAction := flag.String("reaction-action", "add", "reaction action: add|remove")
@@ -456,6 +486,30 @@ func main() {
 		if err := enc.Encode(created); err != nil {
 			fatal(err)
 		}
+		return
+	}
+	if *prCommitsID > 0 {
+		commits, err := client.GetPullRequestCommits(ctx, *prCommitsID)
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(commits); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if *prMergeID > 0 {
+		title := strings.TrimSpace(*mergeTitle)
+		if title == "" {
+			fatal(errors.New("-merge-title is required with -pr-merge"))
+		}
+		if err := client.MergePullRequest(ctx, *prMergeID, title, strings.TrimSpace(*mergeBody)); err != nil {
+			fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"action\":\"merge\",\"ok\":true}\n", *prMergeID)
 		return
 	}
 
@@ -1196,6 +1250,56 @@ func (c *Client) CreatePullRequest(ctx context.Context, title, description, sour
 		return nil, fmt.Errorf("decode create PR response: %w", err)
 	}
 	return &out, nil
+}
+
+func (c *Client) GetPullRequestCommits(ctx context.Context, prID int64) ([]PRCommit, error) {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/commits?limit=1000", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
+	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var page PRCommitPage
+	if err := json.Unmarshal(b, &page); err != nil {
+		return nil, fmt.Errorf("decode PR commits response: %w", err)
+	}
+	return page.Values, nil
+}
+
+func (c *Client) GetPullRequest(ctx context.Context, prID int64) (*PullRequest, error) {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
+	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out PullRequest
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode PR response: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body string) error {
+	pr, err := c.GetPullRequest(ctx, prID)
+	if err != nil {
+		return err
+	}
+	message := strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	if body != "" {
+		message += "\n\n" + body
+	}
+	req := MergePullRequestRequest{
+		Version:            pr.Version,
+		Message:            message,
+		CommitMessage:      message,
+		AutoSubject:        false,
+		AutoMerge:          false,
+		AutoMergeBranch:    false,
+		TransitionToMerged: true,
+	}
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/merge", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
+	_, err = c.doJSON(ctx, http.MethodPost, path, req)
+	return err
 }
 
 func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string, version int) error {

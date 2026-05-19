@@ -66,5 +66,10 @@ Bitbucket PR helper CLI + Neovim plugin.
   - Reaction picker entries are rendered as emoji/symbol + alias (for example `👍  THUMBS_UP`) so large reaction sets stay readable.
   - Reaction picker ordering is recency-based and persistent: the most recently applied reactions are shown first across Neovim restarts (path configurable via `reaction_recency_store_path`).
   - PR create body can be prefilled from config via `setup({ create_pr_body_template = "..." })` (string with newlines) or `setup({ create_pr_body_template = { "line 1", "line 2" } })`.
+  - `:BBPRMerge` merges the PR opened in the current tab and prompts for merge commit message.
+  - Merge message defaults:
+    - title: title of the latest commit in the PR branch
+    - body: generated from `setup({ merge_pr_body_template_fn = function(commits) ... end })`, where `commits` is a list from Bitbucket API.
+  - Merge mapping defaults to `<leader>rm` and can be changed via `setup({ merge_pr_map = "..." })`.
 
   - Your own reactions are marked with `(you)` in comment popups/overview so you can quickly see what you already added.
