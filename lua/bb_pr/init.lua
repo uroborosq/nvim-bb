@@ -383,6 +383,34 @@ local function extract_repo_relative_path(bufname)
 	local rel = vim.fn.fnamemodify(name, ":.")
 	return normalize_repo_path(rel)
 end
+
+local function resolve_buffer_for_target_path(target_path)
+	local cur = vim.api.nvim_get_current_buf()
+	local cur_name = vim.api.nvim_buf_get_name(cur)
+	local cur_rel = extract_repo_relative_path(cur_name)
+	if path_matches(cur_rel, target_path) and vim.bo[cur].buftype == "" then
+		return cur
+	end
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			local name = vim.api.nvim_buf_get_name(bufnr)
+			local rel = extract_repo_relative_path(name)
+			if path_matches(rel, target_path) and vim.bo[bufnr].buftype == "" then
+				return bufnr
+			end
+		end
+	end
+
+	local abs = vim.fn.fnamemodify(vim.fn.getcwd() .. "/" .. target_path, ":p")
+	local bufnr = vim.fn.bufadd(abs)
+	vim.fn.bufload(bufnr)
+	if vim.bo[bufnr].buftype ~= "" then
+		return nil
+	end
+	return bufnr
+end
+
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
 	if not vim.api.nvim_win_is_valid(win) then
@@ -2131,8 +2159,21 @@ local function accept_suggestion()
 		vim.notify("bb_pr: comment has invalid line anchor", vim.log.levels.WARN)
 		return
 	end
-	vim.api.nvim_buf_set_lines(0, line - 1, line, false, suggestion_lines)
-	vim.notify("bb_pr: suggestion applied to buffer", vim.log.levels.INFO)
+
+	local target_buf = resolve_buffer_for_target_path(target_path)
+	if not target_buf then
+		vim.notify("bb_pr: failed to resolve writable target buffer", vim.log.levels.WARN)
+		return
+	end
+	vim.api.nvim_buf_set_lines(target_buf, line - 1, line, false, suggestion_lines)
+	local ok_write, write_err = pcall(vim.api.nvim_buf_call, target_buf, function()
+		vim.cmd("silent write")
+	end)
+	if not ok_write then
+		vim.notify("bb_pr: suggestion applied, but failed to write file: " .. tostring(write_err), vim.log.levels.WARN)
+		return
+	end
+	vim.notify("bb_pr: suggestion applied to file", vim.log.levels.INFO)
 end
 
 local function suggestion_prefill_for_context(ctx, suggestion_line)
