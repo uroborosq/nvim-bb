@@ -95,7 +95,6 @@ local function format_opened_age(ms)
 	return string.format("%dm", math.floor(seconds / 60))
 end
 
-
 local function normalize_my_review_status(pr)
 	local raw = type(pr.my_review_status) == "string" and string.upper(pr.my_review_status) or ""
 	if raw ~= "" then
@@ -382,6 +381,94 @@ local function extract_repo_relative_path(bufname)
 
 	local rel = vim.fn.fnamemodify(name, ":.")
 	return normalize_repo_path(rel)
+end
+
+local function current_buffer_repo_path(bufnr)
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	local primary = normalize_repo_path(extract_repo_relative_path(name))
+	if primary ~= "" then
+		return primary
+	end
+
+	local alt_expand = normalize_repo_path(vim.fn.expand("%:."))
+	if alt_expand ~= "" then
+		return alt_expand
+	end
+
+	local alt_name = normalize_repo_path(name)
+	if alt_name ~= "" then
+		return alt_name
+	end
+
+	return ""
+end
+
+local function resolve_apply_target_bufnr(target_path)
+	local cur = vim.api.nvim_get_current_buf()
+	local source = vim.b[cur].bb_pr_float_source_bufnr
+	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
+		local source_name = vim.api.nvim_buf_get_name(source)
+		if not tostring(source_name):match("^diffview://") then
+			local source_path = current_buffer_repo_path(source)
+			if target_path == "" or path_matches(source_path, target_path) then
+				return source
+			end
+		end
+	end
+
+	if vim.api.nvim_buf_is_valid(cur) then
+		local cur_name = vim.api.nvim_buf_get_name(cur)
+		if not tostring(cur_name):match("^diffview://") then
+			local cur_path = current_buffer_repo_path(cur)
+			if target_path == "" or path_matches(cur_path, target_path) then
+				return cur
+			end
+		end
+	end
+
+	for _, b in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(b) and vim.bo[b].buftype == "" then
+			local name = vim.api.nvim_buf_get_name(b)
+			if name ~= "" and not tostring(name):match("^diffview://") then
+				local p = current_buffer_repo_path(b)
+				if target_path ~= "" and path_matches(p, target_path) then
+					return b
+				end
+			end
+		end
+	end
+
+	if target_path ~= "" then
+		local abs = vim.fn.fnamemodify(target_path, ":p")
+		local file_buf = vim.fn.bufadd(abs)
+		pcall(vim.fn.bufload, file_buf)
+		if type(file_buf) == "number" and file_buf > 0 and vim.api.nvim_buf_is_valid(file_buf) then
+			return file_buf
+		end
+	end
+
+	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
+		return source
+	end
+	return cur
+end
+
+local function apply_suggestion_lines(buf, line, replacement_lines)
+	if not (type(buf) == "number" and vim.api.nvim_buf_is_valid(buf)) then
+		return false, "invalid target buffer"
+	end
+	local was_modifiable = vim.bo[buf].modifiable
+	if not was_modifiable then
+		vim.bo[buf].modifiable = true
+	end
+	local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, line - 1, line, false, replacement_lines)
+	if not was_modifiable then
+		vim.bo[buf].modifiable = false
+	end
+	if not ok then
+		return false, tostring(err or "failed to apply suggestion")
+	end
+	return true, nil
 end
 local function current_diff_side()
 	local win = vim.api.nvim_get_current_win()
@@ -1933,7 +2020,10 @@ local function accept_suggestion()
 		return
 	end
 	if not comment.is_file_comment then
-		vim.notify("bb_pr: selected comment is overview-only, no file location to apply suggestion", vim.log.levels.WARN)
+		vim.notify(
+			"bb_pr: selected comment is overview-only, no file location to apply suggestion",
+			vim.log.levels.WARN
+		)
 		return
 	end
 	local replacement = extract_first_suggestion_block(comment.text)
@@ -1947,14 +2037,26 @@ local function accept_suggestion()
 		return
 	end
 	local target_path = normalize_repo_path(comment.path or "")
-	local buf = vim.api.nvim_get_current_buf()
-	local cur_buf_path = normalize_repo_path(extract_repo_relative_path(vim.api.nvim_buf_get_name(buf)))
-	if target_path == "" or cur_buf_path ~= target_path then
-		vim.notify("bb_pr: open commented file before accepting suggestion: " .. target_path, vim.log.levels.WARN)
+	local buf = resolve_apply_target_bufnr(target_path)
+	local cur_buf_path = current_buffer_repo_path(buf)
+	if target_path == "" or not path_matches(cur_buf_path, target_path) then
+		vim.notify(
+			string.format(
+				"bb_pr: open commented file before accepting suggestion (anchor=%s current=%s buf=%s)",
+				target_path,
+				cur_buf_path,
+				vim.api.nvim_buf_get_name(buf)
+			),
+			vim.log.levels.WARN
+		)
 		return
 	end
 	local replacement_lines = vim.split(replacement, "\n", { plain = true })
-	vim.api.nvim_buf_set_lines(buf, line - 1, line, false, replacement_lines)
+	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
+	if not ok_apply then
+		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
+		return
+	end
 	vim.notify("bb_pr: suggestion applied. Commit and push manually (git add/commit/push).", vim.log.levels.INFO)
 end
 
