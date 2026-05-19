@@ -404,9 +404,50 @@ local function current_buffer_repo_path(bufnr)
 	return ""
 end
 
-local function resolve_apply_target_bufnr()
+local function resolve_apply_target_bufnr(target_path)
 	local cur = vim.api.nvim_get_current_buf()
 	local source = vim.b[cur].bb_pr_float_source_bufnr
+	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
+		local source_name = vim.api.nvim_buf_get_name(source)
+		if not tostring(source_name):match("^diffview://") then
+			local source_path = current_buffer_repo_path(source)
+			if target_path == "" or path_matches(source_path, target_path) then
+				return source
+			end
+		end
+	end
+
+	if vim.api.nvim_buf_is_valid(cur) then
+		local cur_name = vim.api.nvim_buf_get_name(cur)
+		if not tostring(cur_name):match("^diffview://") then
+			local cur_path = current_buffer_repo_path(cur)
+			if target_path == "" or path_matches(cur_path, target_path) then
+				return cur
+			end
+		end
+	end
+
+	for _, b in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(b) and vim.bo[b].buftype == "" then
+			local name = vim.api.nvim_buf_get_name(b)
+			if name ~= "" and not tostring(name):match("^diffview://") then
+				local p = current_buffer_repo_path(b)
+				if target_path ~= "" and path_matches(p, target_path) then
+					return b
+				end
+			end
+		end
+	end
+
+	if target_path ~= "" then
+		local abs = vim.fn.fnamemodify(target_path, ":p")
+		local file_buf = vim.fn.bufadd(abs)
+		pcall(vim.fn.bufload, file_buf)
+		if type(file_buf) == "number" and file_buf > 0 and vim.api.nvim_buf_is_valid(file_buf) then
+			return file_buf
+		end
+	end
+
 	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
 		return source
 	end
@@ -1994,7 +2035,7 @@ local function accept_suggestion()
 		return
 	end
 	local target_path = normalize_repo_path(comment.path or "")
-	local buf = resolve_apply_target_bufnr()
+	local buf = resolve_apply_target_bufnr(target_path)
 	local cur_buf_path = current_buffer_repo_path(buf)
 	if target_path == "" or not path_matches(cur_buf_path, target_path) then
 		vim.notify(
