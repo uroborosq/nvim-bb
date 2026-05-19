@@ -366,6 +366,14 @@ type PRCommitPage struct {
 	NextPageStart int        `json:"nextPageStart"`
 }
 
+type PullRequestMergeability struct {
+	CanMerge bool `json:"canMerge"`
+	Vetoes   []struct {
+		Summary  string `json:"summaryMessage"`
+		Detailed string `json:"detailedMessage"`
+	} `json:"vetoes"`
+}
+
 func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
@@ -1279,6 +1287,30 @@ func (c *Client) GetPullRequest(ctx context.Context, prID int64) (*PullRequest, 
 }
 
 func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body string) error {
+	mergeability, err := c.GetPullRequestMergeability(ctx, prID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "401") || strings.Contains(strings.ToLower(err.Error()), "not permitted") {
+			return fmt.Errorf("merge precheck failed: no permission to merge this PR in Bitbucket (need REPO_WRITE and merge rights): %w", err)
+		}
+		return err
+	}
+	if !mergeability.CanMerge {
+		var reasons []string
+		for _, veto := range mergeability.Vetoes {
+			msg := strings.TrimSpace(veto.Summary)
+			if msg == "" {
+				msg = strings.TrimSpace(veto.Detailed)
+			}
+			if msg != "" {
+				reasons = append(reasons, msg)
+			}
+		}
+		if len(reasons) == 0 {
+			return errors.New("pull request is not mergeable according to Bitbucket checks")
+		}
+		return fmt.Errorf("pull request is not mergeable: %s", strings.Join(reasons, "; "))
+	}
+
 	pr, err := c.GetPullRequest(ctx, prID)
 	if err != nil {
 		return err
@@ -1299,7 +1331,23 @@ func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body s
 	}
 	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/merge", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
 	_, err = c.doJSON(ctx, http.MethodPost, path, req)
+	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "401") || strings.Contains(strings.ToLower(err.Error()), "not permitted")) {
+		return fmt.Errorf("merge denied by Bitbucket permissions (need REPO_WRITE + merge rights for target branch): %w", err)
+	}
 	return err
+}
+
+func (c *Client) GetPullRequestMergeability(ctx context.Context, prID int64) (*PullRequestMergeability, error) {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/merge", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
+	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out PullRequestMergeability
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode mergeability response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string, version int) error {
