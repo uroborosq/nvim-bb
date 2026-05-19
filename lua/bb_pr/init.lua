@@ -95,7 +95,6 @@ local function format_opened_age(ms)
 	return string.format("%dm", math.floor(seconds / 60))
 end
 
-
 local function normalize_my_review_status(pr)
 	local raw = type(pr.my_review_status) == "string" and string.upper(pr.my_review_status) or ""
 	if raw ~= "" then
@@ -2021,7 +2020,10 @@ local function accept_suggestion()
 		return
 	end
 	if not comment.is_file_comment then
-		vim.notify("bb_pr: selected comment is overview-only, no file location to apply suggestion", vim.log.levels.WARN)
+		vim.notify(
+			"bb_pr: selected comment is overview-only, no file location to apply suggestion",
+			vim.log.levels.WARN
+		)
 		return
 	end
 	local replacement = extract_first_suggestion_block(comment.text)
@@ -2050,16 +2052,6 @@ local function accept_suggestion()
 		return
 	end
 	local replacement_lines = vim.split(replacement, "\n", { plain = true })
-	vim.notify(
-		string.format(
-			"bb_pr: applying suggestion to file=%s line=%d anchor=%s current=%s",
-			vim.api.nvim_buf_get_name(buf),
-			line,
-			target_path,
-			cur_buf_path
-		),
-		vim.log.levels.INFO
-	)
 	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
 	if not ok_apply then
 		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
