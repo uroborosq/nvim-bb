@@ -1943,7 +1943,15 @@ local function merge_current_pr()
 			end
 		end
 		vim.schedule(function()
-			open_text_editor("Merge PR #" .. tostring(pr.id), function(text)
+			local initial_text = title
+			if type(body_lines) == "table" and #body_lines > 0 then
+				initial_text = table.concat(vim.list_extend({ title, "" }, body_lines), "\n")
+			end
+			open_multiline_comment_input({
+				title = "Merge PR #" .. tostring(pr.id),
+				prompt = "Line 1: merge commit title. Next lines: commit body. <C-s> submit, q cancel",
+				initial_text = initial_text,
+			}, function(text)
 				local body = ""
 				if text:find("\n", 1, true) then
 					local lines = vim.split(text, "\n", { plain = true })
@@ -1969,8 +1977,6 @@ local function merge_current_pr()
 					end)
 				end)
 			end)
-			local buf = vim.api.nvim_get_current_buf()
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ title }, body_lines))
 		end)
 	end)
 end
