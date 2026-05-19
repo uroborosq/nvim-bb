@@ -60,7 +60,7 @@ Bitbucket PR helper CLI + Neovim plugin.
     ```
 
     Mapping is configurable via `setup({ create_suggestion_map = "..." })`.
-  - `<leader>rA` (or `:BBPRAcceptSuggestion`) applies the first ```suggestion``` block from the comment under cursor directly to the commented file line (file-scoped comments only). After applying, commit and push with git manually.
+  - `<leader>rA` (or `:BBPRAcceptSuggestion`) applies the first ```suggestion``` block from the comment under cursor directly to the commented file line (file-scoped comments only). Path matching is normalized (including diffview-style paths and `a/`/`b/` prefixes) before apply, and the edit is applied to the real file buffer (not the diffview virtual buffer). After applying, commit and push with git manually.
     Mapping is configurable via `setup({ accept_suggestion_map = "..." })`.
   - Reaction choices are configurable via `setup({ reaction_choices = { "THUMBS_UP", "HEART", "LAUGH" } })`, and now default to the full rxaviers GitHub emoji reaction list.
   - Reaction picker entries are rendered as emoji/symbol + alias (for example `👍  THUMBS_UP`) so large reaction sets stay readable.
