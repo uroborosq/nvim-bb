@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -398,6 +399,7 @@ func main() {
 	reactionShortcut := flag.String("reaction", "", "reaction shortcut for -pr-reaction (e.g. THUMBS_UP, HEART)")
 	reactionAction := flag.String("reaction-action", "add", "reaction action: add|remove")
 	deleteCommentID := flag.Int64("delete-comment-id", 0, "comment id for -pr-delete-comment")
+	deleteCommentVersion := flag.Int("delete-comment-version", -1, "comment version for -pr-delete-comment (optimistic lock)")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
 	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
@@ -472,7 +474,10 @@ func main() {
 		if commentID <= 0 {
 			fatal(errors.New("-delete-comment-id is required with -pr-delete-comment"))
 		}
-		if err := client.DeletePullRequestComment(ctx, *prDeleteCommentID, commentID); err != nil {
+		if *deleteCommentVersion < 0 {
+			fatal(errors.New("-delete-comment-version is required with -pr-delete-comment"))
+		}
+		if err := client.DeletePullRequestComment(ctx, *prDeleteCommentID, commentID, *deleteCommentVersion); err != nil {
 			fatal(err)
 		}
 		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"comment_id\":%d,\"action\":\"delete\",\"ok\":true}\n", *prDeleteCommentID, commentID)
@@ -1084,7 +1089,7 @@ func (c *Client) CreatePullRequestComment(ctx context.Context, prID int64, paylo
 	return &out, nil
 }
 
-func (c *Client) DeletePullRequestComment(ctx context.Context, prID int64, commentID int64) error {
+func (c *Client) DeletePullRequestComment(ctx context.Context, prID int64, commentID int64, version int) error {
 	u := *c.baseURL
 	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
 		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
@@ -1098,6 +1103,9 @@ func (c *Client) DeletePullRequestComment(ctx context.Context, prID int64, comme
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	q := req.URL.Query()
+	q.Set("version", strconv.Itoa(version))
+	req.URL.RawQuery = q.Encode()
 	c.setAuth(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

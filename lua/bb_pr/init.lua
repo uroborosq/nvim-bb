@@ -258,6 +258,7 @@ end
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
 local apply_pr_info_content
+local find_comment_by_id
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -2086,7 +2087,7 @@ local function toggle_task_status()
 	end)
 end
 
-local function find_comment_by_id(cid)
+find_comment_by_id = function(cid)
 	local payload = get_current_tab_comments() or {}
 	for _, c in ipairs(as_array(payload.overview_comments)) do
 		if tonumber(c.id or 0) == cid then
@@ -2268,12 +2269,24 @@ local function delete_comment()
 		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
+	local target = find_comment_by_id(cid)
+	if type(target) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	local version = tonumber(target.version or -1) or -1
+	if version < 0 then
+		vim.notify("bb_pr: selected comment has invalid version for delete", vim.log.levels.WARN)
+		return
+	end
 	local cmd = bb_cmd({
 		"-json",
 		"-pr-delete-comment",
 		tostring(pr.id),
 		"-delete-comment-id",
 		tostring(cid),
+		"-delete-comment-version",
+		tostring(version),
 	})
 	vim.system(cmd, { text = true }, function(res)
 		if res.code ~= 0 then
