@@ -68,6 +68,7 @@ Bitbucket PR helper CLI + Neovim plugin.
   - PR create body can be prefilled from config via `setup({ create_pr_body_template = "..." })` (string with newlines) or `setup({ create_pr_body_template = { "line 1", "line 2" } })`.
   - PR target branch selection is loaded from Bitbucket branch API; when unavailable/empty, plugin asks you to type any target branch manually (no hardcoded `main`/`master` fallback).
   - `:BBPRMerge` merges the PR opened in the current tab and prompts for merge commit message.
+  - Before merge, CLI runs Bitbucket mergeability precheck (`.../pull-requests/{id}/merge` GET). If user has no merge permissions, error now includes explicit hint about required rights (`REPO_WRITE` + branch merge permissions).
   - Merge message defaults:
     - title: title of the latest commit in the PR branch
     - body: generated from `setup({ merge_pr_body_template_fn = function(commits) ... end })`, where `commits` is a list from Bitbucket API.
