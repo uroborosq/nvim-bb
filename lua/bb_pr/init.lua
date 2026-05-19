@@ -2050,6 +2050,16 @@ local function accept_suggestion()
 		return
 	end
 	local replacement_lines = vim.split(replacement, "\n", { plain = true })
+	vim.notify(
+		string.format(
+			"bb_pr: applying suggestion to file=%s line=%d anchor=%s current=%s",
+			vim.api.nvim_buf_get_name(buf),
+			line,
+			target_path,
+			cur_buf_path
+		),
+		vim.log.levels.INFO
+	)
 	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
 	if not ok_apply then
 		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
