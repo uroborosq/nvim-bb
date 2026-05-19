@@ -1831,6 +1831,19 @@ local function create_pr()
 		vim.notify("bb_pr: failed to detect current git branch", vim.log.levels.ERROR)
 		return
 	end
+	local function detect_origin_default_branch()
+		local out = vim.fn.system({ "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD" })
+		if vim.v.shell_error ~= 0 then
+			return nil
+		end
+		local ref = vim.trim(out or "")
+		local branch = ref:match("^origin/(.+)$")
+		if not branch or branch == "" then
+			return nil
+		end
+		return branch
+	end
+	local default_branch = detect_origin_default_branch()
 	local synced, sync_err = ensure_branch_synced_with_origin(source_branch)
 	if not synced then
 		vim.notify(sync_err, vim.log.levels.ERROR)
@@ -1857,19 +1870,6 @@ local function create_pr()
 				table.insert(options, name)
 			end
 		end
-		local function detect_origin_default_branch()
-			local out = vim.fn.system({ "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD" })
-			if vim.v.shell_error ~= 0 then
-				return nil
-			end
-			local ref = vim.trim(out or "")
-			local branch = ref:match("^origin/(.+)$")
-			if not branch or branch == "" then
-				return nil
-			end
-			return branch
-		end
-		local default_branch = detect_origin_default_branch()
 		table.sort(options, function(a, b)
 			local pa = (default_branch and a == default_branch) and 0 or 1
 			local pb = (default_branch and b == default_branch) and 0 or 1
