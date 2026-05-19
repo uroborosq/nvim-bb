@@ -2122,6 +2122,34 @@ local function find_comment_by_id(payload, comment_id)
 	return nil
 end
 
+
+local function resolve_comment_anchor(payload, comment)
+	if type(comment) ~= "table" then
+		return "", 0
+	end
+
+	local current = comment
+	local seen = {}
+	for _ = 1, 20 do
+		local path = normalize_repo_path(current.path or "")
+		local line = tonumber(current.line or 0) or 0
+		if path ~= "" and line > 0 then
+			return path, line
+		end
+		local parent_id = tonumber(current.parent_id or 0) or 0
+		if parent_id <= 0 or seen[parent_id] then
+			break
+		end
+		seen[parent_id] = true
+		current = find_comment_by_id(payload, parent_id)
+		if type(current) ~= "table" then
+			break
+		end
+	end
+
+	return normalize_repo_path(comment.path or ""), tonumber(comment.line or 0) or 0
+end
+
 local function accept_suggestion()
 	local payload = get_current_tab_comments() or {}
 	local comment_id = resolve_reply_target_comment_id()
@@ -2140,12 +2168,12 @@ local function accept_suggestion()
 		return
 	end
 
-	local target_path = normalize_repo_path(comment.path or "")
+	local target_path, line = resolve_comment_anchor(payload, comment)
 	local cur_buf_path = extract_repo_relative_path(vim.api.nvim_buf_get_name(0))
 	if target_path == "" then
 		vim.notify("bb_pr: comment has empty anchor path", vim.log.levels.WARN)
 		return
-	end	
+	end
 	if not path_matches(cur_buf_path, target_path) then
 		vim.notify(
 			string.format("bb_pr: current buffer does not match comment path (cur=%s, target=%s)", cur_buf_path, target_path),
@@ -2154,7 +2182,6 @@ local function accept_suggestion()
 		return
 	end
 
-	local line = tonumber(comment.line or 0) or 0
 	if line <= 0 then
 		vim.notify("bb_pr: comment has invalid line anchor", vim.log.levels.WARN)
 		return
