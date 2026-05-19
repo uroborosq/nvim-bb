@@ -1857,19 +1857,38 @@ local function create_pr()
 				table.insert(options, name)
 			end
 		end
-		if #options == 0 then
-			table.insert(options, "main")
-			table.insert(options, "master")
+		local function detect_origin_default_branch()
+			local out = vim.fn.system({ "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD" })
+			if vim.v.shell_error ~= 0 then
+				return nil
+			end
+			local ref = vim.trim(out or "")
+			local branch = ref:match("^origin/(.+)$")
+			if not branch or branch == "" then
+				return nil
+			end
+			return branch
 		end
+		local default_branch = detect_origin_default_branch()
 		table.sort(options, function(a, b)
-			local pa = (a == "main" or a == "master") and 0 or 1
-			local pb = (b == "main" or b == "master") and 0 or 1
+			local pa = (default_branch and a == default_branch) and 0 or 1
+			local pb = (default_branch and b == default_branch) and 0 or 1
 			if pa ~= pb then
 				return pa < pb
 			end
 			return a < b
 		end)
 		vim.schedule(function()
+			if #options == 0 then
+				vim.ui.input({ prompt = "Target branch: " }, function(input)
+					local target = vim.trim(input or "")
+					if target == "" then
+						return
+					end
+					open_create_pr_editor(source_branch, target)
+				end)
+				return
+			end
 			vim.ui.select(options, { prompt = "Select target branch" }, function(choice)
 				if not choice then
 					return
