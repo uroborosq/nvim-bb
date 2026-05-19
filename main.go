@@ -292,6 +292,7 @@ type PRCommentView struct {
 	MyReactions   map[string]bool `json:"my_reactions,omitempty"`
 	IsTask        bool            `json:"is_task,omitempty"`
 	TaskStatus    string          `json:"task_status,omitempty"`
+	CommentState  string          `json:"comment_state,omitempty"`
 	Version       int             `json:"version"`
 }
 
@@ -928,18 +929,19 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		myReactions := extractMyReactions(cmt.Properties.Reactions, self)
 
 		view := PRCommentView{
-			ID:          cmt.ID,
-			ParentID:    item.ParentID,
-			Depth:       item.Depth,
-			Text:        cmt.Text,
-			Author:      displayUser(cmt.Author),
-			CreatedDate: cmt.CreatedDate,
-			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
-			UpdatedDate: cmt.UpdatedDate,
-			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
-			Reactions:   commentReactions,
-			MyReactions: myReactions,
-			Version:     cmt.Version,
+			ID:           cmt.ID,
+			ParentID:     item.ParentID,
+			Depth:        item.Depth,
+			Text:         cmt.Text,
+			Author:       displayUser(cmt.Author),
+			CreatedDate:  cmt.CreatedDate,
+			CreatedAt:    msToTime(cmt.CreatedDate).Format(time.RFC3339),
+			UpdatedDate:  cmt.UpdatedDate,
+			UpdatedAt:    msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+			Reactions:    commentReactions,
+			MyReactions:  myReactions,
+			Version:      cmt.Version,
+			CommentState: strings.ToUpper(strings.TrimSpace(cmt.State)),
 		}
 		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
 		if severity == "BLOCKER" {

@@ -2060,8 +2060,10 @@ local function toggle_comment_resolution()
 		vim.notify("bb_pr: selected comment not found in loaded payload", vim.log.levels.WARN)
 		return
 	end
-	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
-	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
+	local status = type(target.comment_state) == "string" and string.upper(target.comment_state)
+		or (type(target.task_status) == "string" and string.upper(target.task_status))
+		or "OPEN"
+	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "resolved"
 	local version = tonumber(target.version or 0) or 0
 	local cmd = bb_cmd({
 		"-json",

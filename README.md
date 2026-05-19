@@ -47,7 +47,7 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line.
   - `[C` / `]C` jump between PR comments (works in both file diffs and PR overview comments).
   - `<leader>rr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
-  - `<leader>rt` (or `:BBPRToggleTask`) toggles comment resolution between open/resolved from PR Info or line-comments float under cursor (works for overview and file-scoped comments on Bitbucket Server 8.9.7).
+  - `<leader>rt` (or `:BBPRToggleTask`) toggles comment resolution state between OPEN/RESOLVED from PR Info or line-comments float under cursor (works for overview and file-scoped comments on Bitbucket Server 8.9.7).
   - `<leader>rv` (or `:BBPRResolveComment`) is an alias for comment resolution toggle and can be customized via `setup({ resolve_comment_map = "..." })`.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
   - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
