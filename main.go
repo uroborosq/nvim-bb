@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -379,6 +380,7 @@ func main() {
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
+	prDeleteCommentID := flag.Int64("pr-delete-comment", 0, "delete PR comment by id for the given PR id")
 	prReviewID := flag.Int64("pr-review", 0, "set your review state for the given PR id")
 	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
@@ -396,6 +398,8 @@ func main() {
 	reactionCommentID := flag.Int64("comment-id", 0, "comment id for -pr-reaction")
 	reactionShortcut := flag.String("reaction", "", "reaction shortcut for -pr-reaction (e.g. THUMBS_UP, HEART)")
 	reactionAction := flag.String("reaction-action", "add", "reaction action: add|remove")
+	deleteCommentID := flag.Int64("delete-comment-id", 0, "comment id for -pr-delete-comment")
+	deleteCommentVersion := flag.Int("delete-comment-version", -1, "comment version for -pr-delete-comment (optimistic lock)")
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
 	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
@@ -462,6 +466,21 @@ func main() {
 		if err := enc.Encode(created); err != nil {
 			fatal(err)
 		}
+		return
+	}
+
+	if *prDeleteCommentID > 0 {
+		commentID := *deleteCommentID
+		if commentID <= 0 {
+			fatal(errors.New("-delete-comment-id is required with -pr-delete-comment"))
+		}
+		if *deleteCommentVersion < 0 {
+			fatal(errors.New("-delete-comment-version is required with -pr-delete-comment"))
+		}
+		if err := client.DeletePullRequestComment(ctx, *prDeleteCommentID, commentID, *deleteCommentVersion); err != nil {
+			fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"comment_id\":%d,\"action\":\"delete\",\"ok\":true}\n", *prDeleteCommentID, commentID)
 		return
 	}
 
@@ -1068,6 +1087,36 @@ func (c *Client) CreatePullRequestComment(ctx context.Context, prID int64, paylo
 		return nil, fmt.Errorf("decode Bitbucket create comment response: %w", err)
 	}
 	return &out, nil
+}
+
+func (c *Client) DeletePullRequestComment(ctx context.Context, prID int64, commentID int64, version int) error {
+	u := *c.baseURL
+	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
+		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		url.PathEscape(c.cfg.Project),
+		url.PathEscape(c.cfg.Repo),
+		prID,
+		commentID,
+	))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	q := req.URL.Query()
+	q.Set("version", strconv.Itoa(version))
+	req.URL.RawQuery = q.Encode()
+	c.setAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("DELETE %s: %w", u.Redacted(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return fmt.Errorf("BitBucket returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {

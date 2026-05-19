@@ -12,6 +12,7 @@ local default_config = {
 	create_comment_map = "<leader>rC",
 	create_task_map = "<leader>rT",
 	reply_comment_map = "<leader>rR",
+	delete_comment_map = "<leader>rx",
 	react_comment_map = "<leader>re",
 	create_suggestion_map = "<leader>rs",
 	accept_suggestion_map = "<leader>rA",
@@ -257,6 +258,7 @@ end
 local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
 local apply_pr_info_content
+local find_comment_by_id
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -2085,7 +2087,7 @@ local function toggle_task_status()
 	end)
 end
 
-local function find_comment_by_id(cid)
+find_comment_by_id = function(cid)
 	local payload = get_current_tab_comments() or {}
 	for _, c in ipairs(as_array(payload.overview_comments)) do
 		if tonumber(c.id or 0) == cid then
@@ -2252,6 +2254,50 @@ local function react_to_comment()
 				vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
 				vim.cmd("BBPRLoadComments")
 			end)
+		end)
+	end)
+end
+
+local function delete_comment()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+	local target = find_comment_by_id(cid)
+	if type(target) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	local version = tonumber(target.version or -1) or -1
+	if version < 0 then
+		vim.notify("bb_pr: selected comment has invalid version for delete", vim.log.levels.WARN)
+		return
+	end
+	local cmd = bb_cmd({
+		"-json",
+		"-pr-delete-comment",
+		tostring(pr.id),
+		"-delete-comment-id",
+		tostring(cid),
+		"-delete-comment-version",
+		tostring(version),
+	})
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: delete comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		vim.schedule(function()
+			vim.notify("bb_pr: comment deleted", vim.log.levels.INFO)
+			vim.cmd("BBPRLoadComments")
 		end)
 	end)
 end
@@ -2475,6 +2521,9 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPRReactComment", function()
 		react_to_comment()
 	end, { desc = "Add reaction to comment under cursor" })
+	vim.api.nvim_create_user_command("BBPRDeleteComment", function()
+		delete_comment()
+	end, { desc = "Delete PR comment under cursor" })
 
 	vim.api.nvim_create_user_command("BBPRCreatePR", function()
 		create_pr()
@@ -2529,6 +2578,14 @@ function M.setup(opts)
 			M.config.react_comment_map,
 			"<cmd>BBPRReactComment<CR>",
 			{ desc = "React to PR comment", silent = true }
+		)
+	end
+	if M.config.delete_comment_map and M.config.delete_comment_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.delete_comment_map,
+			"<cmd>BBPRDeleteComment<CR>",
+			{ desc = "Delete PR comment", silent = true }
 		)
 	end
 	if M.config.toggle_task_map and M.config.toggle_task_map ~= "" then
