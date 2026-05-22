@@ -7,6 +7,8 @@ local default_config = {
 	force_repo_autodetect = true,
 	force_repo_autodetect_flag = "-force-autodetect-repo",
 	diffview_cmd = "DiffviewOpen",
+	checkout_pr_branch_on_open = false,
+	checkout_pr_branch_require_empty_index = true,
 	comment_prev_map = "[C",
 	comment_next_map = "]C",
 	create_comment_map = "<leader>rC",
@@ -988,6 +990,37 @@ local function apply_comments_when_diffview_ready(comments_payload, opts)
 	attempt()
 end
 
+
+local function git_index_is_empty()
+	local out = vim.fn.system({ "git", "diff", "--cached", "--name-only" })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: failed to inspect git index"
+	end
+	return vim.trim(out or "") == ""
+end
+
+local function maybe_checkout_pr_branch(pr)
+	if not M.config.checkout_pr_branch_on_open then
+		return true
+	end
+	local from_ref = pr and pr.fromRef and pr.fromRef.displayId
+	if type(from_ref) ~= "string" or from_ref == "" then
+		return false, "bb_pr: source branch missing for checkout"
+	end
+	if M.config.checkout_pr_branch_require_empty_index then
+		local clean, err = git_index_is_empty()
+		if not clean then
+			return false, err or "bb_pr: git index must be empty before checkout"
+		end
+	end
+
+	local out = vim.fn.system({ "git", "checkout", from_ref })
+	if vim.v.shell_error ~= 0 then
+		return false, "bb_pr: checkout failed: " .. vim.trim(out or "")
+	end
+	return true
+end
+
 local function build_lines(prs)
 	local lines = {
 		"ID  STATE    AUTHOR               FROM -> TO           TITLE",
@@ -1024,6 +1057,11 @@ local function open_diffview(pr)
 	end
 
 	local function open_after_fetch()
+		local checked_out, checkout_err = maybe_checkout_pr_branch(pr)
+		if not checked_out then
+			vim.notify(checkout_err or "bb_pr: failed to checkout PR branch", vim.log.levels.ERROR)
+			return
+		end
 		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
 		set_current_tab_pr(pr)
 		run_comments_provider(pr.id, function(payload)

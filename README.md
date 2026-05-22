@@ -28,6 +28,10 @@ Bitbucket PR helper CLI + Neovim plugin.
   - optional flag override: `setup({ force_repo_autodetect_flag = "-force-autodetect-repo" })`
 - Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
+- Optional PR source-branch checkout on open: `setup({ checkout_pr_branch_on_open = true })`.
+  - By default checkout is disabled.
+  - When enabled, plugin can require an empty git index before checkout (default `true`) via `setup({ checkout_pr_branch_require_empty_index = false })`.
+
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
 - CLI: `bb -pr-comments <id> -json` returns structured PR comments (overview + file anchors) with timestamps for Neovim overlays (virtual text / floating windows).
