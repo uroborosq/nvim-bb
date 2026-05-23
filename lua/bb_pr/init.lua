@@ -1637,6 +1637,7 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].filetype = "markdown"
+	vim.diagnostic.enable(false, { bufnr = buf })
 	local initial_lines = { "", "", "", "" }
 	if type(opts.initial_text) == "string" and opts.initial_text ~= "" then
 		initial_lines = vim.split(opts.initial_text, "\n", { plain = true })
@@ -1757,6 +1758,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].filetype = "markdown"
+	vim.diagnostic.enable(false, { bufnr = buf })
 	local default_title = string.format("%s -> %s", source_branch, target_branch)
 	local initial_lines = {
 		"Title: " .. default_title,
