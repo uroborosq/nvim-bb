@@ -24,6 +24,7 @@ local default_config = {
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
+	edit_pr_description_map = "<leader>rE",
 	create_pr_map = "<leader>rc",
 	create_pr_toggle_draft_map = "<leader>rt",
 	create_pr_body_template = "",
@@ -1441,6 +1442,101 @@ apply_pr_info_content = function(buf, pr)
 	vim.diagnostic.enable(false, { bufnr = buf })
 end
 
+local function open_edit_pr_description(pr, info_buf)
+	local pr_id = tonumber(pr.id or 0) or 0
+	if pr_id <= 0 then
+		vim.notify("bb_pr: invalid PR id", vim.log.levels.ERROR)
+		return
+	end
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "markdown"
+	vim.diagnostic.enable(false, { bufnr = buf })
+
+	local initial_lines = {
+		"Title: " .. (pr.title or ""),
+		"",
+		"Body:",
+	}
+	local body_text = pr.description or ""
+	if body_text ~= "" then
+		for _, line in ipairs(vim.split(body_text, "\n", { plain = true })) do
+			table.insert(initial_lines, line)
+		end
+	end
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
+
+	local width = math.max(90, math.floor(vim.o.columns * 0.7))
+	local height = math.max(14, math.floor(vim.o.lines * 0.4))
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = "Edit PR #" .. tostring(pr_id) .. " (<C-s>/<CR> submit, q cancel)",
+		title_pos = "center",
+	})
+
+	local function submit()
+		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+		local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
+		local body_lines = {}
+		for i = 4, #lines do
+			table.insert(body_lines, lines[i])
+		end
+		local body = vim.trim(table.concat(body_lines, "\n"))
+		if title == "" then
+			vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
+			return
+		end
+		pcall(vim.api.nvim_win_close, win, true)
+
+		local version = tonumber(pr.version or -1) or -1
+		local cmd = bb_cmd({
+			"-json",
+			"-pr-update",
+			tostring(pr_id),
+			"-pr-update-version",
+			tostring(version),
+			"-pr-title",
+			title,
+			"-pr-body",
+			body,
+		})
+		local source_tab = vim.api.nvim_get_current_tabpage()
+		vim.system(cmd, { text = true }, function(res)
+			vim.schedule(function()
+				if res.code ~= 0 then
+					vim.notify("bb_pr: PR update failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+					return
+				end
+				refresh_current_pr(function(fresh_pr)
+					vim.schedule(function()
+						local updated = fresh_pr or pr
+						set_tab_pr(source_tab, updated, { preserve_comments = true })
+						if info_buf and vim.api.nvim_buf_is_valid(info_buf) then
+							apply_pr_info_content(info_buf, updated)
+						end
+						vim.notify("bb_pr: PR #" .. tostring(pr_id) .. " updated", vim.log.levels.INFO)
+					end)
+				end, source_tab)
+			end)
+		end)
+	end
+
+	vim.keymap.set("n", "q", function()
+		pcall(vim.api.nvim_win_close, win, true)
+	end, { buffer = buf, silent = true })
+	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
+end
+
 local function open_pr_info(pr)
 	local buf = vim.api.nvim_create_buf(false, true)
 	apply_pr_info_content(buf, pr)
@@ -1508,6 +1604,12 @@ local function open_pr_info(pr)
 		vim.keymap.set("n", M.config.pr_info_needs_work_map, function()
 			apply_review_action("needs-work")
 		end, { buffer = buf, silent = true, desc = "Mark PR needs work" })
+	end
+	if M.config.edit_pr_description_map and M.config.edit_pr_description_map ~= "" then
+		vim.keymap.set("n", M.config.edit_pr_description_map, function()
+			local current_pr = vim.b[buf].bb_pr_info_pr or pr
+			open_edit_pr_description(current_pr, buf)
+		end, { buffer = buf, silent = true, desc = "Edit PR title and description" })
 	end
 end
 

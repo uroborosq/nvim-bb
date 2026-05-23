@@ -389,6 +389,8 @@ func main() {
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
 	prReactionID := flag.Int64("pr-reaction", 0, "set reaction on PR comment for the given PR id")
 	prCreate := flag.Bool("pr-create", false, "create pull request")
+	prUpdateID := flag.Int64("pr-update", 0, "update pull request title/description by id")
+	prUpdateVersion := flag.Int("pr-update-version", -1, "current pull request version for -pr-update (optimistic lock)")
 	prMergeID := flag.Int64("pr-merge", 0, "merge pull request by id")
 	prCommitsID := flag.Int64("pr-commits", 0, "print pull request commits as JSON for the given PR id")
 	targetBranches := flag.Bool("target-branches", false, "list target branches for PR creation")
@@ -518,6 +520,27 @@ func main() {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(created); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if *prUpdateID > 0 {
+		version := *prUpdateVersion
+		if version < 0 {
+			cur, err := client.GetPullRequest(ctx, *prUpdateID)
+			if err != nil {
+				fatal(err)
+			}
+			version = cur.Version
+		}
+		updated, err := client.UpdatePullRequest(ctx, *prUpdateID, version, strings.TrimSpace(*prTitle), strings.TrimSpace(*prBody))
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(updated); err != nil {
 			fatal(err)
 		}
 		return
@@ -1339,6 +1362,24 @@ func (c *Client) GetRepoBranches(ctx context.Context) ([]BranchRef, error) {
 		return nil, fmt.Errorf("decode branches response: %w", err)
 	}
 	return page.Values, nil
+}
+
+func (c *Client) UpdatePullRequest(ctx context.Context, prID int64, version int, title, description string) (*PullRequest, error) {
+	req := struct {
+		Version     int    `json:"version"`
+		Title       string `json:"title,omitempty"`
+		Description string `json:"description"`
+	}{Version: version, Title: title, Description: description}
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
+	b, err := c.doJSON(ctx, http.MethodPut, path, req)
+	if err != nil {
+		return nil, err
+	}
+	var out PullRequest
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode update PR response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) CreatePullRequest(ctx context.Context, title, description, sourceBranch, targetBranch string) (*PullRequest, error) {
