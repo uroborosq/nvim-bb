@@ -910,7 +910,10 @@ apply_comments_to_current_buffer = function(comments_payload)
 				virt_text = { { vt, virt_text_hl } },
 				virt_text_pos = "eol",
 			})
-			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, underline_hl, line - 1, 0, -1)
+			local line_text = vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or ""
+			local first_non_ws = line_text:find("%S")
+			local text_start_col = first_non_ws and (first_non_ws - 1) or 0
+			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, underline_hl, line - 1, text_start_col, -1)
 		end
 	end
 
