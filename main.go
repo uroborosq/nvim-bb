@@ -962,8 +962,6 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		for _, activity := range page.Values {
 			root := extractActivityComment(activity)
 			if root != nil {
-				hadEffective := root.Anchor != nil || activity.Anchor != nil
-				outdated := !hadEffective && (root.CommentAnchor != nil || activity.CommentAnchor != nil)
 				if root.Anchor == nil {
 					root.Anchor = root.CommentAnchor
 				}
@@ -973,6 +971,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 				if root.Anchor == nil {
 					root.Anchor = activity.CommentAnchor
 				}
+				outdated := false
 				if root.Anchor != nil && root.Anchor.DiffType != "" && root.Anchor.DiffType != "EFFECTIVE" {
 					outdated = true
 				}
