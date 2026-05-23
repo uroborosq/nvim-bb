@@ -661,18 +661,20 @@ local function open_comment_float(comments, line)
 
 	local lines = { string.format("PR comments for line %d", line), "" }
 	local comment_ids_by_line = {}
-	for idx, c in ipairs(comments) do
+	for _, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-		local indent = string.rep("\t", depth)
-		if idx > 1 then
-			table.insert(lines, indent .. "---")
-			table.insert(lines, "")
+		local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
+		local status = ""
+		if c.is_task then
+			local task_status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+			status = (task_status == "DONE" or task_status == "RESOLVED") and "☑ " or "☐ "
+		elseif c.is_resolved then
+			status = "~ "
 		end
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
-		local checkbox = task_checkbox_prefix(c) or "- "
 		local header =
-			string.format("%s%s%s %s", indent, checkbox, c.author or "unknown", c.created_at or "unknown time")
+			string.format("- %s%s%s %s", bars, status, c.author or "unknown", c.created_at or "unknown time")
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -685,12 +687,12 @@ local function open_comment_float(comments, line)
 		end
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 		for _, msg_line in ipairs(msg_lines) do
-			table.insert(lines, indent .. "\t" .. msg_line)
+			table.insert(lines, "    " .. msg_line)
 		end
 		local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
 		if reactions_line then
 			table.insert(lines, "")
-			table.insert(lines, indent .. "\t" .. reactions_line)
+			table.insert(lines, "    " .. reactions_line)
 		end
 		table.insert(lines, "")
 	end
@@ -1670,21 +1672,22 @@ local function build_overview_comment_lines(payload)
 		end
 		table.insert(lines, "")
 
-		for comment_idx, c in ipairs(thread_comments) do
+		for _, c in ipairs(thread_comments) do
 			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-			local indent = string.rep("\t", depth)
-
-			if #thread_comments > 1 and comment_idx > 1 then
-				table.insert(lines, indent .. "---")
-				table.insert(lines, "")
+			local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
+			local status = ""
+			if c.is_task then
+				local task_status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+				status = (task_status == "DONE" or task_status == "RESOLVED") and "☑ " or "☐ "
+			elseif c.is_resolved then
+				status = "~ "
 			end
 
 			local author = c.author or "unknown"
 			local created_at = c.created_at or "unknown time"
 			local comment_id = tonumber(c.id or 0) or 0
 			local reply_to = tonumber(c.parent_id or 0) or 0
-			local checkbox = task_checkbox_prefix(c) or "- "
-			local header = string.format("%s%s%s %s", indent, checkbox, author, created_at)
+			local header = string.format("- %s%s%s %s", bars, status, author, created_at)
 			if comment_id > 0 then
 				header = header .. string.format(" (#%d)", comment_id)
 			end
@@ -1700,13 +1703,13 @@ local function build_overview_comment_lines(payload)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
-				table.insert(lines, indent .. "\t(empty)")
+				table.insert(lines, "    (empty)")
 				if comment_id > 0 then
 					comment_ids_by_relative_line[#lines] = comment_id
 				end
 			else
 				for _, msg_line in ipairs(msg_lines) do
-					table.insert(lines, indent .. "\t" .. msg_line)
+					table.insert(lines, "    " .. msg_line)
 					if comment_id > 0 then
 						comment_ids_by_relative_line[#lines] = comment_id
 					end
