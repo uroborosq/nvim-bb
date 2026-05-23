@@ -39,6 +39,7 @@ local state = {
 	prs = {},
 	pr_by_tab = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
+	diffview_panel_ns = vim.api.nvim_create_namespace("bb_pr_diffview_panel"),
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
 	reaction_usage_by_key = {},
@@ -920,6 +921,108 @@ apply_comments_to_current_buffer = function(comments_payload)
 	vim.b[bufnr].bb_pr_line_comments = by_line
 end
 
+local function walk_diffview_components(node, rows)
+	if type(node) ~= "table" then
+		return
+	end
+	if node._name == "file" and type(node.comp) == "table" then
+		local ctx = node.comp.context
+		local lstart = node.comp.lstart
+		if type(ctx) == "table" and type(ctx.path) == "string" and type(lstart) == "number" then
+			rows[ctx.path] = lstart
+		end
+	end
+	for i = 1, #node do
+		walk_diffview_components(node[i], rows)
+	end
+end
+
+local function collect_diffview_file_rows(panel_buf)
+	local ok, lib = pcall(require, "diffview.lib")
+	if not ok then
+		return nil
+	end
+	local view = lib.get_current_view()
+	if type(view) ~= "table" or type(view.panel) ~= "table" then
+		return nil
+	end
+	if view.panel.bufid ~= panel_buf then
+		return nil
+	end
+	if type(view.panel.components) ~= "table" then
+		return nil
+	end
+	local rows = {}
+	walk_diffview_components(view.panel.components, rows)
+	if next(rows) == nil then
+		return nil
+	end
+	return rows
+end
+
+local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payload)
+	if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+		return
+	end
+	local paths_with_comments = {}
+	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
+		if not c.is_outdated then
+			local path = c.path
+			if type(path) == "string" and path ~= "" then
+				paths_with_comments[normalize_repo_path(path)] = true
+			end
+		end
+	end
+	if next(paths_with_comments) == nil then
+		return
+	end
+	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+		if vim.api.nvim_win_is_valid(win) then
+			local buf = vim.api.nvim_win_get_buf(win)
+			local ft = vim.bo[buf].filetype
+			if ft == "DiffviewFiles" or ft == "DiffviewFileHistory" then
+				vim.api.nvim_buf_clear_namespace(buf, state.diffview_panel_ns, 0, -1)
+				local rows = collect_diffview_file_rows(buf)
+				if rows then
+					for path, row in pairs(rows) do
+						if paths_with_comments[normalize_repo_path(path)] then
+							vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, row, 0, {
+								sign_text = "💬",
+								sign_hl_group = "DiagnosticSignInfo",
+							})
+						end
+					end
+				else
+					-- Fallback for older diffview versions: full path / basename match.
+					local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+					local marked = {}
+					for path, _ in pairs(paths_with_comments) do
+						local basename = path:match("([^/]+)$") or path
+						for idx, line in ipairs(lines) do
+							if not marked[idx] and type(line) == "string" then
+								if line:find(path, 1, true) or line:find(basename, 1, true) then
+									marked[idx] = true
+									vim.api.nvim_buf_set_extmark(
+										buf,
+										state.diffview_panel_ns,
+										idx - 1,
+										0,
+										{
+											sign_text = "💬",
+											sign_hl_group = "DiagnosticSignInfo",
+										}
+									)
+									break
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
 apply_comments_to_tab_windows = function(comments_payload)
 	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
 		if vim.api.nvim_win_is_valid(win) then
@@ -928,6 +1031,7 @@ apply_comments_to_tab_windows = function(comments_payload)
 			end)
 		end
 	end
+	apply_comment_indicators_to_diffview_panel(vim.api.nvim_get_current_tabpage(), comments_payload)
 end
 
 local function apply_comments_to_specific_tab(tabpage, comments_payload)
@@ -947,6 +1051,7 @@ local function apply_comments_to_specific_tab(tabpage, comments_payload)
 			end)
 		end
 	end
+	apply_comment_indicators_to_diffview_panel(tabpage, comments_payload)
 end
 
 local function apply_comments_to_specific_tab_when_ready(tabpage, comments_payload, opts)
