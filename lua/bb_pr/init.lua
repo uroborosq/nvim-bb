@@ -1680,6 +1680,7 @@ local function open_multiline_comment_input(opts, on_submit)
 		pcall(vim.api.nvim_win_close, win, true)
 	end, { buffer = buf, silent = true })
 	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
 	vim.cmd("startinsert")
 end
 
@@ -1828,6 +1829,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 	end
 
 	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
 	vim.keymap.set("n", "q", function()
 		pcall(vim.api.nvim_win_close, win, true)
 	end, { buffer = buf, silent = true })
