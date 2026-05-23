@@ -384,6 +384,9 @@ func main() {
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
 	prDeleteCommentID := flag.Int64("pr-delete-comment", 0, "delete PR comment by id for the given PR id")
+	prUpdateCommentID := flag.Int64("pr-update-comment", 0, "update PR comment text by id for the given PR id")
+	updateCommentID := flag.Int64("update-comment-id", 0, "comment id for -pr-update-comment")
+	updateCommentVersion := flag.Int("update-comment-version", -1, "comment version for -pr-update-comment (optimistic lock)")
 	prReviewID := flag.Int64("pr-review", 0, "set your review state for the given PR id")
 	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
@@ -490,6 +493,26 @@ func main() {
 			fatal(err)
 		}
 		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"comment_id\":%d,\"action\":\"delete\",\"ok\":true}\n", *prDeleteCommentID, commentID)
+		return
+	}
+
+	if *prUpdateCommentID > 0 {
+		commentID := *updateCommentID
+		if commentID <= 0 {
+			fatal(errors.New("-update-comment-id is required with -pr-update-comment"))
+		}
+		if *updateCommentVersion < 0 {
+			fatal(errors.New("-update-comment-version is required with -pr-update-comment"))
+		}
+		updated, err := client.UpdatePullRequestComment(ctx, *prUpdateCommentID, commentID, *updateCommentVersion, *commentText)
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(updated); err != nil {
+			fatal(err)
+		}
 		return
 	}
 
@@ -1508,6 +1531,24 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 	}{State: normalized, Version: version}
 	_, err := c.doJSON(ctx, http.MethodPut, path, body)
 	return err
+}
+
+func (c *Client) UpdatePullRequestComment(ctx context.Context, prID int64, commentID int64, version int, text string) (*PRComment, error) {
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
+	body := struct {
+		Version int    `json:"version"`
+		Text    string `json:"text"`
+	}{Version: version, Text: text}
+	b, err := c.doJSON(ctx, http.MethodPut, path, body)
+	if err != nil {
+		return nil, err
+	}
+	var out PRComment
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode update comment response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) ResolveComment(ctx context.Context, prID int64, commentID int64, version int, action string) error {
