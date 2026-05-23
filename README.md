@@ -7,6 +7,8 @@
 - etwa dashboard
 - images (haha)
 - jira issues resolving
+- save PR/comment drafts
+- finally fix merge/create PR templates
 
 ## Overview
 
