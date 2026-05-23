@@ -1031,14 +1031,26 @@ local function open_diffview(pr)
 	end
 
 	local function open_after_fetch()
-		vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
-		set_current_tab_pr(pr)
-		run_comments_provider(pr.id, function(payload)
+		local checkout_cmd = { "git", "checkout", "-B", from_ref, "origin/" .. from_ref }
+		vim.system(checkout_cmd, { text = true }, function(co_res)
 			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_when_diffview_ready(payload)
+				if co_res.code ~= 0 then
+					vim.notify(
+						"bb_pr: failed to checkout " .. from_ref .. ": " .. (co_res.stderr or ""),
+						vim.log.levels.ERROR
+					)
+					return
+				end
+				vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
+				set_current_tab_pr(pr)
+				run_comments_provider(pr.id, function(payload)
+					vim.schedule(function()
+						set_current_tab_comments(payload)
+						apply_comments_when_diffview_ready(payload)
+					end)
+				end, { notify_errors = false })
 			end)
-		end, { notify_errors = false })
+		end)
 	end
 
 	local fetch_cmd = {
@@ -1049,24 +1061,39 @@ local function open_diffview(pr)
 		"+refs/heads/" .. from_ref .. ":refs/remotes/origin/" .. from_ref,
 	}
 
-	vim.system(fetch_cmd, { text = true }, function(fetch_res)
-		if fetch_res.code ~= 0 then
+	vim.system({ "git", "diff", "--quiet", "HEAD" }, { text = true }, function(st_res)
+		if st_res.code ~= 0 then
 			vim.schedule(function()
-				vim.notify("bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""), vim.log.levels.ERROR)
+				vim.notify(
+					"bb_pr: working tree has uncommitted changes, cannot checkout " .. from_ref,
+					vim.log.levels.WARN
+				)
 			end)
 			return
 		end
 
-		-- Match Bitbucket's merge check by trying a temporary merge of target into source.
-		local merge_check_cmd = {
-			"git",
-			"merge-tree",
-			"origin/" .. to_ref,
-			"origin/" .. from_ref,
-		}
+		vim.system(fetch_cmd, { text = true }, function(fetch_res)
+			if fetch_res.code ~= 0 then
+				vim.schedule(function()
+					vim.notify(
+						"bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""),
+						vim.log.levels.ERROR
+					)
+				end)
+				return
+			end
 
-		vim.system(merge_check_cmd, { text = true }, function(_)
-			vim.schedule(open_after_fetch)
+			-- Match Bitbucket's merge check by trying a temporary merge of target into source.
+			local merge_check_cmd = {
+				"git",
+				"merge-tree",
+				"origin/" .. to_ref,
+				"origin/" .. from_ref,
+			}
+
+			vim.system(merge_check_cmd, { text = true }, function(_)
+				vim.schedule(open_after_fetch)
+			end)
 		end)
 	end)
 end
