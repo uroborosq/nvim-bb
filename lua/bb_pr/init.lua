@@ -659,7 +659,7 @@ local function open_comment_float(comments, line)
 	local comment_ids_by_line = {}
 	for idx, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-		local indent = string.rep("  ", depth)
+		local indent = string.rep("\t", depth)
 		if idx > 1 then
 			table.insert(lines, indent .. "---")
 			table.insert(lines, "")
@@ -681,12 +681,12 @@ local function open_comment_float(comments, line)
 		end
 		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 		for _, msg_line in ipairs(msg_lines) do
-			table.insert(lines, indent .. "  " .. msg_line)
+			table.insert(lines, indent .. "\t" .. msg_line)
 		end
 		local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
 		if reactions_line then
 			table.insert(lines, "")
-			table.insert(lines, indent .. "  " .. reactions_line)
+			table.insert(lines, indent .. "\t" .. reactions_line)
 		end
 		table.insert(lines, "")
 	end
@@ -1271,7 +1271,7 @@ local function build_overview_comment_lines(payload)
 
 		for comment_idx, c in ipairs(thread_comments) do
 			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-			local indent = string.rep("  ", depth)
+			local indent = string.rep("\t", depth)
 
 			if #thread_comments > 1 and comment_idx > 1 then
 				table.insert(lines, indent .. "---")
@@ -1299,13 +1299,13 @@ local function build_overview_comment_lines(payload)
 
 			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 			if #msg_lines == 0 then
-				table.insert(lines, indent .. "  (empty)")
+				table.insert(lines, indent .. "\t(empty)")
 				if comment_id > 0 then
 					comment_ids_by_relative_line[#lines] = comment_id
 				end
 			else
 				for _, msg_line in ipairs(msg_lines) do
-					table.insert(lines, indent .. "  " .. msg_line)
+					table.insert(lines, indent .. "\t" .. msg_line)
 					if comment_id > 0 then
 						comment_ids_by_relative_line[#lines] = comment_id
 					end
