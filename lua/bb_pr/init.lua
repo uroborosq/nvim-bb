@@ -25,6 +25,7 @@ local default_config = {
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
+	pr_info_open_file_map = "<leader>rf",
 	edit_pr_description_map = "<leader>rE",
 	create_pr_map = "<leader>rc",
 	create_pr_toggle_draft_map = "<leader>rt",
@@ -264,6 +265,7 @@ local apply_comments_to_current_buffer
 local apply_comments_to_tab_windows
 local apply_pr_info_content
 local find_comment_by_id
+local resolve_reply_target_comment_id
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -1190,7 +1192,9 @@ local function collect_diffview_file_entries(view)
 	return entries
 end
 
-local function navigate_to_file_comment_in_diffview(c)
+local function navigate_to_file_comment_in_diffview(c, opts)
+	opts = opts or {}
+	local should_open_float = opts.open_float ~= false
 	local ok, lib = pcall(require, "diffview.lib")
 	if not ok then
 		vim.notify(string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")), vim.log.levels.INFO)
@@ -1296,17 +1300,19 @@ local function navigate_to_file_comment_in_diffview(c)
 	local function attempt()
 		local jumped = jump_cursor()
 		if jumped then
-			local float_attempts = 0
-			local function try_float()
-				if open_float_for_line(jumped.buf) then
-					return
+			if should_open_float then
+				local float_attempts = 0
+				local function try_float()
+					if open_float_for_line(jumped.buf) then
+						return
+					end
+					float_attempts = float_attempts + 1
+					if float_attempts < 20 then
+						vim.defer_fn(try_float, 100)
+					end
 				end
-				float_attempts = float_attempts + 1
-				if float_attempts < 20 then
-					vim.defer_fn(try_float, 100)
-				end
+				try_float()
 			end
-			try_float()
 			return
 		end
 		attempts = attempts + 1
@@ -1651,7 +1657,14 @@ local function build_overview_comment_lines(payload)
 		if thread_idx > 1 then
 			table.insert(lines, "")
 		end
+		local thread_root_id = tonumber(root_comment.id or 0) or 0
+		local function tag_with_root()
+			if thread_root_id > 0 then
+				comment_ids_by_relative_line[#lines] = thread_root_id
+			end
+		end
 		table.insert(lines, string.format("### Thread %d", thread_idx))
+		tag_with_root()
 		table.insert(thread_line_numbers, #lines)
 		if root_comment.__scope == "file" then
 			local path = root_comment.path or "(unknown file)"
@@ -1660,15 +1673,20 @@ local function build_overview_comment_lines(payload)
 			local line_type = root_comment.line_type or ""
 			local loc = line > 0 and string.format(":%d", line) or ""
 			table.insert(lines, string.format("_Scope: file • `%s%s` %s %s_", path, loc, side, line_type))
+			tag_with_root()
 			if root_comment.diff_hunk and root_comment.diff_hunk ~= "" then
 				table.insert(lines, "```diff")
+				tag_with_root()
 				for _, hline in ipairs(vim.split(root_comment.diff_hunk, "\n", { plain = true })) do
 					table.insert(lines, hline)
+					tag_with_root()
 				end
 				table.insert(lines, "```")
+				tag_with_root()
 			end
 		else
 			table.insert(lines, "_Scope: overview_")
+			tag_with_root()
 		end
 		table.insert(lines, "")
 
@@ -2020,6 +2038,22 @@ local function open_pr_info(pr)
 			local current_pr = vim.b[buf].bb_pr_info_pr or pr
 			open_edit_pr_description(current_pr, buf)
 		end, { buffer = buf, silent = true, desc = "Edit PR title and description" })
+	end
+	if M.config.pr_info_open_file_map and M.config.pr_info_open_file_map ~= "" then
+		vim.keymap.set("n", M.config.pr_info_open_file_map, function()
+			local cid = resolve_reply_target_comment_id()
+			if not cid then
+				vim.notify("bb_pr: move cursor to a file comment line", vim.log.levels.WARN)
+				return
+			end
+			local target = find_comment_by_id(cid)
+			if type(target) ~= "table" or not target.is_file_comment or not target.path then
+				vim.notify("bb_pr: not a file comment", vim.log.levels.WARN)
+				return
+			end
+			pcall(vim.api.nvim_win_close, win, true)
+			navigate_to_file_comment_in_diffview(target, { open_float = false })
+		end, { buffer = buf, silent = true, desc = "Open file from overview comment in diff" })
 	end
 end
 
@@ -2583,7 +2617,7 @@ local function merge_current_pr()
 	end)
 end
 
-local function resolve_reply_target_comment_id()
+resolve_reply_target_comment_id = function()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
 
