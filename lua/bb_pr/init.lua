@@ -753,7 +753,7 @@ local function jump_file_comment(direction)
 		local seen = {}
 		for _, mark in ipairs(extmarks) do
 			local details = mark[4] or {}
-			if details.sign_text ~= "💬" then
+			if details.sign_text ~= "💬" and details.sign_text ~= "✅" then
 				goto continue
 			end
 			local row = tonumber(mark[2] or -1)
@@ -888,14 +888,29 @@ apply_comments_to_current_buffer = function(comments_payload)
 	for line, line_comments in pairs(by_line) do
 		if line > 0 and line <= line_count then
 			local preview = split_first_line(line_comments[1].text)
-			local vt = string.format("💬 %d %s", #line_comments, preview)
+			local root_count = 0
+			local fully_resolved = true
+			for _, c in ipairs(line_comments) do
+				if (tonumber(c.parent_id or 0) or 0) == 0 then
+					root_count = root_count + 1
+					if not c.is_resolved then
+						fully_resolved = false
+					end
+				end
+			end
+			local resolved = root_count > 0 and fully_resolved
+			local underline_hl = resolved and "BbPrResolvedThread" or "Underlined"
+			local virt_text_hl = resolved and "BbPrResolvedVirtText" or "DiagnosticVirtualTextInfo"
+			local sign_icon = resolved and "✅" or "💬"
+			local sign_hl = resolved and "BbPrResolvedVirtText" or "DiagnosticSignInfo"
+			local vt = string.format("%s %d %s", sign_icon, #line_comments, preview)
 			vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
-				sign_text = "💬",
-				sign_hl_group = "DiagnosticSignInfo",
-				virt_text = { { vt, "DiagnosticVirtualTextInfo" } },
+				sign_text = sign_icon,
+				sign_hl_group = sign_hl,
+				virt_text = { { vt, virt_text_hl } },
 				virt_text_pos = "eol",
 			})
-			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, "Underlined", line - 1, 0, -1)
+			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, underline_hl, line - 1, 0, -1)
 		end
 	end
 
@@ -2686,6 +2701,9 @@ end
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
+
+	vim.api.nvim_set_hl(0, "BbPrResolvedThread", { default = true, underline = true, sp = "Gray" })
+	vim.api.nvim_set_hl(0, "BbPrResolvedVirtText", { default = true, link = "Comment" })
 
 	vim.api.nvim_create_user_command("BBPRList", function()
 		M.open_list()
