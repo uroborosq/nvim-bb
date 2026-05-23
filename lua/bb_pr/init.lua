@@ -1033,22 +1033,34 @@ local function open_diffview(pr)
 	local function open_after_fetch()
 		local checkout_cmd = { "git", "checkout", "-B", from_ref, "origin/" .. from_ref }
 		vim.system(checkout_cmd, { text = true }, function(co_res)
-			vim.schedule(function()
-				if co_res.code ~= 0 then
+			if co_res.code ~= 0 then
+				vim.schedule(function()
 					vim.notify(
 						"bb_pr: failed to checkout " .. from_ref .. ": " .. (co_res.stderr or ""),
 						vim.log.levels.ERROR
 					)
-					return
-				end
-				vim.cmd(string.format("%s origin/%s", M.config.diffview_cmd, to_ref))
-				set_current_tab_pr(pr)
-				run_comments_provider(pr.id, function(payload)
-					vim.schedule(function()
-						set_current_tab_comments(payload)
-						apply_comments_when_diffview_ready(payload)
-					end)
-				end, { notify_errors = false })
+				end)
+				return
+			end
+			local merge_cmd = { "git", "merge", "origin/" .. to_ref, "--no-edit" }
+			vim.system(merge_cmd, { text = true }, function(merge_res)
+				vim.schedule(function()
+					if merge_res.code ~= 0 then
+						vim.notify(
+							"bb_pr: merge conflict with origin/" .. to_ref .. ": " .. (merge_res.stderr or ""),
+							vim.log.levels.ERROR
+						)
+						return
+					end
+					vim.cmd(string.format("%s origin/%s", M.config.diffview_cmd, to_ref))
+					set_current_tab_pr(pr)
+					run_comments_provider(pr.id, function(payload)
+						vim.schedule(function()
+							set_current_tab_comments(payload)
+							apply_comments_when_diffview_ready(payload)
+						end)
+					end, { notify_errors = false })
+				end)
 			end)
 		end)
 	end

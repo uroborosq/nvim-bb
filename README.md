@@ -8,7 +8,6 @@
 - images (haha)
 - jira issues resolving
 - editing PRs
-- checkout
 
 ## Overview
 
