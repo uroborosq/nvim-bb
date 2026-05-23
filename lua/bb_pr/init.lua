@@ -1773,6 +1773,22 @@ apply_pr_info_content = function(buf, pr)
 	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers =
 		build_pr_info_content(pr)
 
+	local prev_ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line
+	local saved_positions = {}
+	for _, win in ipairs(vim.api.nvim_list_wins()) do
+		if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+			local cur = vim.api.nvim_win_get_cursor(win)
+			local cid = nil
+			if type(prev_ids_by_line) == "table" then
+				cid = tonumber(prev_ids_by_line[cur[1]] or 0)
+				if cid == 0 then
+					cid = nil
+				end
+			end
+			table.insert(saved_positions, { win = win, comment_id = cid, line = cur[1], col = cur[2] })
+		end
+	end
+
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
@@ -1801,6 +1817,28 @@ apply_pr_info_content = function(buf, pr)
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
 
 	vim.diagnostic.enable(false, { bufnr = buf })
+
+	local line_count = vim.api.nvim_buf_line_count(buf)
+	for _, pos in ipairs(saved_positions) do
+		if vim.api.nvim_win_is_valid(pos.win) then
+			local new_line = pos.line
+			if pos.comment_id then
+				for ln, cid in pairs(ids_by_line) do
+					if tonumber(cid) == pos.comment_id then
+						new_line = tonumber(ln) or new_line
+						break
+					end
+				end
+			end
+			if new_line > line_count then
+				new_line = line_count
+			end
+			if new_line < 1 then
+				new_line = 1
+			end
+			pcall(vim.api.nvim_win_set_cursor, pos.win, { new_line, pos.col or 0 })
+		end
+	end
 end
 
 local function open_edit_pr_description(pr, info_buf)
@@ -2569,7 +2607,20 @@ local function refresh_float_window_if_needed(win, buf)
 		return
 	end
 
+	local saved_comment_id = nil
+	local saved_line = nil
+	local saved_col = nil
 	if vim.api.nvim_win_is_valid(win) then
+		local cur = vim.api.nvim_win_get_cursor(win)
+		saved_line = cur[1]
+		saved_col = cur[2]
+		local ids_by_line = vim.b[buf].bb_pr_float_comment_ids_by_line
+		if type(ids_by_line) == "table" then
+			local cid = tonumber(ids_by_line[saved_line] or 0)
+			if cid and cid > 0 then
+				saved_comment_id = cid
+			end
+		end
 		pcall(vim.api.nvim_win_close, win, true)
 	end
 	local reopened_win = nil
@@ -2580,8 +2631,33 @@ local function refresh_float_window_if_needed(win, buf)
 			reopened_win = open_comment_float(updated_comments, source_line)
 		end
 	end)
-	if was_current and reopened_win and vim.api.nvim_win_is_valid(reopened_win) then
-		pcall(vim.api.nvim_set_current_win, reopened_win)
+	if reopened_win and vim.api.nvim_win_is_valid(reopened_win) then
+		if was_current then
+			pcall(vim.api.nvim_set_current_win, reopened_win)
+		end
+		local new_buf = vim.api.nvim_win_get_buf(reopened_win)
+		local new_line = saved_line
+		if saved_comment_id then
+			local new_ids = vim.b[new_buf].bb_pr_float_comment_ids_by_line
+			if type(new_ids) == "table" then
+				for ln, cid in pairs(new_ids) do
+					if tonumber(cid) == saved_comment_id then
+						new_line = tonumber(ln) or new_line
+						break
+					end
+				end
+			end
+		end
+		if new_line then
+			local line_count = vim.api.nvim_buf_line_count(new_buf)
+			if new_line > line_count then
+				new_line = line_count
+			end
+			if new_line < 1 then
+				new_line = 1
+			end
+			pcall(vim.api.nvim_win_set_cursor, reopened_win, { new_line, saved_col or 0 })
+		end
 	end
 end
 
