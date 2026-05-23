@@ -295,6 +295,7 @@ type PRCommentView struct {
 	IsTask        bool            `json:"is_task,omitempty"`
 	TaskStatus    string          `json:"task_status,omitempty"`
 	IsResolved    bool            `json:"is_resolved,omitempty"`
+	IsOutdated    bool            `json:"is_outdated,omitempty"`
 	Version       int             `json:"version"`
 }
 
@@ -306,9 +307,10 @@ type PullRequestComments struct {
 }
 
 type FlatComment struct {
-	Comment  PRComment
-	ParentID int64
-	Depth    int
+	Comment    PRComment
+	ParentID   int64
+	Depth      int
+	IsOutdated bool
 }
 
 type CommentParent struct {
@@ -960,6 +962,8 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		for _, activity := range page.Values {
 			root := extractActivityComment(activity)
 			if root != nil {
+				hadEffective := root.Anchor != nil || activity.Anchor != nil
+				outdated := !hadEffective && (root.CommentAnchor != nil || activity.CommentAnchor != nil)
 				if root.Anchor == nil {
 					root.Anchor = root.CommentAnchor
 				}
@@ -969,7 +973,16 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 				if root.Anchor == nil {
 					root.Anchor = activity.CommentAnchor
 				}
-				all = append(all, flattenCommentTree(*root, 0, 0)...)
+				if root.Anchor != nil && root.Anchor.DiffType != "" && root.Anchor.DiffType != "EFFECTIVE" {
+					outdated = true
+				}
+				flat := flattenCommentTree(*root, 0, 0)
+				if outdated {
+					for i := range flat {
+						flat[i].IsOutdated = true
+					}
+				}
+				all = append(all, flat...)
 			}
 		}
 
@@ -1045,6 +1058,9 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		}
 		if cmt.ThreadResolved {
 			view.IsResolved = true
+		}
+		if item.IsOutdated {
+			view.IsOutdated = true
 		}
 
 		if anchor != nil {

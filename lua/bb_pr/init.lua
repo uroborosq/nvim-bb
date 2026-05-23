@@ -868,7 +868,7 @@ apply_comments_to_current_buffer = function(comments_payload)
 	local seen_comment_ids = {}
 
 	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
-		if path_matches(rel_norm, c.path) and comment_matches_side(c, side) then
+		if not c.is_outdated and path_matches(rel_norm, c.path) and comment_matches_side(c, side) then
 			local cid = tonumber(c.id or 0) or 0
 			if cid > 0 and seen_comment_ids[cid] then
 				goto continue
