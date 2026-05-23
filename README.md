@@ -4,10 +4,11 @@
 
 ## Roadmap
 
-- comments resolving
 - etwa dashboard
 - images (haha)
 - jira issues resolving
+- editing PRs
+- checkout
 
 ## Overview
 
@@ -51,7 +52,7 @@ Bitbucket PR helper CLI + Neovim plugin.
   - `:BBPRReactComment` adds a reaction to the comment under cursor (works for overview comments and file-scoped comments).
   - `<leader>re` (or `:BBPRReactComment`) toggles a reaction on the comment under cursor (adds if absent, removes if it is already yours), and can be customized via `setup({ react_comment_map = "..." })`.
   - `<leader>rx` (or `:BBPRDeleteComment`) deletes the comment under cursor (supports both overview comments and file-scoped comments), and can be customized via `setup({ delete_comment_map = "..." })`.
-  - `<leader>rv` (or `:BBPRResolveComment`) toggles the resolve state of the comment thread under cursor (resolve if open, unresolve if already resolved). Works for both regular comment threads and task comments, in both overview and file-scoped contexts. Resolved threads are shown with a `[~]` prefix instead of `- `. Mapping is configurable via `setup({ resolve_comment_map = "..." })`.
+  - `<leader>rv` (or `:BBPRResolveComment`) toggles the resolve state of the comment thread under cursor (resolve if open, unresolve if already resolved). Works for both regular comment threads and task comments, in both overview and file-scoped contexts. Resolved threads are shown with a `[~]` prefix instead of `-`. Mapping is configurable via `setup({ resolve_comment_map = "..." })`.
   - `<leader>rs` (or `:BBPRCreateSuggestion`) opens the comment editor with a prefilled Markdown suggestion block for the commented line in one step. If cursor is on an existing overview or file-scoped comment, it creates a suggestion **reply** to that comment:
 
     ```suggestion

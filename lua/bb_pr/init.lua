@@ -803,7 +803,7 @@ local function jump_overview_comment(direction)
 		overview_lines = {}
 		local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 		for idx, line in ipairs(all_lines) do
-			if type(line) == "string" and line:match("^%s*%- .+ @ .+") then
+			if type(line) == "string" and line:match("^### Thread %d+") then
 				table.insert(overview_lines, idx)
 			end
 		end
@@ -811,7 +811,7 @@ local function jump_overview_comment(direction)
 	end
 
 	if #overview_lines == 0 then
-		vim.notify("bb_pr: no overview comments in current buffer", vim.log.levels.INFO)
+		vim.notify("bb_pr: no comment threads in current buffer", vim.log.levels.INFO)
 		return
 	end
 
@@ -1241,6 +1241,7 @@ local function build_overview_comment_lines(payload)
 	local comment_line_numbers = {}
 	local comment_ids_by_line_order = {}
 	local comment_ids_by_relative_line = {}
+	local thread_line_numbers = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		local root_comment = thread_comments[1] or {}
@@ -1248,6 +1249,7 @@ local function build_overview_comment_lines(payload)
 			table.insert(lines, "")
 		end
 		table.insert(lines, string.format("### Thread %d", thread_idx))
+		table.insert(thread_line_numbers, #lines)
 		if root_comment.__scope == "file" then
 			local path = root_comment.path or "(unknown file)"
 			local line = tonumber(root_comment.line or 0) or 0
@@ -1317,7 +1319,7 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 	end
 
-	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line
+	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers
 end
 
 local function build_pr_info_content(pr)
@@ -1354,7 +1356,7 @@ local function build_pr_info_content(pr)
 
 	local comments_payload = get_current_tab_comments()
 	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
+	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers =
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
@@ -1362,11 +1364,12 @@ local function build_pr_info_content(pr)
 		overview_start_line,
 		comment_line_numbers,
 		comment_ids_by_line_order,
-		comment_ids_by_relative_line
+		comment_ids_by_relative_line,
+		thread_line_numbers
 end
 
 apply_pr_info_content = function(buf, pr)
-	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line =
+	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers =
 		build_pr_info_content(pr)
 
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -1375,13 +1378,16 @@ apply_pr_info_content = function(buf, pr)
 	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 
 	vim.b[buf].bb_pr_info_pr = pr
-	vim.b[buf].bb_pr_overview_comment_lines = {}
-	vim.b[buf].bb_pr_overview_comment_ids_by_line = {}
 
-	local ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line or {}
-	for idx, line in ipairs(comment_line_numbers) do
+	local new_thread_lines = {}
+	for _, line in ipairs(thread_line_numbers or {}) do
+		table.insert(new_thread_lines, overview_start_line + line - 1)
+	end
+	vim.b[buf].bb_pr_overview_comment_lines = new_thread_lines
+
+	local ids_by_line = {}
+	for idx, line in ipairs(comment_line_numbers or {}) do
 		local abs = overview_start_line + line - 1
-		table.insert(vim.b[buf].bb_pr_overview_comment_lines, abs)
 		local cid = tonumber((comment_ids_by_line_order or {})[idx] or 0) or 0
 		if cid > 0 then
 			ids_by_line[abs] = cid
