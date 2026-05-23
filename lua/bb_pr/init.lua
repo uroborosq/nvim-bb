@@ -1041,7 +1041,7 @@ local function open_diffview(pr)
 					)
 					return
 				end
-				vim.cmd(string.format("%s origin/%s...origin/%s", M.config.diffview_cmd, to_ref, from_ref))
+				vim.cmd(string.format("%s origin/%s", M.config.diffview_cmd, to_ref))
 				set_current_tab_pr(pr)
 				run_comments_provider(pr.id, function(payload)
 					vim.schedule(function()
