@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -38,6 +39,8 @@ type Config struct {
 	InsecureTLS bool   `json:"insecure_tls"`
 	JSONOutput  bool   `json:"json_output"`
 	CurrentUser string `json:"current_user"`
+
+	Repos map[string]string `json:"repos"`
 }
 
 type RuntimeConfig struct {
@@ -381,6 +384,13 @@ type PullRequestMergeability struct {
 }
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "open" {
+		if err := runOpenCommand(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
@@ -694,6 +704,186 @@ func main() {
 	}
 
 	printTable(prs, cfg, *reviewersEnabled)
+}
+
+type openTarget struct {
+	Project   string
+	Repo      string
+	PRID      int64
+	CommentID int64
+}
+
+func runOpenCommand(args []string) error {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 1 {
+		return errors.New("usage: bb open <url> [-config path]")
+	}
+	rawURL := rest[0]
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
+	target, err := parseBitbucketPRURL(rawURL)
+	if err != nil {
+		return err
+	}
+
+	folder, err := lookupRepoFolder(cfg.Repos, target.Project, target.Repo)
+	if err != nil {
+		return err
+	}
+
+	luaCode := fmt.Sprintf(`require("bb_pr").open_pr(%d, %s)`, target.PRID, luaOpenOpts(target.CommentID))
+
+	sock := findNvimSocketForFolder(folder)
+	if sock != "" {
+		expr := fmt.Sprintf("luaeval(%s)", vimSingleQuote(luaCode))
+		out, err := exec.Command("nvim", "--server", sock, "--remote-expr", expr).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("send to nvim %s: %w (%s)", sock, err, strings.TrimSpace(string(out)))
+		}
+		fmt.Fprintf(os.Stderr, "bb: opened PR #%d in nvim at %s\n", target.PRID, folder)
+		return nil
+	}
+
+	cmd := exec.Command("nvim", "+lua "+luaCode)
+	cmd.Dir = folder
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func parseBitbucketPRURL(raw string) (*openTarget, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse url: %w", err)
+	}
+	re := regexp.MustCompile(`/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)`)
+	m := re.FindStringSubmatch(u.Path)
+	if m == nil {
+		return nil, fmt.Errorf("not a Bitbucket PR URL: %s", raw)
+	}
+	prID, err := strconv.ParseInt(m[3], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse pr id %q: %w", m[3], err)
+	}
+	out := &openTarget{
+		Project: m[1],
+		Repo:    m[2],
+		PRID:    prID,
+	}
+	if c := u.Query().Get("commentId"); c != "" {
+		if id, err := strconv.ParseInt(c, 10, 64); err == nil {
+			out.CommentID = id
+		}
+	}
+	return out, nil
+}
+
+func lookupRepoFolder(repos map[string]string, project, repo string) (string, error) {
+	if len(repos) == 0 {
+		return "", fmt.Errorf("config.repos is empty; add %q -> /path/to/folder", project+"/"+repo)
+	}
+	want := project + "/" + repo
+	for k, v := range repos {
+		if strings.EqualFold(k, want) {
+			return expandHome(strings.TrimSpace(v)), nil
+		}
+	}
+	return "", fmt.Errorf("no folder mapping for %s in config.repos", want)
+}
+
+func expandHome(p string) string {
+	if strings.HasPrefix(p, "~/") || p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
+func luaOpenOpts(commentID int64) string {
+	if commentID > 0 {
+		return fmt.Sprintf("{comment_id=%d}", commentID)
+	}
+	return "{}"
+}
+
+func vimSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func findNvimSocketForFolder(folder string) string {
+	target, err := filepath.EvalSymlinks(folder)
+	if err != nil {
+		target = folder
+	}
+	target = filepath.Clean(target)
+
+	var roots []string
+	if rd := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); rd != "" {
+		roots = append(roots, rd)
+	}
+	roots = append(roots, "/tmp")
+
+	seen := map[string]bool{}
+	var sockets []string
+	for _, root := range roots {
+		matches, _ := filepath.Glob(filepath.Join(root, "nvim.*"))
+		for _, m := range matches {
+			fi, err := os.Stat(m)
+			if err != nil {
+				continue
+			}
+			if fi.Mode()&os.ModeSocket != 0 {
+				if !seen[m] {
+					seen[m] = true
+					sockets = append(sockets, m)
+				}
+				continue
+			}
+			if fi.IsDir() {
+				entries, _ := os.ReadDir(m)
+				for _, e := range entries {
+					p := filepath.Join(m, e.Name())
+					st, err := os.Stat(p)
+					if err == nil && st.Mode()&os.ModeSocket != 0 && !seen[p] {
+						seen[p] = true
+						sockets = append(sockets, p)
+					}
+				}
+			}
+		}
+	}
+
+	for _, sock := range sockets {
+		out, err := exec.Command("nvim", "--server", sock, "--remote-expr", "getcwd()").Output()
+		if err != nil {
+			continue
+		}
+		cwd := strings.TrimSpace(string(out))
+		if cwd == "" {
+			continue
+		}
+		if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+			cwd = resolved
+		}
+		if filepath.Clean(cwd) == target {
+			return sock
+		}
+	}
+	return ""
 }
 
 func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string, forceAutodetect bool) RuntimeConfig {

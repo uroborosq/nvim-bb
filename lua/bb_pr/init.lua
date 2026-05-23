@@ -42,6 +42,7 @@ local state = {
 	diffview_panel_ns = vim.api.nvim_create_namespace("bb_pr_diffview_panel"),
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
+	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
 }
@@ -1147,6 +1148,239 @@ local function build_lines(prs)
 	return lines
 end
 
+local open_pr_info_with_comments_fwd
+
+local function collect_diffview_file_entries(view)
+	local entries = {}
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node._name == "file" and type(node.comp) == "table" then
+			local ctx = node.comp.context
+			if type(ctx) == "table" and type(ctx.path) == "string" then
+				table.insert(entries, ctx)
+			end
+		end
+		for i = 1, #node do
+			walk(node[i])
+		end
+	end
+	if view and view.panel and type(view.panel.components) == "table" then
+		walk(view.panel.components)
+	end
+	if #entries == 0 and view and type(view.files) == "table" then
+		local files_iter = view.files
+		if type(files_iter.ipairs) == "function" then
+			for _, f in files_iter:ipairs() do
+				if type(f) == "table" and type(f.path) == "string" then
+					table.insert(entries, f)
+				end
+			end
+		else
+			for _, f in ipairs(files_iter) do
+				if type(f) == "table" and type(f.path) == "string" then
+					table.insert(entries, f)
+				end
+			end
+		end
+	end
+	return entries
+end
+
+local function navigate_to_file_comment_in_diffview(c)
+	local ok, lib = pcall(require, "diffview.lib")
+	if not ok then
+		vim.notify(string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")), vim.log.levels.INFO)
+		return
+	end
+	local view = lib.get_current_view()
+	if type(view) ~= "table" then
+		vim.notify(string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")), vim.log.levels.INFO)
+		return
+	end
+
+	local target_path = normalize_repo_path(c.path or "")
+	local entries = collect_diffview_file_entries(view)
+	local target_file = nil
+	for _, entry in ipairs(entries) do
+		if path_matches(entry.path or "", target_path) then
+			target_file = entry
+			break
+		end
+	end
+	if not target_file then
+		local paths = {}
+		for _, e in ipairs(entries) do
+			table.insert(paths, tostring(e.path or "?"))
+		end
+		vim.notify(
+			"bb_pr: file not in PR diff: "
+				.. (c.path or "?")
+				.. (#paths > 0 and ("\navailable: " .. table.concat(paths, ", ")) or ""),
+			vim.log.levels.WARN
+		)
+		return
+	end
+	if type(view.set_file) == "function" then
+		pcall(view.set_file, view, target_file, false, true)
+	end
+
+	local line = tonumber(c.line or 0) or 0
+	if line <= 0 then
+		return
+	end
+	local file_type = string.upper(tostring(c.file_type or "TO"))
+
+	local function jump_cursor()
+		local target_win = nil
+		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
+				local side = vim.api.nvim_win_call(win, current_diff_side)
+				if (file_type == "TO" and side == "right") or (file_type == "FROM" and side == "left") then
+					target_win = win
+					break
+				end
+				if side == "single" then
+					target_win = target_win or win
+				end
+			end
+		end
+		if not target_win then
+			return nil
+		end
+		local buf = vim.api.nvim_win_get_buf(target_win)
+		local line_count = vim.api.nvim_buf_line_count(buf)
+		if line > line_count then
+			line = line_count
+		end
+		vim.api.nvim_set_current_win(target_win)
+		vim.api.nvim_win_set_cursor(target_win, { line, 0 })
+		return { win = target_win, buf = buf }
+	end
+
+	local target_comment_id = tonumber(c.id or 0) or 0
+
+	local function open_float_for_line(buf)
+		local by_line = vim.b[buf].bb_pr_line_comments
+		if type(by_line) ~= "table" then
+			return false
+		end
+		local line_comments = by_line[line]
+		if type(line_comments) ~= "table" or #line_comments == 0 then
+			return false
+		end
+		local float_win = open_comment_float(line_comments, line)
+		if target_comment_id > 0 and float_win and vim.api.nvim_win_is_valid(float_win) then
+			local float_buf = vim.api.nvim_win_get_buf(float_win)
+			local ids_by_line = vim.b[float_buf].bb_pr_float_comment_ids_by_line
+			if type(ids_by_line) == "table" then
+				local target_line = nil
+				for lnum, cid in pairs(ids_by_line) do
+					if tonumber(cid) == target_comment_id then
+						target_line = tonumber(lnum)
+						break
+					end
+				end
+				if target_line then
+					pcall(vim.api.nvim_win_set_cursor, float_win, { target_line, 0 })
+				end
+			end
+		end
+		return true
+	end
+
+	local attempts = 0
+	local function attempt()
+		local jumped = jump_cursor()
+		if jumped then
+			local float_attempts = 0
+			local function try_float()
+				if open_float_for_line(jumped.buf) then
+					return
+				end
+				float_attempts = float_attempts + 1
+				if float_attempts < 20 then
+					vim.defer_fn(try_float, 100)
+				end
+			end
+			try_float()
+			return
+		end
+		attempts = attempts + 1
+		if attempts < 20 then
+			vim.defer_fn(attempt, 100)
+		end
+	end
+	vim.defer_fn(attempt, 50)
+end
+
+local function navigate_to_overview_comment(pr, comment_id)
+	if type(open_pr_info_with_comments_fwd) ~= "function" then
+		return
+	end
+	open_pr_info_with_comments_fwd(pr)
+	local attempts = 0
+	local function attempt()
+		local cur_buf = vim.api.nvim_get_current_buf()
+		local ids_by_line = vim.b[cur_buf].bb_pr_overview_comment_ids_by_line
+		if type(ids_by_line) == "table" then
+			local target_line = nil
+			for line, id in pairs(ids_by_line) do
+				if tonumber(id) == tonumber(comment_id) then
+					target_line = tonumber(line)
+					break
+				end
+			end
+			if target_line then
+				pcall(vim.api.nvim_win_set_cursor, 0, { target_line, 0 })
+				return
+			end
+		end
+		attempts = attempts + 1
+		if attempts < 20 then
+			vim.defer_fn(attempt, 100)
+		end
+	end
+	vim.defer_fn(attempt, 50)
+end
+
+local function consume_pending_nav(pr_id)
+	local key = tonumber(pr_id or 0) or 0
+	if key <= 0 then
+		return nil
+	end
+	local nav = state.pending_nav_by_pr_id[key]
+	state.pending_nav_by_pr_id[key] = nil
+	return nav
+end
+
+local function try_navigate_to_pending_comment(pr, payload)
+	local pr_id = tonumber(pr and pr.id or 0) or 0
+	local nav = consume_pending_nav(pr_id)
+	if type(nav) ~= "table" then
+		return
+	end
+	local comment_id = tonumber(nav.comment_id or 0) or 0
+	if comment_id <= 0 then
+		return
+	end
+
+	for _, c in ipairs(as_array(payload and payload.file_comments)) do
+		if tonumber(c.id or 0) == comment_id then
+			navigate_to_file_comment_in_diffview(c)
+			return
+		end
+	end
+	for _, c in ipairs(as_array(payload and payload.overview_comments)) do
+		if tonumber(c.id or 0) == comment_id then
+			navigate_to_overview_comment(pr, comment_id)
+			return
+		end
+	end
+	vim.notify("bb_pr: comment #" .. comment_id .. " not found in PR", vim.log.levels.WARN)
+end
+
 local function open_diffview(pr)
 	local from_ref = pr.fromRef and pr.fromRef.displayId
 	local to_ref = pr.toRef and pr.toRef.displayId
@@ -1183,6 +1417,9 @@ local function open_diffview(pr)
 						vim.schedule(function()
 							set_current_tab_comments(payload)
 							apply_comments_when_diffview_ready(payload)
+							vim.defer_fn(function()
+								try_navigate_to_pending_comment(pr, payload)
+							end, 300)
 						end)
 					end, { notify_errors = false })
 				end)
@@ -1751,6 +1988,7 @@ local function open_pr_info_with_comments(pr)
 		end)
 	end, { notify_errors = true })
 end
+open_pr_info_with_comments_fwd = open_pr_info_with_comments
 local function open_telescope_picker(prs)
 	local ok_pickers, pickers = pcall(require, "telescope.pickers")
 	local ok_finders, finders = pcall(require, "telescope.finders")
@@ -1798,6 +2036,37 @@ local function open_telescope_picker(prs)
 		:find()
 
 	return true
+end
+
+function M.open_pr(pr_id, opts)
+	opts = opts or {}
+	pr_id = tonumber(pr_id) or 0
+	if pr_id <= 0 then
+		vim.notify("bb_pr: invalid PR id", vim.log.levels.ERROR)
+		return
+	end
+	local comment_id = tonumber(opts.comment_id or 0) or 0
+
+	run_provider(function(prs)
+		local found = nil
+		for _, p in ipairs(prs or {}) do
+			if tonumber(p.id or 0) == pr_id then
+				found = p
+				break
+			end
+		end
+
+		vim.schedule(function()
+			if not found then
+				vim.notify("bb_pr: PR #" .. pr_id .. " not found in current repo", vim.log.levels.ERROR)
+				return
+			end
+			if comment_id > 0 then
+				state.pending_nav_by_pr_id[pr_id] = { comment_id = comment_id }
+			end
+			open_diffview(found)
+		end)
+	end)
 end
 
 function M.open_list()
