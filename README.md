@@ -7,7 +7,6 @@
 - etwa dashboard
 - images (haha)
 - jira issues resolving
-- fix cursor after reload,reply,reaction and etc
 
 ## Overview
 
