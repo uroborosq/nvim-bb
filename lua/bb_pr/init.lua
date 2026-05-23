@@ -1715,6 +1715,14 @@ local function build_overview_comment_lines(payload)
 					end
 				end
 			end
+			local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
+			if reactions_line then
+				table.insert(lines, "")
+				table.insert(lines, "    " .. reactions_line)
+				if comment_id > 0 then
+					comment_ids_by_relative_line[#lines] = comment_id
+				end
+			end
 			table.insert(lines, "")
 		end
 	end
