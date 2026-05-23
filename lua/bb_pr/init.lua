@@ -20,6 +20,7 @@ local default_config = {
 	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
 	refresh_comments_map = "<leader>rr",
 	toggle_task_map = "<leader>rt",
+	resolve_comment_map = "<leader>rv",
 	pr_info_approve_map = "<leader>ra",
 	pr_info_disapprove_map = "<leader>rd",
 	pr_info_needs_work_map = "<leader>rn",
@@ -319,14 +320,20 @@ local function split_first_line(text)
 end
 
 local function task_checkbox_prefix(c)
-	if type(c) ~= "table" or not c.is_task then
+	if type(c) ~= "table" then
 		return nil
 	end
-	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
-	if status == "DONE" or status == "RESOLVED" then
-		return "- [x] "
+	if c.is_task then
+		local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+		if status == "DONE" or status == "RESOLVED" then
+			return "- [x] "
+		end
+		return "- [ ] "
 	end
-	return "- [ ] "
+	if c.is_resolved then
+		return "- [~] "
+	end
+	return nil
 end
 
 local function as_array(value)
@@ -2087,6 +2094,59 @@ local function toggle_task_status()
 	end)
 end
 
+local function resolve_comment()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+
+	local payload = get_current_tab_comments() or {}
+	local all_comments = {}
+	for _, c in ipairs(as_array(payload.overview_comments)) do
+		all_comments[tonumber(c.id or 0) or 0] = c
+	end
+	for _, c in ipairs(as_array(payload.file_comments)) do
+		all_comments[tonumber(c.id or 0) or 0] = c
+	end
+	local target = all_comments[cid]
+	if type(target) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	local version = tonumber(target.version or 0) or 0
+	local action = target.is_resolved and "unresolve" or "resolve"
+	local cmd = bb_cmd({
+		"-json",
+		"-pr-resolve-comment",
+		tostring(pr.id),
+		"-resolve-comment-id",
+		tostring(cid),
+		"-resolve-comment-version",
+		tostring(version),
+		"-resolve-action",
+		action,
+	})
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: resolve comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		vim.schedule(function()
+			local verb = action == "resolve" and "resolved" or "unresolved"
+			vim.notify("bb_pr: comment thread " .. verb, vim.log.levels.INFO)
+			vim.cmd("BBPRLoadComments")
+		end)
+	end)
+end
+
 find_comment_by_id = function(cid)
 	local payload = get_current_tab_comments() or {}
 	for _, c in ipairs(as_array(payload.overview_comments)) do
@@ -2518,6 +2578,10 @@ function M.setup(opts)
 		toggle_task_status()
 	end, { desc = "Toggle PR task done/open for comment under cursor" })
 
+	vim.api.nvim_create_user_command("BBPRResolveComment", function()
+		resolve_comment()
+	end, { desc = "Resolve/unresolve PR comment thread under cursor" })
+
 	vim.api.nvim_create_user_command("BBPRReactComment", function()
 		react_to_comment()
 	end, { desc = "Add reaction to comment under cursor" })
@@ -2594,6 +2658,14 @@ function M.setup(opts)
 			M.config.toggle_task_map,
 			"<cmd>BBPRToggleTask<CR>",
 			{ desc = "Toggle PR task done/open", silent = true }
+		)
+	end
+	if M.config.resolve_comment_map and M.config.resolve_comment_map ~= "" then
+		vim.keymap.set(
+			"n",
+			M.config.resolve_comment_map,
+			"<cmd>BBPRResolveComment<CR>",
+			{ desc = "Resolve/unresolve PR comment thread", silent = true }
 		)
 	end
 	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then

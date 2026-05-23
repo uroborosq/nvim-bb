@@ -142,13 +142,15 @@ type PRComment struct {
 	CreatedDate   int64       `json:"createdDate"`
 	UpdatedDate   int64       `json:"updatedDate"`
 	Version       int         `json:"version"`
-	Anchor        *Anchor     `json:"anchor,omitempty"`
-	CommentAnchor *Anchor     `json:"commentAnchor,omitempty"`
-	Comments      []PRComment `json:"comments,omitempty"`
-	Properties    Properties  `json:"properties,omitempty"`
-	Severity      string      `json:"severity,omitempty"`
-	State         string      `json:"state,omitempty"`
-	Author        User        `json:"author"`
+	Anchor         *Anchor     `json:"anchor,omitempty"`
+	CommentAnchor  *Anchor     `json:"commentAnchor,omitempty"`
+	Comments       []PRComment `json:"comments,omitempty"`
+	Properties     Properties  `json:"properties,omitempty"`
+	Severity       string      `json:"severity,omitempty"`
+	State          string      `json:"state,omitempty"`
+	ThreadResolved bool        `json:"threadResolved,omitempty"`
+	ResolvedDate   int64       `json:"resolvedDate,omitempty"`
+	Author         User        `json:"author"`
 }
 
 type Anchor struct {
@@ -292,6 +294,7 @@ type PRCommentView struct {
 	MyReactions   map[string]bool `json:"my_reactions,omitempty"`
 	IsTask        bool            `json:"is_task,omitempty"`
 	TaskStatus    string          `json:"task_status,omitempty"`
+	IsResolved    bool            `json:"is_resolved,omitempty"`
 	Version       int             `json:"version"`
 }
 
@@ -403,6 +406,10 @@ func main() {
 	taskID := flag.Int64("task-id", 0, "task/comment id to update with -pr-task-status")
 	taskState := flag.String("task-state", "", "task state: open|done")
 	taskVersion := flag.Int("task-version", 0, "comment version for task update (optimistic lock)")
+	prResolveCommentID := flag.Int64("pr-resolve-comment", 0, "resolve or unresolve a comment thread for the given PR id")
+	resolveCommentID := flag.Int64("resolve-comment-id", 0, "comment id for -pr-resolve-comment")
+	resolveCommentVersion := flag.Int("resolve-comment-version", -1, "comment version for -pr-resolve-comment (optimistic lock)")
+	resolveAction := flag.String("resolve-action", "resolve", "resolve action: resolve|unresolve")
 	commentText := flag.String("text", "", "comment/task text")
 	commentTask := flag.Bool("task", false, "create task (BLOCKER severity)")
 	replyTo := flag.Int64("reply-to", 0, "reply to existing comment id")
@@ -569,6 +576,25 @@ func main() {
 			fatal(err)
 		}
 		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"task_id\":%d,\"task_state\":%q,\"ok\":true}\n", *prTaskStatusID, id, state)
+		return
+	}
+
+	if *prResolveCommentID > 0 {
+		commentID := *resolveCommentID
+		if commentID <= 0 {
+			fatal(errors.New("-resolve-comment-id is required with -pr-resolve-comment"))
+		}
+		if *resolveCommentVersion < 0 {
+			fatal(errors.New("-resolve-comment-version is required with -pr-resolve-comment"))
+		}
+		action := strings.ToLower(strings.TrimSpace(*resolveAction))
+		if action == "" {
+			action = "resolve"
+		}
+		if err := client.ResolveComment(ctx, *prResolveCommentID, commentID, *resolveCommentVersion, action); err != nil {
+			fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"pr_id\":%d,\"comment_id\":%d,\"resolve_action\":%q,\"ok\":true}\n", *prResolveCommentID, commentID, action)
 		return
 	}
 
@@ -916,6 +942,27 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		start = next
 	}
 
+	// Deduplicate: same comment can appear in multiple activities (COMMENTED, RESOLVED, UNRESOLVED).
+	// Keep the most recently updated version so threadResolved reflects actual current state.
+	seenByID := map[int64]int{}
+	var deduped []FlatComment
+	for _, item := range all {
+		cid := item.Comment.ID
+		if cid <= 0 {
+			deduped = append(deduped, item)
+			continue
+		}
+		if idx, ok := seenByID[cid]; ok {
+			if item.Comment.UpdatedDate > deduped[idx].Comment.UpdatedDate {
+				deduped[idx] = item
+			}
+		} else {
+			seenByID[cid] = len(deduped)
+			deduped = append(deduped, item)
+		}
+	}
+	all = deduped
+
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, item := range all {
 		cmt := item.Comment
@@ -949,6 +996,9 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			} else {
 				view.TaskStatus = "OPEN"
 			}
+		}
+		if cmt.ThreadResolved {
+			view.IsResolved = true
 		}
 
 		if anchor != nil {
@@ -1415,6 +1465,26 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 		State   string `json:"state"`
 		Version int    `json:"version"`
 	}{State: normalized, Version: version}
+	_, err := c.doJSON(ctx, http.MethodPut, path, body)
+	return err
+}
+
+func (c *Client) ResolveComment(ctx context.Context, prID int64, commentID int64, version int, action string) error {
+	var threadResolved bool
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "", "resolve":
+		threadResolved = true
+	case "unresolve", "reopen":
+		threadResolved = false
+	default:
+		return fmt.Errorf("bad -resolve-action %q; expected resolve|unresolve", action)
+	}
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		c.cfg.Project, c.cfg.Repo, prID, commentID)
+	body := struct {
+		ThreadResolved bool `json:"threadResolved"`
+		Version        int  `json:"version"`
+	}{ThreadResolved: threadResolved, Version: version}
 	_, err := c.doJSON(ctx, http.MethodPut, path, body)
 	return err
 }
