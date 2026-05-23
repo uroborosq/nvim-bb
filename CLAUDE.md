@@ -54,3 +54,7 @@ Single-file; all types, API client, and flag handling live there.
 - Every new comment action must work for **both overview and file-scoped comments**.
 - All keymaps must have the `<leader>r` prefix.
 - Every keymap must be configurable via `setup({...})`.
+
+## Agent instructions
+
+- Do not commit immediately, give me chance to test your solution.
