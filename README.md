@@ -5,7 +5,6 @@
 ## Roadmap
 
 - etwa dashboard
-- images (haha)
 
 ## Overview
 
