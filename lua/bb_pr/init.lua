@@ -32,6 +32,9 @@ local default_config = {
 	create_pr_body_template = "",
 	merge_pr_map = "<leader>rm",
 	merge_pr_body_template_fn = nil,
+	jira_base_url = "",
+	jira_open_map = "<leader>rj",
+	jira_open_url_map = "<leader>rJ",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 	draft_store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
 	draft_max_count = 50,
@@ -3455,6 +3458,111 @@ local function create_suggestion_comment()
 	})
 end
 
+local function ticket_under_cursor()
+	local word = vim.fn.expand("<cWORD>")
+	return word:match("[A-Z][A-Z0-9]+%-%d+")
+end
+
+local function open_jira_ticket(ticket)
+	local cmd = bb_cmd({ "-jira-ticket", ticket })
+	vim.system(cmd, { text = true }, function(res)
+		vim.schedule(function()
+			if res.code ~= 0 then
+				vim.notify("bb_pr: jira fetch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				return
+			end
+			local ok, issue = pcall(vim.json.decode, res.stdout)
+			if not ok or type(issue) ~= "table" then
+				vim.notify("bb_pr: invalid jira response", vim.log.levels.ERROR)
+				return
+			end
+
+			local lines = {}
+			local function push(s) table.insert(lines, ((s or ""):gsub("\r", ""))) end
+			local function split_field(s)
+				return vim.split((s or ""):gsub("\r\n", "\n"):gsub("\r", "\n"), "\n", { plain = true })
+			end
+
+			push(string.format("[%s] %s", issue.key or "", issue.summary or ""))
+			push(string.rep("─", 60))
+			local function meta(label, val)
+				if type(val) == "string" and val ~= "" then
+					push(string.format("%-14s %s", label .. ":", val))
+				end
+			end
+			meta("Type",       issue.type)
+			meta("Status",     issue.status)
+			meta("Priority",   issue.priority)
+			meta("Assignee",   issue.assignee)
+			meta("Reporter",   issue.reporter)
+			meta("Epic",       issue.epic_link)
+			if type(issue.fix_versions) == "table" and #issue.fix_versions > 0 then
+				meta("Fix Versions", table.concat(issue.fix_versions, ", "))
+			end
+			push(string.rep("─", 60))
+			if type(issue.description) == "string" and issue.description ~= "" then
+				for _, l in ipairs(split_field(issue.description)) do
+					push(l)
+				end
+			else
+				push("(no description)")
+			end
+
+			local comments = type(issue.comments) == "table" and issue.comments or {}
+			if #comments > 0 then
+				push("")
+				push(string.rep("─", 60))
+				push(string.format("Comments (%d):", #comments))
+				for _, c in ipairs(comments) do
+					push("")
+					push(string.format("  %s  •  %s", c.author or "", (c.created or ""):sub(1, 10)))
+					for _, l in ipairs(split_field(c.body or "")) do
+						push("  " .. l)
+					end
+				end
+			end
+
+			local buf = vim.api.nvim_create_buf(false, true)
+			vim.bo[buf].buftype = "nofile"
+			vim.bo[buf].bufhidden = "wipe"
+			vim.bo[buf].swapfile = false
+			vim.bo[buf].filetype = "markdown"
+			vim.diagnostic.enable(false, { bufnr = buf })
+			vim.api.nvim_buf_set_option(buf, "modifiable", true)
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+			vim.api.nvim_buf_set_option(buf, "modifiable", false)
+
+			local width = math.max(70, math.floor(vim.o.columns * 0.65))
+			local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.7))
+			local win = vim.api.nvim_open_win(buf, true, {
+				relative = "editor",
+				width = width,
+				height = height,
+				row = math.floor((vim.o.lines - height) / 2),
+				col = math.floor((vim.o.columns - width) / 2),
+				style = "minimal",
+				border = "rounded",
+				title = " " .. (issue.key or ticket) .. " ",
+				title_pos = "center",
+			})
+			vim.wo[win].wrap = true
+			vim.wo[win].linebreak = true
+
+			local url = issue.url or ""
+			for _, key in ipairs({ "q", "<Esc>" }) do
+				vim.keymap.set("n", key, function()
+					pcall(vim.api.nvim_win_close, win, true)
+				end, { buffer = buf, silent = true })
+			end
+			if M.config.jira_open_url_map and M.config.jira_open_url_map ~= "" and url ~= "" then
+				vim.keymap.set("n", M.config.jira_open_url_map, function()
+					vim.fn.jobstart({ "xdg-open", url }, { detach = true })
+				end, { buffer = buf, silent = true, desc = "Open Jira ticket in browser" })
+			end
+		end)
+	end)
+end
+
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
@@ -3673,6 +3781,32 @@ function M.setup(opts)
 	end
 	if M.config.merge_pr_map and M.config.merge_pr_map ~= "" then
 		vim.keymap.set("n", M.config.merge_pr_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
+	end
+	if M.config.jira_open_map and M.config.jira_open_map ~= "" then
+		vim.keymap.set("n", M.config.jira_open_map, function()
+			local ticket = ticket_under_cursor()
+			if not ticket then
+				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
+				return
+			end
+			open_jira_ticket(ticket)
+		end, { desc = "Open Jira ticket", silent = true })
+	end
+	if M.config.jira_open_url_map and M.config.jira_open_url_map ~= "" then
+		vim.keymap.set("n", M.config.jira_open_url_map, function()
+			local ticket = ticket_under_cursor()
+			if not ticket then
+				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
+				return
+			end
+			local jira_base = vim.trim(M.config.jira_base_url or "")
+			if jira_base == "" then
+				vim.notify("bb_pr: jira_base_url not configured", vim.log.levels.WARN)
+				return
+			end
+			local jira_url = jira_base:gsub("/$", "") .. "/browse/" .. ticket
+			vim.fn.jobstart({ "xdg-open", jira_url }, { detach = true })
+		end, { desc = "Open Jira ticket in browser", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })

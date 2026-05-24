@@ -42,6 +42,12 @@ type Config struct {
 
 	Repos       map[string]string `json:"repos"`
 	TerminalCmd []string          `json:"terminal_cmd"`
+
+	JiraBaseURL string `json:"jira_base_url"`
+	JiraAuth    string `json:"jira_auth"`     // bearer | basic | none
+	JiraToken   string `json:"jira_token"`
+	JiraUser    string `json:"jira_user"`
+	JiraPassword string `json:"jira_password"`
 }
 
 type RuntimeConfig struct {
@@ -384,6 +390,27 @@ type PullRequestMergeability struct {
 	} `json:"vetoes"`
 }
 
+type JiraIssue struct {
+	Key         string        `json:"key"`
+	Summary     string        `json:"summary"`
+	URL         string        `json:"url"`
+	Description string        `json:"description"`
+	Type        string        `json:"type"`
+	Status      string        `json:"status"`
+	Priority    string        `json:"priority"`
+	Assignee    string        `json:"assignee"`
+	Reporter    string        `json:"reporter"`
+	FixVersions []string      `json:"fix_versions"`
+	EpicLink    string        `json:"epic_link"`
+	Comments    []JiraComment `json:"comments"`
+}
+
+type JiraComment struct {
+	Author  string `json:"author"`
+	Body    string `json:"body"`
+	Created string `json:"created"`
+}
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "open" {
 		if err := runOpenCommand(os.Args[2:]); err != nil {
@@ -435,6 +462,7 @@ func main() {
 	commentLine := flag.Int("line", 0, "line number for file comment")
 	commentLineType := flag.String("line-type", "CONTEXT", "line type: ADDED|REMOVED|CONTEXT")
 	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
+	jiraTicket := flag.String("jira-ticket", "", "fetch Jira issue by key and print as JSON")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	projectOverride := flag.String("project", "", "override project key (auto-detected from git remote when omitted)")
 	repoOverride := flag.String("repo", "", "override repo slug (auto-detected from git remote when omitted)")
@@ -457,6 +485,19 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
 	defer cancel()
+
+	if *jiraTicket != "" {
+		issue, err := GetJiraIssue(ctx, cfg, strings.TrimSpace(*jiraTicket))
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(issue); err != nil {
+			fatal(err)
+		}
+		return
+	}
 
 	if *prCommentID > 0 {
 		text := strings.TrimSpace(*commentText)
@@ -2132,6 +2173,123 @@ func sanitizeCell(s string) string {
 
 func joinURLPath(basePath, suffix string) string {
 	return strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(suffix, "/")
+}
+
+func GetJiraIssue(ctx context.Context, cfg RuntimeConfig, issueKey string) (*JiraIssue, error) {
+	if cfg.JiraBaseURL == "" {
+		return nil, errors.New("jira_base_url is not configured")
+	}
+	baseURL, err := url.Parse(strings.TrimRight(cfg.JiraBaseURL, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("parse jira_base_url: %w", err)
+	}
+
+	tlsCfg := &tls.Config{InsecureSkipVerify: cfg.InsecureTLS} //nolint:gosec
+	httpClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+	}
+
+	doReq := func(path string) ([]byte, error) {
+		endpoint, _ := baseURL.Parse(path)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		auth := cfg.JiraAuth
+		if auth == "" {
+			auth = cfg.Auth
+		}
+		switch auth {
+		case "bearer":
+			tok := cfg.JiraToken
+			if tok == "" {
+				tok = cfg.Token
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+		case "basic":
+			u, p := cfg.JiraUser, cfg.JiraPassword
+			if u == "" {
+				u = cfg.User
+			}
+			if p == "" {
+				p = cfg.Password
+			}
+			req.SetBasicAuth(u, p)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("jira API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		}
+		return b, nil
+	}
+
+	const fields = "summary,description,comment,issuetype,status,priority,assignee,reporter,fixVersions,customfield_10014"
+	b, err := doReq("/rest/api/2/issue/" + url.PathEscape(issueKey) + "?fields=" + fields)
+	if err != nil {
+		return nil, err
+	}
+
+	type namedField struct {
+		Name        string `json:"name"`
+		DisplayName string `json:"displayName"`
+	}
+	var raw struct {
+		Key    string `json:"key"`
+		Fields struct {
+			Summary     string    `json:"summary"`
+			Description string    `json:"description"`
+			IssueType   namedField `json:"issuetype"`
+			Status      namedField `json:"status"`
+			Priority    namedField `json:"priority"`
+			Assignee    namedField `json:"assignee"`
+			Reporter    namedField `json:"reporter"`
+			FixVersions []namedField `json:"fixVersions"`
+			EpicLink    string    `json:"customfield_10014"`
+			Comment     struct {
+				Comments []struct {
+					Author  namedField `json:"author"`
+					Body    string     `json:"body"`
+					Created string     `json:"created"`
+				} `json:"comments"`
+			} `json:"comment"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("decode jira issue: %w", err)
+	}
+
+	issue := &JiraIssue{
+		Key:         raw.Key,
+		Summary:     raw.Fields.Summary,
+		Description: raw.Fields.Description,
+		URL:         strings.TrimRight(cfg.JiraBaseURL, "/") + "/browse/" + raw.Key,
+		Type:        raw.Fields.IssueType.Name,
+		Status:      raw.Fields.Status.Name,
+		Priority:    raw.Fields.Priority.Name,
+		Assignee:    raw.Fields.Assignee.DisplayName,
+		Reporter:    raw.Fields.Reporter.DisplayName,
+		EpicLink:    raw.Fields.EpicLink,
+	}
+	for _, v := range raw.Fields.FixVersions {
+		issue.FixVersions = append(issue.FixVersions, v.Name)
+	}
+	for _, c := range raw.Fields.Comment.Comments {
+		issue.Comments = append(issue.Comments, JiraComment{
+			Author:  c.Author.DisplayName,
+			Body:    c.Body,
+			Created: c.Created,
+		})
+	}
+	return issue, nil
 }
 
 func fatal(err error) {
