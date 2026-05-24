@@ -590,6 +590,7 @@ func main() {
 	commentLineType := flag.String("line-type", "CONTEXT", "line type: ADDED|REMOVED|CONTEXT")
 	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
 	jiraTicket := flag.String("jira-ticket", "", "fetch Jira issue by key and print as JSON")
+	fetchURL := flag.String("fetch-url", "", "fetch URL with Bitbucket auth and write binary body to stdout")
 	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
 	projectOverride := flag.String("project", "", "override project key (auto-detected from git remote when omitted)")
 	repoOverride := flag.String("repo", "", "override repo slug (auto-detected from git remote when omitted)")
@@ -601,9 +602,6 @@ func main() {
 		fatal(err)
 	}
 	cfg = applyRepoSelection(cfg, strings.TrimSpace(*projectOverride), strings.TrimSpace(*repoOverride), *forceAutodetectRepo)
-	if err := validateRepoSelection(cfg); err != nil {
-		fatal(err)
-	}
 
 	client, err := NewClient(cfg)
 	if err != nil {
@@ -612,6 +610,31 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
 	defer cancel()
+
+	if *fetchURL != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(*fetchURL), nil)
+		if err != nil {
+			fatal(err)
+		}
+		client.setAuth(req)
+		resp, err := client.httpClient.Do(req)
+		if err != nil {
+			fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			b, _ := io.ReadAll(resp.Body)
+			fatal(fmt.Errorf("fetch %s: %s: %s", *fetchURL, resp.Status, strings.TrimSpace(string(b))))
+		}
+		if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if err := validateRepoSelection(cfg); err != nil {
+		fatal(err)
+	}
 
 	if *jiraTicket != "" {
 		issue, err := GetJiraIssue(ctx, cfg, strings.TrimSpace(*jiraTicket))

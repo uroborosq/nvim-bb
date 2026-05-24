@@ -35,6 +35,7 @@ local default_config = {
 	jira_base_url = "",
 	jira_open_map = "<leader>rj",
 	jira_open_url_map = "<leader>rJ",
+	image_open_map = "<leader>ri",
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 	draft_store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
 	draft_max_count = 50,
@@ -3563,6 +3564,64 @@ local function open_jira_ticket(ticket)
 	end)
 end
 
+local function open_attachment_at_cursor()
+	local line = vim.api.nvim_get_current_line()
+	local _, attach_y = line:match("!%[.-%]%(attachment:(%d+)/(%d+)%)")
+	if not attach_y then
+		_, attach_y = line:match("attachment:(%d+)/(%d+)")
+	end
+	if not attach_y then
+		vim.notify("bb_pr: no attachment under cursor", vim.log.levels.WARN)
+		return
+	end
+
+	local ext = ".png"
+	local alt = line:match("!%[(.-)%]%(attachment:")
+	if alt and alt:match("%.%a+$") then
+		ext = "." .. ((alt:match("%.(%a+)$") or "png"):lower())
+	end
+
+	local pr = get_current_tab_pr()
+	if not pr then
+		vim.notify("bb_pr: no PR loaded for current tab", vim.log.levels.WARN)
+		return
+	end
+
+	local self_href = (pr.links and pr.links.self and pr.links.self[1] and pr.links.self[1].href) or ""
+	local base_url = self_href:match("^(https?://[^/]+)") or ""
+	local project = (pr.toRef and pr.toRef.repository and pr.toRef.repository.project and pr.toRef.repository.project.key) or ""
+	local repo = (pr.toRef and pr.toRef.repository and pr.toRef.repository.slug) or ""
+	if base_url == "" or project == "" or repo == "" then
+		vim.notify("bb_pr: cannot determine PR context", vim.log.levels.WARN)
+		return
+	end
+
+	local url = base_url .. "/rest/api/latest/projects/" .. project .. "/repos/" .. repo .. "/attachments/" .. attach_y
+	local tmp = vim.fn.tempname() .. ext
+	vim.notify("bb_pr: fetching attachment…", vim.log.levels.INFO)
+
+	vim.system(bb_cmd({ "-fetch-url", url }), { text = false }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: fetch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		local f = io.open(tmp, "wb")
+		if not f then
+			vim.schedule(function()
+				vim.notify("bb_pr: cannot write temp file " .. tmp, vim.log.levels.ERROR)
+			end)
+			return
+		end
+		f:write(res.stdout)
+		f:close()
+		vim.schedule(function()
+			vim.fn.jobstart({ "xdg-open", tmp }, { detach = true })
+		end)
+	end)
+end
+
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
@@ -3807,6 +3866,11 @@ function M.setup(opts)
 			local jira_url = jira_base:gsub("/$", "") .. "/browse/" .. ticket
 			vim.fn.jobstart({ "xdg-open", jira_url }, { detach = true })
 		end, { desc = "Open Jira ticket in browser", silent = true })
+	end
+	if M.config.image_open_map and M.config.image_open_map ~= "" then
+		vim.keymap.set("n", M.config.image_open_map, function()
+			open_attachment_at_cursor()
+		end, { desc = "Download and open attachment under cursor", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
