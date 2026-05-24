@@ -411,9 +411,136 @@ type JiraComment struct {
 	Created string `json:"created"`
 }
 
+func runDashboardCommand(args []string) error {
+	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
+	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	stateFilter := fs.String("state", "OPEN", "PR state: OPEN|MERGED|DECLINED|ALL")
+	limitFlag := fs.Int("limit", 50, "max PRs to fetch")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
+	defer cancel()
+
+	path := fmt.Sprintf("/rest/api/latest/dashboard/pull-requests?role=REVIEWER&state=%s&limit=%d",
+		url.QueryEscape(*stateFilter), *limitFlag)
+	b, err := client.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return fmt.Errorf("fetch dashboard PRs: %w", err)
+	}
+
+	var page struct {
+		Values []PullRequest `json:"values"`
+	}
+	if err := json.Unmarshal(b, &page); err != nil {
+		return fmt.Errorf("decode dashboard response: %w", err)
+	}
+	if len(page.Values) == 0 {
+		fmt.Fprintln(os.Stderr, "no reviewer PRs found")
+		return nil
+	}
+
+	enrichPullRequests(page.Values, cfg)
+
+	now := time.Now()
+	var sb strings.Builder
+	// header line (url field is empty so fzf skips it with --with-nth=2..)
+	sb.WriteString("\tAGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tREPO\tAUTHOR\tTITLE\n")
+	for _, pr := range page.Values {
+		prURL := ""
+		if len(pr.Links.Self) > 0 {
+			prURL = pr.Links.Self[0].Href
+		}
+		repo := pr.ToRef.Repository
+		repoLabel := repo.Project.Key + "/" + repo.Slug
+
+		ageStr := "-"
+		if t := msToTime(pr.CreatedDate); !t.IsZero() {
+			ageStr = humanAge(now.Sub(t))
+		}
+		lcomStr := "-"
+		if t := msToTime(pr.UpdatedDate); !t.IsZero() {
+			lcomStr = humanAge(now.Sub(t))
+		}
+
+		line := fmt.Sprintf("%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			prURL,
+			ageStr,
+			lcomStr,
+			pr.CommentCount,
+			needsWorkStatus(pr.Reviewers),
+			countApprovals(pr.Reviewers),
+			myApprovalMarker(pr, cfg),
+			repoLabel,
+			displayUser(pr.Author.User),
+			sanitizeCell(pr.Title),
+		)
+		sb.WriteString(line)
+	}
+
+	fzf := exec.Command("fzf",
+		"--ansi",
+		"--with-nth=2..",
+		"--delimiter=\t",
+		"--header-lines=1",
+		"--prompt=Reviewer PRs> ",
+		"--height=60%",
+		"--reverse",
+		"--tabstop=4",
+	)
+	fzf.Stdin = strings.NewReader(sb.String())
+	fzf.Stderr = os.Stderr
+	out, err := fzf.Output()
+	if err != nil {
+		// fzf exits 130 on ESC/q — not an error worth reporting
+		return nil
+	}
+
+	selected := strings.TrimSpace(string(out))
+	if selected == "" {
+		return nil
+	}
+	parts := strings.SplitN(selected, "\t", 2)
+	prURL := strings.TrimSpace(parts[0])
+	if prURL == "" {
+		return fmt.Errorf("could not extract PR URL from selection")
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		self = "bb"
+	}
+	openArgs := []string{"open", prURL}
+	if *configPath != "/etc/bb/config.json" {
+		openArgs = append(openArgs, "-config", *configPath)
+	}
+	openCmd := exec.Command(self, openArgs...)
+	openCmd.Stdin = os.Stdin
+	openCmd.Stdout = os.Stdout
+	openCmd.Stderr = os.Stderr
+	return openCmd.Run()
+}
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "open" {
 		if err := runOpenCommand(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "dashboard" {
+		if err := runDashboardCommand(os.Args[2:]); err != nil {
 			fatal(err)
 		}
 		return
