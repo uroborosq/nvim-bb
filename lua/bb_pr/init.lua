@@ -2276,6 +2276,15 @@ local function open_multiline_comment_input(opts, on_submit)
 	})
 	vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "<!-- " .. prompt .. " -->", "" })
 	vim.api.nvim_win_set_cursor(win, { 3, 0 })
+	if opts.title_separator then
+		local sep_line = 2 -- 0-indexed: prompt(0) + empty(1) + title(2)
+		local sep_text = string.rep("─", math.max(40, math.floor(vim.o.columns * 0.5)))
+		local ns = vim.api.nvim_create_namespace("bb_pr_merge_sep")
+		vim.api.nvim_buf_set_extmark(buf, ns, sep_line, 0, {
+			virt_lines = { { { sep_text, "Comment" } } },
+			virt_lines_above = false,
+		})
+	end
 
 	local function submit()
 		if not vim.api.nvim_buf_is_valid(buf) then
@@ -2371,94 +2380,124 @@ local function open_create_pr_editor(source_branch, target_branch)
 		return { "" }
 	end
 
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].filetype = "markdown"
-	vim.diagnostic.enable(false, { bufnr = buf })
-	local default_title = string.format("%s -> %s", source_branch, target_branch)
-	local initial_lines = {
-		"Title: " .. default_title,
-		"",
-		"Body:",
-	}
-	vim.list_extend(initial_lines, resolve_pr_body_template_lines())
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
+	local function normalize_branch_title(branch)
+		local name = branch:match("([^/]+)$") or branch
+		name = name:gsub("[_%-%./]+", " ")
+		name = vim.trim(name)
+		return name:sub(1, 1):upper() .. name:sub(2)
+	end
 
-	local width = math.max(90, math.floor(vim.o.columns * 0.7))
-	local height = math.max(14, math.floor(vim.o.lines * 0.4))
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
-		title = "Create PR (<C-s> submit)",
-		title_pos = "center",
-	})
+	local function do_open(default_title)
+		local buf = vim.api.nvim_create_buf(false, true)
+		vim.bo[buf].buftype = "nofile"
+		vim.bo[buf].bufhidden = "wipe"
+		vim.bo[buf].swapfile = false
+		vim.bo[buf].filetype = "markdown"
+		vim.diagnostic.enable(false, { bufnr = buf })
+		local initial_lines = {
+			"Title: " .. default_title,
+			"",
+			"Body:",
+		}
+		vim.list_extend(initial_lines, resolve_pr_body_template_lines())
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
-	local function submit()
-		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-		local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
-		local body_lines = {}
-		for i = 4, #lines do
-			table.insert(body_lines, lines[i])
-		end
-		local body = vim.trim(table.concat(body_lines, "\n"))
-		if title == "" then
-			vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
-			return
-		end
-		pcall(vim.api.nvim_win_close, win, true)
-		local cmd = bb_cmd({
-			"-json",
-			"-pr-create",
-			"-pr-title",
-			title,
-			"-pr-body",
-			body,
-			"-pr-source",
-			source_branch,
-			"-pr-target",
-			target_branch,
+		local width = math.max(90, math.floor(vim.o.columns * 0.7))
+		local height = math.max(14, math.floor(vim.o.lines * 0.4))
+		local win = vim.api.nvim_open_win(buf, true, {
+			relative = "editor",
+			width = width,
+			height = height,
+			row = math.floor((vim.o.lines - height) / 2),
+			col = math.floor((vim.o.columns - width) / 2),
+			style = "minimal",
+			border = "rounded",
+			title = "Create PR (<C-s> submit)",
+			title_pos = "center",
 		})
-		vim.system(cmd, { text = true }, function(res)
-			if res.code ~= 0 then
-				vim.schedule(function()
-					vim.notify("bb_pr: create PR failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
+
+		local function submit()
+			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
+			local body_lines = {}
+			for i = 4, #lines do
+				table.insert(body_lines, lines[i])
+			end
+			local body = vim.trim(table.concat(body_lines, "\n"))
+			if title == "" then
+				vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
 				return
 			end
-			vim.schedule(function()
-				vim.notify("bb_pr: pull request created", vim.log.levels.INFO)
+			pcall(vim.api.nvim_win_close, win, true)
+			local cmd = bb_cmd({
+				"-json",
+				"-pr-create",
+				"-pr-title",
+				title,
+				"-pr-body",
+				body,
+				"-pr-source",
+				source_branch,
+				"-pr-target",
+				target_branch,
+			})
+			vim.system(cmd, { text = true }, function(res)
+				if res.code ~= 0 then
+					vim.schedule(function()
+						vim.notify("bb_pr: create PR failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+					end)
+					return
+				end
+				vim.schedule(function()
+					vim.notify("bb_pr: pull request created", vim.log.levels.INFO)
+				end)
 			end)
-		end)
+		end
+
+		local function toggle_draft()
+			local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
+			local prefix = "Title: "
+			local raw = line:gsub("^Title:%s*", "", 1)
+			vim.api.nvim_buf_set_lines(buf, 0, 1, false, { prefix .. toggle_draft_in_title_line(raw) })
+		end
+
+		vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+		vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
+		vim.keymap.set("n", "q", function()
+			pcall(vim.api.nvim_win_close, win, true)
+		end, { buffer = buf, silent = true })
+		if M.config.create_pr_toggle_draft_map and M.config.create_pr_toggle_draft_map ~= "" then
+			vim.keymap.set(
+				"n",
+				M.config.create_pr_toggle_draft_map,
+				toggle_draft,
+				{ buffer = buf, silent = true, desc = "Toggle [DRAFT]" }
+			)
+		end
+		vim.cmd("startinsert")
 	end
 
-	local function toggle_draft()
-		local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
-		local prefix = "Title: "
-		local raw = line:gsub("^Title:%s*", "", 1)
-		vim.api.nvim_buf_set_lines(buf, 0, 1, false, { prefix .. toggle_draft_in_title_line(raw) })
-	end
-
-	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
-	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
-	vim.keymap.set("n", "q", function()
-		pcall(vim.api.nvim_win_close, win, true)
-	end, { buffer = buf, silent = true })
-	if M.config.create_pr_toggle_draft_map and M.config.create_pr_toggle_draft_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.create_pr_toggle_draft_map,
-			toggle_draft,
-			{ buffer = buf, silent = true, desc = "Toggle [DRAFT]" }
-		)
-	end
-	vim.cmd("startinsert")
+	vim.system(
+		{ "git", "log", "origin/" .. target_branch .. ".." .. source_branch, "--format=%s" },
+		{ text = true },
+		function(res)
+			local commits = {}
+			if res.code == 0 and res.stdout and res.stdout ~= "" then
+				for line in res.stdout:gmatch("[^\n]+") do
+					table.insert(commits, vim.trim(line))
+				end
+			end
+			local default_title
+			if #commits == 1 then
+				default_title = commits[1]
+			else
+				default_title = normalize_branch_title(source_branch)
+			end
+			vim.schedule(function()
+				do_open(default_title)
+			end)
+		end
+	)
 end
 
 local function create_pr()
@@ -2563,10 +2602,7 @@ local function merge_current_pr()
 			end)
 			return
 		end
-		local title = get_last_commit_title(commits)
-		if title == "" then
-			title = tostring(pr.title or "")
-		end
+		local title = string.format("PR #%s: %s", tostring(pr.id or ""), tostring(pr.title or ""))
 		local body_lines = { "" }
 		if type(M.config.merge_pr_body_template_fn) == "function" then
 			local ok_tpl, tpl = pcall(M.config.merge_pr_body_template_fn, commits)
@@ -2576,6 +2612,14 @@ local function merge_current_pr()
 				elseif type(tpl) == "table" then
 					body_lines = tpl
 				end
+			end
+		else
+			local tickets = {}
+			for ticket in (pr.title or ""):gmatch("[A-Z][A-Z0-9]+%-%d+") do
+				table.insert(tickets, ticket)
+			end
+			if #tickets > 0 then
+				body_lines = { "Fixes " .. table.concat(tickets, " ") }
 			end
 		end
 		vim.schedule(function()
@@ -2587,6 +2631,7 @@ local function merge_current_pr()
 				title = "Merge PR #" .. tostring(pr.id),
 				prompt = "Line 1: merge commit title. Next lines: commit body. <C-s> submit, q cancel",
 				initial_text = initial_text,
+				title_separator = true,
 			}, function(text)
 				local body = ""
 				if text:find("\n", 1, true) then
