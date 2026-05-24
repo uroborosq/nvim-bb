@@ -33,6 +33,8 @@ local default_config = {
 	merge_pr_map = "<leader>rm",
 	merge_pr_body_template_fn = nil,
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
+	draft_store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
+	draft_max_count = 50,
 }
 M.config = vim.deepcopy(default_config)
 
@@ -46,6 +48,7 @@ local state = {
 	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
+	drafts = {},
 }
 
 local function tab_key(tabpage)
@@ -188,6 +191,80 @@ local function persist_reaction_recency_state()
 		by_key = state.reaction_usage_by_key or {},
 	})
 	pcall(vim.fn.writefile, { payload }, path)
+end
+
+local function load_drafts()
+	local path = tostring(M.config.draft_store_path or "")
+	if path == "" then return end
+	local ok, lines = pcall(vim.fn.readfile, path)
+	if not ok or type(lines) ~= "table" or #lines == 0 then return end
+	local ok2, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+	if not ok2 or type(decoded) ~= "table" then return end
+	state.drafts = type(decoded.drafts) == "table" and decoded.drafts or {}
+end
+
+local function persist_drafts()
+	local path = tostring(M.config.draft_store_path or "")
+	if path == "" then return end
+	local dir = vim.fn.fnamemodify(path, ":h")
+	pcall(vim.fn.mkdir, dir, "p")
+	local payload = vim.json.encode({ drafts = state.drafts })
+	pcall(vim.fn.writefile, { payload }, path)
+end
+
+local function save_draft(key, text, base)
+	if not key or vim.trim(text or "") == "" then return end
+	local kept = {}
+	for _, d in ipairs(state.drafts) do
+		if d.key ~= key then
+			table.insert(kept, d)
+		end
+	end
+	table.insert(kept, { key = key, text = text, base = base, saved_at = os.time() })
+	local max = tonumber(M.config.draft_max_count or 50) or 50
+	if #kept > max then
+		table.sort(kept, function(a, b) return (a.saved_at or 0) > (b.saved_at or 0) end)
+		local trimmed = {}
+		for i = 1, max do trimmed[i] = kept[i] end
+		kept = trimmed
+	end
+	state.drafts = kept
+	persist_drafts()
+end
+
+local function get_draft(key)
+	if not key then return nil end
+	local found = nil
+	for _, d in ipairs(state.drafts) do
+		if d.key == key then
+			if not found or (d.saved_at or 0) > (found.saved_at or 0) then
+				found = d
+			end
+		end
+	end
+	return found
+end
+
+local function delete_draft(key)
+	if not key then return end
+	local kept = {}
+	for _, d in ipairs(state.drafts) do
+		if d.key ~= key then
+			table.insert(kept, d)
+		end
+	end
+	if #kept ~= #state.drafts then
+		state.drafts = kept
+		persist_drafts()
+	end
+end
+
+local function draft_age_label(saved_at)
+	local diff = os.time() - (saved_at or 0)
+	if diff < 60 then return diff .. "s ago"
+	elseif diff < 3600 then return math.floor(diff / 60) .. "m ago"
+	elseif diff < 86400 then return math.floor(diff / 3600) .. "h ago"
+	else return math.floor(diff / 86400) .. "d ago" end
 end
 
 local function with_repo_autodetect_flag(cmd)
@@ -2248,6 +2325,14 @@ local function open_multiline_comment_input(opts, on_submit)
 	opts = opts or {}
 	local title = opts.title or "Comment"
 	local prompt = opts.prompt or "Write text. <C-s> submit, q cancel"
+	local draft_key = opts.draft_key
+
+	local fresh_text = opts.initial_text
+	local existing_draft = draft_key and get_draft(draft_key)
+	local conflict = existing_draft
+		and existing_draft.base ~= nil
+		and existing_draft.base ~= (fresh_text or "")
+	local initial_text = (existing_draft and not conflict) and existing_draft.text or fresh_text
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].buftype = "nofile"
@@ -2256,8 +2341,8 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.bo[buf].filetype = "markdown"
 	vim.diagnostic.enable(false, { bufnr = buf })
 	local initial_lines = { "", "", "", "" }
-	if type(opts.initial_text) == "string" and opts.initial_text ~= "" then
-		initial_lines = vim.split(opts.initial_text, "\n", { plain = true })
+	if type(initial_text) == "string" and initial_text ~= "" then
+		initial_lines = vim.split(initial_text, "\n", { plain = true })
 	end
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
@@ -2276,31 +2361,77 @@ local function open_multiline_comment_input(opts, on_submit)
 	})
 	vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "<!-- " .. prompt .. " -->", "" })
 	vim.api.nvim_win_set_cursor(win, { 3, 0 })
-	if opts.title_separator then
-		local sep_line = 2 -- 0-indexed: prompt(0) + empty(1) + title(2)
+	local sep_ns = vim.api.nvim_create_namespace("bb_pr_merge_sep")
+	local function apply_separator()
+		if not opts.title_separator then return end
 		local sep_text = string.rep("─", math.max(40, math.floor(vim.o.columns * 0.5)))
-		local ns = vim.api.nvim_create_namespace("bb_pr_merge_sep")
-		vim.api.nvim_buf_set_extmark(buf, ns, sep_line, 0, {
+		vim.api.nvim_buf_clear_namespace(buf, sep_ns, 0, -1)
+		vim.api.nvim_buf_set_extmark(buf, sep_ns, 2, 0, {
 			virt_lines = { { { sep_text, "Comment" } } },
 			virt_lines_above = false,
 		})
 	end
+	apply_separator()
 
-	local function submit()
-		if not vim.api.nvim_buf_is_valid(buf) then
-			return
-		end
+	if existing_draft and not conflict then
+		vim.notify(
+			"bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")",
+			vim.log.levels.INFO
+		)
+	end
+
+	local submitted = false
+
+	local function get_typed_text()
+		if not vim.api.nvim_buf_is_valid(buf) then return "" end
 		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 		if #lines >= 2 and lines[1]:match("^%<%!%-%-") then
 			lines = vim.list_slice(lines, 3)
 		end
-		local text = table.concat(lines, "\n")
-		text = vim.trim(text)
+		return vim.trim(table.concat(lines, "\n"))
+	end
+
+	if conflict then
+		vim.notify(
+			string.format(
+				"bb_pr: draft from %s conflicts with updated template — <C-r> to restore draft",
+				draft_age_label(existing_draft.saved_at)
+			),
+			vim.log.levels.WARN
+		)
+		vim.keymap.set({ "n", "i" }, "<C-r>", function()
+			if not vim.api.nvim_buf_is_valid(buf) then return end
+			local draft_lines = vim.split(existing_draft.text, "\n", { plain = true })
+			local prompt_prefix = { "<!-- " .. prompt .. " -->", "" }
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend(prompt_prefix, draft_lines))
+			apply_separator()
+			vim.notify("bb_pr: draft loaded", vim.log.levels.INFO)
+		end, { buffer = buf, silent = true })
+	end
+
+	local function submit()
+		if not vim.api.nvim_buf_is_valid(buf) then return end
+		local text = get_typed_text()
+		submitted = true
+		delete_draft(draft_key)
 		pcall(vim.api.nvim_win_close, win, true)
 		if text ~= "" then
 			on_submit(text)
 		end
 	end
+
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(win),
+		once = true,
+		callback = function()
+			if not submitted and draft_key then
+				local text = get_typed_text()
+				if text ~= "" then
+					save_draft(draft_key, text, fresh_text or "")
+				end
+			end
+		end,
+	})
 
 	vim.keymap.set("n", "q", function()
 		pcall(vim.api.nvim_win_close, win, true)
@@ -2388,6 +2519,27 @@ local function open_create_pr_editor(source_branch, target_branch)
 	end
 
 	local function do_open(default_title)
+		local pr_draft_key = "create_pr:" .. source_branch .. ":" .. target_branch
+		local fresh_base = vim.json.encode({
+			title = default_title,
+			body = table.concat(resolve_pr_body_template_lines(), "\n"),
+		})
+		local existing_draft = get_draft(pr_draft_key)
+		local pr_conflict = existing_draft
+			and existing_draft.base ~= nil
+			and existing_draft.base ~= fresh_base
+		local draft_title = default_title
+		local draft_body_lines = resolve_pr_body_template_lines()
+		if existing_draft and not pr_conflict then
+			local ok, d = pcall(vim.json.decode, existing_draft.text)
+			if ok and type(d) == "table" then
+				if type(d.title) == "string" and d.title ~= "" then draft_title = d.title end
+				if type(d.body) == "string" then
+					draft_body_lines = vim.split(d.body, "\n", { plain = true })
+				end
+			end
+		end
+
 		local buf = vim.api.nvim_create_buf(false, true)
 		vim.bo[buf].buftype = "nofile"
 		vim.bo[buf].bufhidden = "wipe"
@@ -2395,11 +2547,11 @@ local function open_create_pr_editor(source_branch, target_branch)
 		vim.bo[buf].filetype = "markdown"
 		vim.diagnostic.enable(false, { bufnr = buf })
 		local initial_lines = {
-			"Title: " .. default_title,
+			"Title: " .. draft_title,
 			"",
 			"Body:",
 		}
-		vim.list_extend(initial_lines, resolve_pr_body_template_lines())
+		vim.list_extend(initial_lines, draft_body_lines)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
 		local width = math.max(90, math.floor(vim.o.columns * 0.7))
@@ -2416,6 +2568,45 @@ local function open_create_pr_editor(source_branch, target_branch)
 			title_pos = "center",
 		})
 
+		if existing_draft and not pr_conflict then
+			vim.notify(
+				"bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")",
+				vim.log.levels.INFO
+			)
+		end
+
+		local submitted = false
+
+		local function get_pr_draft_text()
+			if not vim.api.nvim_buf_is_valid(buf) then return nil end
+			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
+			local body_parts = {}
+			for i = 4, #lines do table.insert(body_parts, lines[i]) end
+			return vim.json.encode({ title = title, body = table.concat(body_parts, "\n") })
+		end
+
+		if pr_conflict then
+			vim.notify(
+				string.format(
+					"bb_pr: draft from %s conflicts with updated template — <C-r> to restore draft",
+					draft_age_label(existing_draft.saved_at)
+				),
+				vim.log.levels.WARN
+			)
+			vim.keymap.set({ "n", "i" }, "<C-r>", function()
+				if not vim.api.nvim_buf_is_valid(buf) then return end
+				local ok, d = pcall(vim.json.decode, existing_draft.text)
+				if not ok or type(d) ~= "table" then return end
+				local restored_lines = { "Title: " .. (d.title or ""), "", "Body:" }
+				if type(d.body) == "string" then
+					vim.list_extend(restored_lines, vim.split(d.body, "\n", { plain = true }))
+				end
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, restored_lines)
+				vim.notify("bb_pr: draft loaded", vim.log.levels.INFO)
+			end, { buffer = buf, silent = true })
+		end
+
 		local function submit()
 			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
@@ -2428,6 +2619,8 @@ local function open_create_pr_editor(source_branch, target_branch)
 				vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
 				return
 			end
+			submitted = true
+			delete_draft(pr_draft_key)
 			pcall(vim.api.nvim_win_close, win, true)
 			local cmd = bb_cmd({
 				"-json",
@@ -2453,6 +2646,17 @@ local function open_create_pr_editor(source_branch, target_branch)
 				end)
 			end)
 		end
+
+		vim.api.nvim_create_autocmd("WinClosed", {
+			pattern = tostring(win),
+			once = true,
+			callback = function()
+				if not submitted then
+					local text = get_pr_draft_text()
+					if text then save_draft(pr_draft_key, text, fresh_base) end
+				end
+			end,
+		})
 
 		local function toggle_draft()
 			local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
@@ -2632,6 +2836,7 @@ local function merge_current_pr()
 				prompt = "Line 1: merge commit title. Next lines: commit body. <C-s> submit, q cancel",
 				initial_text = initial_text,
 				title_separator = true,
+				draft_key = "merge:" .. tostring(pr.id),
 			}, function(text)
 				local body = ""
 				if text:find("\n", 1, true) then
@@ -3149,10 +3354,19 @@ local function post_comment_or_task(is_task, force_reply, opts)
 				suggestion_line = current_line
 			end
 		end
+		local comment_draft_key
+		if reply_to and reply_to > 0 then
+			comment_draft_key = "comment:reply:" .. tostring(reply_to)
+		elseif ctx and ctx.mode == "new_file" then
+			comment_draft_key = "comment:file:" .. tostring(pr.id) .. ":" .. tostring(ctx.path or "") .. ":" .. tostring(ctx.line or 0)
+		else
+			comment_draft_key = "comment:overview:" .. tostring(pr.id)
+		end
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
 			prompt = "Write multiline text. <C-s> submit, q cancel",
 			initial_text = opts.initial_text,
+			draft_key = comment_draft_key,
 		}, function(text)
 			local cmd = bb_cmd({ "-json", "-pr-comment", tostring(pr.id), "-text", text })
 			if is_task then
@@ -3244,6 +3458,7 @@ end
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
+	load_drafts()
 
 	vim.api.nvim_set_hl(0, "BbPrResolvedThread", { default = true, underline = true, sp = "Gray" })
 	vim.api.nvim_set_hl(0, "BbPrResolvedVirtText", { default = true, link = "Comment" })
