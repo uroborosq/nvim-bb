@@ -40,7 +40,8 @@ type Config struct {
 	JSONOutput  bool   `json:"json_output"`
 	CurrentUser string `json:"current_user"`
 
-	Repos map[string]string `json:"repos"`
+	Repos       map[string]string `json:"repos"`
+	TerminalCmd []string          `json:"terminal_cmd"`
 }
 
 type RuntimeConfig struct {
@@ -740,12 +741,20 @@ func runOpenCommand(args []string) error {
 		return err
 	}
 
+	gitCheck := exec.Command("git", "diff", "--quiet", "HEAD")
+	gitCheck.Dir = folder
+	if err := gitCheck.Run(); err != nil {
+		return fmt.Errorf("cannot open PR: repo %s has staged or uncommitted changes (stash or commit them first)", folder)
+	}
+
 	luaCode := fmt.Sprintf(`require("bb_pr").open_pr(%d, %s)`, target.PRID, luaOpenOpts(target.CommentID))
 
 	sock := findNvimSocketForFolder(folder)
 	if sock != "" {
 		expr := fmt.Sprintf("luaeval(%s)", vimSingleQuote(luaCode))
-		out, err := exec.Command("nvim", "--server", sock, "--remote-expr", expr).CombinedOutput()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "nvim", "--server", sock, "--remote-expr", expr).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("send to nvim %s: %w (%s)", sock, err, strings.TrimSpace(string(out)))
 		}
@@ -753,12 +762,17 @@ func runOpenCommand(args []string) error {
 		return nil
 	}
 
-	cmd := exec.Command("nvim", "+lua "+luaCode)
+	if len(cfg.TerminalCmd) == 0 {
+		return fmt.Errorf("no nvim instance found for %s and terminal_cmd is not set in config", folder)
+	}
+	termArgs := append(append([]string{}, cfg.TerminalCmd[1:]...), "nvim", "+lua "+luaCode)
+	cmd := exec.Command(cfg.TerminalCmd[0], termArgs...)
 	cmd.Dir = folder
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("launch terminal: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "bb: opening PR #%d in new terminal at %s\n", target.PRID, folder)
+	return nil
 }
 
 func parseBitbucketPRURL(raw string) (*openTarget, error) {
@@ -868,7 +882,9 @@ func findNvimSocketForFolder(folder string) string {
 	}
 
 	for _, sock := range sockets {
-		out, err := exec.Command("nvim", "--server", sock, "--remote-expr", "getcwd()").Output()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, err := exec.CommandContext(ctx, "nvim", "--server", sock, "--remote-expr", "getcwd()").Output()
+		cancel()
 		if err != nil {
 			continue
 		}
