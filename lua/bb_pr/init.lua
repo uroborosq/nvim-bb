@@ -39,6 +39,13 @@ local default_config = {
 	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 	draft_store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
 	draft_max_count = 50,
+	stats_map = "<leader>rS",
+	stats_repos = "",
+	stats_project = "",
+	stats_since_days = 30,
+	stats_concurrency = 10,
+	stats_top = 20,
+	stats_ignore_users = "",
 }
 M.config = vim.deepcopy(default_config)
 
@@ -3622,6 +3629,185 @@ local function open_attachment_at_cursor()
 	end)
 end
 
+local function stats_detect_context()
+	-- Try current tab PR first (most reliable — already fetched from Bitbucket).
+	local pr = get_current_tab_pr()
+	if pr then
+		local repo_slug = vim.tbl_get(pr, "toRef", "repository", "slug")
+			or vim.tbl_get(pr, "fromRef", "repository", "slug")
+		local proj_key = vim.tbl_get(pr, "toRef", "repository", "project", "key")
+			or vim.tbl_get(pr, "fromRef", "repository", "project", "key")
+		if repo_slug then
+			return repo_slug, proj_key or ""
+		end
+	end
+
+	-- Fall back: parse git remote in the current working directory.
+	local remote = vim.trim(vim.fn.system({ "git", "remote", "get-url", "origin" }))
+	if remote == "" then
+		remote = vim.trim(vim.fn.system({ "git", "remote", "get-url", "upstream" }))
+	end
+	if remote ~= "" then
+		-- strip trailing .git and extract last two path components: .../PROJECT/REPO
+		remote = remote:gsub("%.git$", "")
+		local proj, repo = remote:match("/([^/]+)/([^/]+)$")
+		-- Bitbucket SSH URLs have /scm/PROJECT/REPO — skip "scm" level
+		if proj and proj:lower() == "scm" then
+			proj, repo = remote:match("/scm/([^/]+)/([^/]+)$")
+		end
+		if repo and repo ~= "" then
+			return repo, proj and proj:upper() or ""
+		end
+	end
+
+	return "", ""
+end
+
+function M.show_stats(opts)
+	opts = opts or {}
+	local repos = opts.repos or M.config.stats_repos or ""
+	local project = opts.project or M.config.stats_project or ""
+	local since_days = opts.since_days or M.config.stats_since_days or 30
+	local concurrency = opts.concurrency or M.config.stats_concurrency or 10
+	local top = opts.top or M.config.stats_top or 20
+	local ignore_users = opts.ignore_users or M.config.stats_ignore_users or ""
+
+	-- Auto-detect repo/project from current context when not explicitly configured.
+	if repos == "" or project == "" then
+		local detected_repo, detected_proj = stats_detect_context()
+		if repos == "" then repos = detected_repo end
+		if project == "" then project = detected_proj end
+	end
+
+	if repos == "" then
+		vim.ui.input({ prompt = "Repos (comma-separated slugs): " }, function(input)
+			if input and vim.trim(input) ~= "" then
+				opts.repos = vim.trim(input)
+				M.show_stats(opts)
+			end
+		end)
+		return
+	end
+
+	if not opts._period_selected then
+		local default_days = tostring(M.config.stats_since_days or 30)
+		local period_choices = { "7", "14", "30", "60", "90", "180", "365", "0" }
+		-- Bubble the configured default to the top so pickers pre-select it.
+		table.sort(period_choices, function(a, b)
+			if a == default_days then return true end
+			if b == default_days then return false end
+			return false
+		end)
+		vim.ui.select(period_choices, {
+			prompt = "Period:",
+			format_item = function(item)
+				local n = tonumber(item)
+				local label
+				if not n or n == 0 then
+					label = "All time"
+				else
+					label = string.format("Last %d days", n)
+				end
+				if item == default_days then
+					label = label .. " (default)"
+				end
+				return label
+			end,
+		}, function(choice)
+			if not choice then return end
+			opts.since_days = tonumber(choice) or 0
+			opts.repos = repos
+			opts.project = project
+			opts._period_selected = true
+			M.show_stats(opts)
+		end)
+		return
+	end
+
+	local cmd = { "bb", "stats", "-repos", repos }
+	if project ~= "" then
+		vim.list_extend(cmd, { "-project", project })
+	end
+	vim.list_extend(cmd, { "-since-days", tostring(since_days) })
+	vim.list_extend(cmd, { "-concurrency", tostring(concurrency) })
+	vim.list_extend(cmd, { "-top", tostring(top) })
+	if ignore_users ~= "" then
+		vim.list_extend(cmd, { "-ignore-users", ignore_users })
+	end
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+		"",
+		"  Fetching PR stats…",
+		"",
+		string.format("  repos:   %s", repos),
+		string.format("  period:  last %d days", since_days),
+		string.format("  cmd:     %s", table.concat(cmd, " ")),
+	})
+
+	local width = math.min(vim.o.columns - 4, 120)
+	local height = math.min(vim.o.lines - 4, 50)
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = " BB PR Stats ",
+		title_pos = "center",
+	})
+	_ = win
+
+	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+	vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { buffer = buf, silent = true })
+
+	vim.system(cmd, { text = true }, function(res)
+		vim.schedule(function()
+			if not vim.api.nvim_buf_is_valid(buf) then return end
+			vim.bo[buf].modifiable = true
+
+			if res.code ~= 0 then
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+					"",
+					"  Error running bb stats:",
+					"",
+					"  " .. (res.stderr or "unknown error"),
+					"",
+					"  Command: " .. table.concat(cmd, " "),
+				})
+				vim.bo[buf].modifiable = false
+				return
+			end
+
+			local ok, data = pcall(vim.json.decode, res.stdout)
+			if not ok or type(data) ~= "table" then
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+					"",
+					"  Failed to parse stats output:",
+					"",
+					"  " .. tostring(data),
+				})
+				vim.bo[buf].modifiable = false
+				return
+			end
+
+			local stats_mod = require("bb_pr.stats")
+			local lines, highlights = stats_mod.render(data)
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+			local ns = vim.api.nvim_create_namespace("bb_pr_stats")
+			for _, h in ipairs(highlights) do
+				pcall(vim.api.nvim_buf_add_highlight, buf, ns, h.group, h.line, h.col_start, h.col_end)
+			end
+
+			vim.bo[buf].modifiable = false
+		end)
+	end)
+end
+
 function M.setup(opts)
 	merge_config(opts)
 	load_reaction_recency_state()
@@ -3871,6 +4057,14 @@ function M.setup(opts)
 		vim.keymap.set("n", M.config.image_open_map, function()
 			open_attachment_at_cursor()
 		end, { desc = "Download and open attachment under cursor", silent = true })
+	end
+
+	vim.api.nvim_create_user_command("BBPRStats", function()
+		M.show_stats()
+	end, { desc = "Show PR statistics in a floating window" })
+
+	if M.config.stats_map and M.config.stats_map ~= "" then
+		vim.keymap.set("n", M.config.stats_map, "<cmd>BBPRStats<CR>", { desc = "BB PR Stats", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })

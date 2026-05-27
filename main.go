@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 )
@@ -43,10 +45,10 @@ type Config struct {
 	Repos       map[string]string `json:"repos"`
 	TerminalCmd []string          `json:"terminal_cmd"`
 
-	JiraBaseURL string `json:"jira_base_url"`
-	JiraAuth    string `json:"jira_auth"`     // bearer | basic | none
-	JiraToken   string `json:"jira_token"`
-	JiraUser    string `json:"jira_user"`
+	JiraBaseURL  string `json:"jira_base_url"`
+	JiraAuth     string `json:"jira_auth"` // bearer | basic | none
+	JiraToken    string `json:"jira_token"`
+	JiraUser     string `json:"jira_user"`
 	JiraPassword string `json:"jira_password"`
 }
 
@@ -79,6 +81,7 @@ type PullRequest struct {
 	CommentCount int    `json:"commentCount"`
 	CreatedDate  int64  `json:"createdDate"`
 	UpdatedDate  int64  `json:"updatedDate"`
+	ClosedDate   int64  `json:"closedDate"`
 
 	Author struct {
 		User User `json:"user"`
@@ -147,11 +150,11 @@ type CommentPage struct {
 }
 
 type PRComment struct {
-	ID            int64       `json:"id"`
-	Text          string      `json:"text"`
-	CreatedDate   int64       `json:"createdDate"`
-	UpdatedDate   int64       `json:"updatedDate"`
-	Version       int         `json:"version"`
+	ID             int64       `json:"id"`
+	Text           string      `json:"text"`
+	CreatedDate    int64       `json:"createdDate"`
+	UpdatedDate    int64       `json:"updatedDate"`
+	Version        int         `json:"version"`
 	Anchor         *Anchor     `json:"anchor,omitempty"`
 	CommentAnchor  *Anchor     `json:"commentAnchor,omitempty"`
 	Comments       []PRComment `json:"comments,omitempty"`
@@ -382,6 +385,13 @@ type PRCommitPage struct {
 	NextPageStart int        `json:"nextPageStart"`
 }
 
+type CommitPage struct {
+	Values        []PRCommit `json:"values"`
+	IsLastPage    bool       `json:"isLastPage"`
+	NextPageStart int        `json:"nextPageStart"`
+	Size          int        `json:"size"`
+}
+
 type PullRequestMergeability struct {
 	CanMerge bool `json:"canMerge"`
 	Vetoes   []struct {
@@ -541,6 +551,12 @@ func main() {
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "dashboard" {
 		if err := runDashboardCommand(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "stats" {
+		if err := runStatsCommand(os.Args[2:]); err != nil {
 			fatal(err)
 		}
 		return
@@ -2238,11 +2254,15 @@ func isCurrentUser(u User, candidates []string) bool {
 
 func prSortBucket(pr PullRequest, candidates []string) int {
 	if isCurrentUser(pr.Author.User, candidates) {
-		return 4
+		return 5
 	}
+	isDraft := strings.Contains(pr.Title, "[DRAFT]")
 	for _, reviewer := range pr.Reviewers {
 		if !isCurrentUser(reviewer.User, candidates) {
 			continue
+		}
+		if isDraft {
+			return 4
 		}
 		status := strings.ToUpper(strings.TrimSpace(reviewer.Status))
 		if reviewer.Approved || status == "APPROVED" {
@@ -2251,6 +2271,9 @@ func prSortBucket(pr PullRequest, candidates []string) int {
 		if status == "NEEDS_WORK" {
 			return 2
 		}
+	}
+	if isDraft {
+		return 4
 	}
 	return 1
 }
@@ -2395,15 +2418,15 @@ func GetJiraIssue(ctx context.Context, cfg RuntimeConfig, issueKey string) (*Jir
 	var raw struct {
 		Key    string `json:"key"`
 		Fields struct {
-			Summary     string    `json:"summary"`
-			Description string    `json:"description"`
-			IssueType   namedField `json:"issuetype"`
-			Status      namedField `json:"status"`
-			Priority    namedField `json:"priority"`
-			Assignee    namedField `json:"assignee"`
-			Reporter    namedField `json:"reporter"`
+			Summary     string       `json:"summary"`
+			Description string       `json:"description"`
+			IssueType   namedField   `json:"issuetype"`
+			Status      namedField   `json:"status"`
+			Priority    namedField   `json:"priority"`
+			Assignee    namedField   `json:"assignee"`
+			Reporter    namedField   `json:"reporter"`
 			FixVersions []namedField `json:"fixVersions"`
-			EpicLink    string    `json:"customfield_10014"`
+			EpicLink    string       `json:"customfield_10014"`
 			Comment     struct {
 				Comments []struct {
 					Author  namedField `json:"author"`
@@ -2440,6 +2463,679 @@ func GetJiraIssue(ctx context.Context, cfg RuntimeConfig, issueKey string) (*Jir
 		})
 	}
 	return issue, nil
+}
+
+// ── stats subcommand ─────────────────────────────────────────────────────────
+
+const defaultIgnoredUsers = "bitbucket.system-user,Code Owners for Bitbucket,Code Owners for BitBucket,tb-service-acc-1,Bitbucket,AI Code Assistant"
+
+type prStatEntry struct {
+	pr   PullRequest
+	repo string
+}
+
+type activityEntry struct {
+	prID       int64
+	repo       string
+	activities []Activity
+}
+
+type StatsResult struct {
+	Summary             StatsSummary      `json:"summary"`
+	UserComments        []UserCount       `json:"user_comments"`
+	UserApprovals       []UserCount       `json:"user_approvals"`
+	UserCommits         []UserCount       `json:"user_commits"`
+	PROpenDuration      DistributionStats `json:"pr_open_duration"`
+	OpenToFirstComment  DistributionStats `json:"open_to_first_comment"`
+	FirstCommentToMerge DistributionStats `json:"first_comment_to_merge"`
+	CommentDistribution DistributionStats `json:"comment_distribution"`
+	TopLongestPRs       []LongestPR       `json:"top_longest_prs"`
+	TopAuthorPRCount    []UserCount       `json:"top_author_pr_count"`
+	TopAuthorDuration   []UserCount       `json:"top_author_duration"`
+	TopAuthorLongRatio  []UserCount       `json:"top_author_long_ratio"`
+	Warnings            []string          `json:"warnings,omitempty"`
+}
+
+type StatsSummary struct {
+	Project    string   `json:"project"`
+	Repos      []string `json:"repos"`
+	TotalPRs   int      `json:"total_prs"`
+	SinceDays  int      `json:"since_days"`
+	SinceDate  string   `json:"since_date,omitempty"`
+	AnalyzedAt string   `json:"analyzed_at"`
+}
+
+type UserCount struct {
+	User  string `json:"user"`
+	Count int    `json:"count"`
+}
+
+type HistogramBucket struct {
+	Label string  `json:"label"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	Count int     `json:"count"`
+}
+
+type DistributionStats struct {
+	Count     int               `json:"count"`
+	Mean      float64           `json:"mean"`
+	Median    float64           `json:"median"`
+	Min       float64           `json:"min"`
+	Max       float64           `json:"max"`
+	Std       float64           `json:"std"`
+	P25       float64           `json:"p25"`
+	P75       float64           `json:"p75"`
+	P90       float64           `json:"p90"`
+	P95       float64           `json:"p95"`
+	Histogram []HistogramBucket `json:"histogram"`
+}
+
+type LongestPR struct {
+	ID            int64   `json:"id"`
+	Title         string  `json:"title"`
+	Repo          string  `json:"repo"`
+	Author        string  `json:"author"`
+	DurationHours float64 `json:"duration_hours"`
+}
+
+func runStatsCommand(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	projectFlag := fs.String("project", "", "project key (defaults to config.project)")
+	reposFlag := fs.String("repos", "", "comma-separated repo slugs (required)")
+	sinceDays := fs.Int("since-days", 90, "days to look back (0 = all time)")
+	stateFlag := fs.String("state", "MERGED", "PR state: OPEN|MERGED|DECLINED|ALL")
+	concurrency := fs.Int("concurrency", 10, "max parallel activity requests")
+	topN := fs.Int("top", 20, "number of longest PRs to include")
+	ignoreUsersFlag := fs.String("ignore-users", defaultIgnoredUsers, "comma-separated display names to ignore")
+	timeoutFlag := fs.String("timeout", "5m", "overall timeout")
+	numBuckets := fs.Int("buckets", 8, "histogram bucket count")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	reposRaw := strings.TrimSpace(*reposFlag)
+	if reposRaw == "" {
+		return errors.New("-repos is required: comma-separated list of repo slugs")
+	}
+	repos := splitTrimmed(reposRaw, ",")
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
+	project := cfg.Project
+	if p := strings.TrimSpace(*projectFlag); p != "" {
+		project = p
+	}
+	if project == "" {
+		return errors.New("-project is required (or set config.project)")
+	}
+
+	dur, err := time.ParseDuration(*timeoutFlag)
+	if err != nil {
+		return fmt.Errorf("bad -timeout: %w", err)
+	}
+	cfg.TimeoutDuration = dur
+
+	var cutoff time.Time
+	if *sinceDays > 0 {
+		cutoff = time.Now().UTC().Add(-time.Duration(*sinceDays) * 24 * time.Hour)
+	}
+
+	ignoredMap := map[string]bool{}
+	for _, u := range splitTrimmed(*ignoreUsersFlag, ",") {
+		ignoredMap[u] = true
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutDuration)
+	defer cancel()
+
+	// Stage 1: fetch PR lists and repo commits from all repos in parallel.
+	type repoResult struct {
+		repo string
+		prs  []PullRequest
+		err  error
+	}
+	type commitResult struct {
+		repo    string
+		commits []PRCommit
+		err     error
+	}
+	repoCh := make(chan repoResult, len(repos))
+	commitCh := make(chan commitResult, len(repos))
+	for _, repo := range repos {
+		repo := repo
+		go func() {
+			prs, err := statsAllPRs(ctx, client, project, repo, *stateFlag, cutoff)
+			repoCh <- repoResult{repo: repo, prs: prs, err: err}
+		}()
+		go func() {
+			commits, err := statsRepoCommits(ctx, client, project, repo, cutoff)
+			commitCh <- commitResult{repo: repo, commits: commits, err: err}
+		}()
+	}
+
+	var allPRs []prStatEntry
+	var allCommits []PRCommit
+	var warnings []string
+	for range repos {
+		r := <-repoCh
+		if r.err != nil {
+			warnings = append(warnings, fmt.Sprintf("repo %s: fetch PRs: %v", r.repo, r.err))
+			continue
+		}
+		for _, pr := range r.prs {
+			allPRs = append(allPRs, prStatEntry{pr: pr, repo: r.repo})
+		}
+	}
+	for range repos {
+		r := <-commitCh
+		if r.err != nil {
+			warnings = append(warnings, fmt.Sprintf("repo %s: fetch commits: %v", r.repo, r.err))
+			continue
+		}
+		allCommits = append(allCommits, r.commits...)
+	}
+
+	// Stage 2: fetch activities for every PR, bounded by semaphore.
+	sem := make(chan struct{}, *concurrency)
+	actResults := make([]activityEntry, len(allPRs))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for i, pe := range allPRs {
+		i, pe := i, pe
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			activities, err := statsAllActivities(ctx, client, project, pe.repo, pe.pr.ID)
+			if err != nil {
+				mu.Lock()
+				warnings = append(warnings, fmt.Sprintf("PR #%d in %s: %v", pe.pr.ID, pe.repo, err))
+				mu.Unlock()
+				return
+			}
+			actResults[i] = activityEntry{prID: pe.pr.ID, repo: pe.repo, activities: activities}
+		}()
+	}
+	wg.Wait()
+
+	result := computePRStats(allPRs, actResults, ignoredMap, project, repos, *sinceDays, cutoff, *topN, *numBuckets)
+
+	commitCounts := map[string]int{}
+	for _, c := range allCommits {
+		author := c.Author.Name
+		if author == "" {
+			author = c.Author.DisplayName
+		}
+		if author == "" || ignoredMap[author] {
+			continue
+		}
+		commitCounts[author]++
+	}
+	result.UserCommits = sortedUserCounts(commitCounts)
+	result.Warnings = append(result.Warnings, warnings...)
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(result)
+}
+
+func statsAllPRs(ctx context.Context, c *Client, project, repo, state string, cutoff time.Time) ([]PullRequest, error) {
+	var all []PullRequest
+	start := 0
+	cutoffMs := cutoff.UnixMilli()
+
+	for {
+		path := fmt.Sprintf(
+			"/rest/api/latest/projects/%s/repos/%s/pull-requests?state=%s&order=NEWEST&limit=100&start=%d",
+			url.PathEscape(project), url.PathEscape(repo), url.QueryEscape(state), start,
+		)
+		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page PRPage
+		if err := json.Unmarshal(b, &page); err != nil {
+			return nil, fmt.Errorf("decode PR page for %s: %w", repo, err)
+		}
+
+		for _, pr := range page.Values {
+			if cutoffMs > 0 && pr.CreatedDate < cutoffMs {
+				return all, nil
+			}
+			all = append(all, pr)
+		}
+
+		if page.IsLastPage {
+			break
+		}
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size > 0 {
+				next = start + page.Size
+			} else {
+				break
+			}
+		}
+		start = next
+	}
+	return all, nil
+}
+
+func statsRepoCommits(ctx context.Context, c *Client, project, repo string, cutoff time.Time) ([]PRCommit, error) {
+	var all []PRCommit
+	start := 0
+	cutoffMs := cutoff.UnixMilli()
+
+	for {
+		path := fmt.Sprintf(
+			"/rest/api/latest/projects/%s/repos/%s/commits?limit=100&start=%d",
+			url.PathEscape(project), url.PathEscape(repo), start,
+		)
+		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page CommitPage
+		if err := json.Unmarshal(b, &page); err != nil {
+			return nil, fmt.Errorf("decode commit page for %s: %w", repo, err)
+		}
+
+		for _, commit := range page.Values {
+			if cutoffMs > 0 && commit.AuthorTime < cutoffMs {
+				return all, nil
+			}
+			all = append(all, commit)
+		}
+
+		if page.IsLastPage {
+			break
+		}
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size > 0 {
+				next = start + page.Size
+			} else {
+				break
+			}
+		}
+		start = next
+	}
+	return all, nil
+}
+
+func statsAllActivities(ctx context.Context, c *Client, project, repo string, prID int64) ([]Activity, error) {
+	var all []Activity
+	start := 0
+
+	for {
+		path := fmt.Sprintf(
+			"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/activities?limit=100&start=%d",
+			url.PathEscape(project), url.PathEscape(repo), prID, start,
+		)
+		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page ActivityPage
+		if err := json.Unmarshal(b, &page); err != nil {
+			return nil, fmt.Errorf("decode activity page: %w", err)
+		}
+		all = append(all, page.Values...)
+		if page.IsLastPage {
+			break
+		}
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size > 0 {
+				next = start + page.Size
+			} else {
+				break
+			}
+		}
+
+		start = next
+	}
+	return all, nil
+}
+
+type prStatKey struct {
+	id   int64
+	repo string
+}
+
+func computePRStats(
+	prEntries []prStatEntry,
+	actResults []activityEntry,
+	ignored map[string]bool,
+	project string,
+	repos []string,
+	sinceDays int,
+	cutoff time.Time,
+	topN int,
+	numBuckets int,
+) StatsResult {
+	prAuthor := map[prStatKey]string{}
+	for _, pe := range prEntries {
+		prAuthor[prStatKey{pe.pr.ID, pe.repo}] = pe.pr.Author.User.DisplayName
+	}
+
+	commentCounts := map[string]int{}
+	approvalCounts := map[string]int{}
+
+	type timeMeta struct {
+		createdMs      int64
+		closedMs       int64
+		state          string
+		firstCommentMs int64
+	}
+	metas := map[prStatKey]timeMeta{}
+	for _, pe := range prEntries {
+		k := prStatKey{pe.pr.ID, pe.repo}
+		metas[k] = timeMeta{
+			createdMs: pe.pr.CreatedDate,
+			closedMs:  pe.pr.ClosedDate,
+			state:     pe.pr.State,
+		}
+	}
+
+	prCommentCounts := map[prStatKey]int{}
+
+	for _, ae := range actResults {
+		if ae.activities == nil {
+			continue
+		}
+		k := prStatKey{ae.prID, ae.repo}
+		author := prAuthor[k]
+		meta := metas[k]
+
+		for _, act := range ae.activities {
+			user := act.User.DisplayName
+			if user == "" {
+				user = act.User.Name
+			}
+			if ignored[user] {
+				continue
+			}
+
+			if act.Action == "COMMENTED" && act.Comment != nil {
+				if user != author {
+					commentCounts[user]++
+					prCommentCounts[k]++
+				}
+				if t := act.Comment.CreatedDate; t > 0 {
+					if meta.firstCommentMs == 0 || t < meta.firstCommentMs {
+						meta.firstCommentMs = t
+					}
+				}
+			}
+			if act.Action == "APPROVED" {
+				approvalCounts[user]++
+			}
+		}
+		metas[k] = meta
+	}
+
+	var openDurations, openToFirst, firstToMerge, commentDist []float64
+
+	type durEntry struct {
+		id     int64
+		repo   string
+		title  string
+		author string
+		hours  float64
+	}
+	var durEntries []durEntry
+	authorHours := map[string][]float64{}
+
+	for _, pe := range prEntries {
+		k := prStatKey{pe.pr.ID, pe.repo}
+		m := metas[k]
+
+		if pe.pr.State == "MERGED" && m.createdMs > 0 && m.closedMs > 0 {
+			h := float64(m.closedMs-m.createdMs) / (3600 * 1000)
+			if h >= 0 {
+				openDurations = append(openDurations, h)
+				author := prAuthor[k]
+				durEntries = append(durEntries, durEntry{id: pe.pr.ID, repo: pe.repo, title: pe.pr.Title, author: author, hours: h})
+				if author != "" && !ignored[author] {
+					authorHours[author] = append(authorHours[author], h)
+				}
+			}
+		}
+
+		if m.firstCommentMs > 0 && m.createdMs > 0 {
+			h := float64(m.firstCommentMs-m.createdMs) / (3600 * 1000)
+			if h >= 0 {
+				openToFirst = append(openToFirst, h)
+			}
+			if pe.pr.State == "MERGED" && m.closedMs > 0 {
+				h2 := float64(m.closedMs-m.firstCommentMs) / (3600 * 1000)
+				if h2 >= 0 {
+					firstToMerge = append(firstToMerge, h2)
+				}
+			}
+		}
+
+		if cnt := prCommentCounts[k]; cnt > 0 {
+			commentDist = append(commentDist, float64(cnt))
+		}
+	}
+
+	sort.Slice(durEntries, func(i, j int) bool { return durEntries[i].hours > durEntries[j].hours })
+	ratioN := len(durEntries) / 10
+	if ratioN < 1 && len(durEntries) > 0 {
+		ratioN = 1
+	}
+	top := make([]LongestPR, 0, ratioN)
+	for i, d := range durEntries {
+		if i >= ratioN {
+			break
+		}
+		top = append(top, LongestPR{ID: d.id, Title: d.title, Repo: d.repo, Author: d.author, DurationHours: round2(d.hours)})
+	}
+
+	// Total merged PRs per author (denominator for ratio).
+	authorPRCount := map[string]int{}
+	for _, pe := range prEntries {
+		if pe.pr.State == "MERGED" {
+			author := prAuthor[prStatKey{pe.pr.ID, pe.repo}]
+			if author != "" && !ignored[author] {
+				authorPRCount[author]++
+			}
+		}
+	}
+
+	// How many of each author's PRs landed in the p90 top list.
+	topAuthorHits := map[string]int{}
+	for i, d := range durEntries {
+		if i >= ratioN {
+			break
+		}
+		if d.author != "" {
+			topAuthorHits[d.author]++
+		}
+	}
+	authorPRSlice := sortedUserCounts(topAuthorHits)
+	if len(authorPRSlice) > topN {
+		authorPRSlice = authorPRSlice[:topN]
+	}
+
+	authorAvg := make([]UserCount, 0, len(authorHours))
+	for author, hours := range authorHours {
+		sum := 0.0
+		for _, h := range hours {
+			sum += h
+		}
+		authorAvg = append(authorAvg, UserCount{User: author, Count: int(math.Round(sum / float64(len(hours))))})
+	}
+	sort.Slice(authorAvg, func(i, j int) bool { return authorAvg[i].Count > authorAvg[j].Count })
+	if len(authorAvg) > topN {
+		authorAvg = authorAvg[:topN]
+	}
+
+	longRatio := make([]UserCount, 0, len(topAuthorHits))
+	for author, hits := range topAuthorHits {
+		total := authorPRCount[author]
+		if total == 0 {
+			continue
+		}
+		pct := int(math.Round(float64(hits) / float64(total) * 100))
+		longRatio = append(longRatio, UserCount{User: author, Count: pct})
+	}
+	sort.Slice(longRatio, func(i, j int) bool { return longRatio[i].Count > longRatio[j].Count })
+	if len(longRatio) > topN {
+		longRatio = longRatio[:topN]
+	}
+
+	sinceStr := ""
+	if !cutoff.IsZero() {
+		sinceStr = cutoff.UTC().Format(time.RFC3339)
+	}
+
+	return StatsResult{
+		Summary: StatsSummary{
+			Project:    project,
+			Repos:      repos,
+			TotalPRs:   len(prEntries),
+			SinceDays:  sinceDays,
+			SinceDate:  sinceStr,
+			AnalyzedAt: time.Now().UTC().Format(time.RFC3339),
+		},
+		UserComments:        sortedUserCounts(commentCounts),
+		UserApprovals:       sortedUserCounts(approvalCounts),
+		PROpenDuration:      computeDistribution(openDurations, numBuckets, "h"),
+		OpenToFirstComment:  computeDistribution(openToFirst, numBuckets, "h"),
+		FirstCommentToMerge: computeDistribution(firstToMerge, numBuckets, "h"),
+		CommentDistribution: computeDistribution(commentDist, numBuckets, ""),
+		TopLongestPRs:       top,
+		TopAuthorPRCount:    authorPRSlice,
+		TopAuthorDuration:   authorAvg,
+		TopAuthorLongRatio:  longRatio,
+	}
+}
+
+func sortedUserCounts(m map[string]int) []UserCount {
+	out := make([]UserCount, 0, len(m))
+	for u, c := range m {
+		out = append(out, UserCount{User: u, Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	return out
+}
+
+func computeDistribution(values []float64, numBuckets int, unit string) DistributionStats {
+	if len(values) == 0 {
+		return DistributionStats{}
+	}
+
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	sort.Float64s(sorted)
+
+	n := len(sorted)
+	sum := 0.0
+	for _, v := range sorted {
+		sum += v
+	}
+	mean := sum / float64(n)
+
+	variance := 0.0
+	for _, v := range sorted {
+		d := v - mean
+		variance += d * d
+	}
+	variance /= float64(n)
+	std := math.Sqrt(variance)
+
+	pct := func(p float64) float64 {
+		idx := p / 100.0 * float64(n-1)
+		lo := int(idx)
+		hi := lo + 1
+		if hi >= n {
+			return sorted[n-1]
+		}
+		frac := idx - float64(lo)
+		return sorted[lo]*(1-frac) + sorted[hi]*frac
+	}
+
+	minV, maxV := sorted[0], sorted[n-1]
+	if numBuckets <= 0 {
+		numBuckets = 8
+	}
+
+	bucketWidth := (maxV - minV) / float64(numBuckets)
+	if bucketWidth <= 0 {
+		bucketWidth = 1
+	}
+
+	buckets := make([]HistogramBucket, numBuckets)
+	for i := range buckets {
+		start := minV + float64(i)*bucketWidth
+		end := start + bucketWidth
+		if i == numBuckets-1 {
+			end = maxV
+		}
+		var label string
+		if unit != "" {
+			label = fmt.Sprintf("%.0f-%.0f%s", start, end, unit)
+		} else {
+			label = fmt.Sprintf("%.0f-%.0f", start, end)
+		}
+		buckets[i] = HistogramBucket{Label: label, Start: round2(start), End: round2(end)}
+	}
+
+	for _, v := range sorted {
+		idx := int((v - minV) / bucketWidth)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= numBuckets {
+			idx = numBuckets - 1
+		}
+		buckets[idx].Count++
+	}
+
+	return DistributionStats{
+		Count:     n,
+		Mean:      round2(mean),
+		Median:    round2(pct(50)),
+		Min:       round2(sorted[0]),
+		Max:       round2(sorted[n-1]),
+		Std:       round2(std),
+		P25:       round2(pct(25)),
+		P75:       round2(pct(75)),
+		P90:       round2(pct(90)),
+		P95:       round2(pct(95)),
+		Histogram: buckets,
+	}
+}
+
+func splitTrimmed(s, sep string) []string {
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
 }
 
 func fatal(err error) {
