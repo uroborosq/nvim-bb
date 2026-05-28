@@ -423,7 +423,7 @@ type JiraComment struct {
 
 func runDashboardCommand(args []string) error {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
-	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	configPath := fs.String("config", defaultConfigPath(), "path to config")
 	stateFilter := fs.String("state", "OPEN", "PR state: OPEN|MERGED|DECLINED|ALL")
 	limitFlag := fs.Int("limit", 50, "max PRs to fetch")
 	if err := fs.Parse(args); err != nil {
@@ -532,7 +532,7 @@ func runDashboardCommand(args []string) error {
 		self = "bb"
 	}
 	openArgs := []string{"open", prURL}
-	if *configPath != "/etc/bb/config.json" {
+	if *configPath != defaultConfigPath() {
 		openArgs = append(openArgs, "-config", *configPath)
 	}
 	openCmd := exec.Command(self, openArgs...)
@@ -607,7 +607,7 @@ func main() {
 	commentFileType := flag.String("file-type", "TO", "file side: TO|FROM")
 	jiraTicket := flag.String("jira-ticket", "", "fetch Jira issue by key and print as JSON")
 	fetchURL := flag.String("fetch-url", "", "fetch URL with Bitbucket auth and write binary body to stdout")
-	configPath := flag.String("config", "/etc/bb/config.json", "path to config")
+	configPath := flag.String("config", defaultConfigPath(), "path to config")
 	projectOverride := flag.String("project", "", "override project key (auto-detected from git remote when omitted)")
 	repoOverride := flag.String("repo", "", "override repo slug (auto-detected from git remote when omitted)")
 	forceAutodetectRepo := flag.Bool("force-autodetect-repo", false, "force auto-detection of project/repo from git remote (ignores config.project/config.repo unless -project/-repo are passed)")
@@ -923,7 +923,7 @@ type openTarget struct {
 
 func runOpenCommand(args []string) error {
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
-	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	configPath := fs.String("config", defaultConfigPath(), "path to config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1189,6 +1189,18 @@ func parseProjectRepoFromRemote(remote string) (string, string) {
 		return "", ""
 	}
 	return strings.ToUpper(match[1]), match[2]
+}
+
+func defaultConfigPath() string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "/etc/bb/config.json"
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "bb", "config.json")
 }
 
 func LoadConfig(path string) (RuntimeConfig, error) {
@@ -2541,7 +2553,7 @@ type LongestPR struct {
 
 func runStatsCommand(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
-	configPath := fs.String("config", "/etc/bb/config.json", "path to config")
+	configPath := fs.String("config", defaultConfigPath(), "path to config")
 	projectFlag := fs.String("project", "", "project key (defaults to config.project)")
 	reposFlag := fs.String("repos", "", "comma-separated repo slugs (required)")
 	sinceDays := fs.Int("since-days", 90, "days to look back (0 = all time)")
