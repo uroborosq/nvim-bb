@@ -2,50 +2,87 @@ local M = {}
 local reactions = require("bb_pr.reactions")
 
 local default_config = {
-	provider_cmd = { "bb", "-reviewers", "-json" },
+	-- internals
+	provider_cmd = { "bb", "-reviewers", "-builds", "-json" },
 	comments_cmd = { "bb", "-json", "-pr-comments" },
+	builds_cmd = { "bb", "-json", "-pr-builds" },
 	force_repo_autodetect = true,
 	force_repo_autodetect_flag = "-force-autodetect-repo",
 	diffview_cmd = "DiffviewOpen",
-	comment_prev_map = "[C",
-	comment_next_map = "]C",
-	create_comment_map = "<leader>rC",
-	create_task_map = "<leader>rT",
-	reply_comment_map = "<leader>rR",
-	delete_comment_map = "<leader>rx",
-	edit_comment_map = "<leader>rU",
-	react_comment_map = "<leader>re",
-	create_suggestion_map = "<leader>rs",
-	accept_suggestion_map = "<leader>rA",
-	reaction_default = "THUMBS_UP",
-	reaction_choices = vim.deepcopy(reactions.all_reaction_choices),
-	refresh_comments_map = "<leader>rr",
-	toggle_task_map = "<leader>rt",
-	resolve_comment_map = "<leader>rv",
-	pr_info_approve_map = "<leader>ra",
-	pr_info_disapprove_map = "<leader>rd",
-	pr_info_needs_work_map = "<leader>rn",
-	pr_info_open_file_map = "<leader>rf",
-	edit_pr_description_map = "<leader>rE",
-	create_pr_map = "<leader>rc",
-	create_pr_toggle_draft_map = "<leader>rt",
-	create_pr_body_template = "",
-	merge_pr_map = "<leader>rm",
-	merge_pr_body_template_fn = nil,
-	jira_base_url = "",
-	jira_open_map = "<leader>rj",
-	jira_open_url_map = "<leader>rJ",
-	image_open_map = "<leader>ri",
-	reaction_recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
-	draft_store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
-	draft_max_count = 50,
-	stats_map = "<leader>rS",
-	stats_repos = "",
-	stats_project = "",
-	stats_since_days = 30,
-	stats_concurrency = 10,
-	stats_top = 20,
-	stats_ignore_users = "",
+
+	-- comment actions: popup windows use the key as-is; diff buffer prepends "g"
+	comments = {
+		prev_map = "[C",
+		next_map = "]C",
+		refresh_map = "<C-r>",
+		reply_map = "r",
+		react_map = "R",
+		delete_map = "D",
+		edit_map = "u",
+		resolve_map = "<space>",
+		toggle_task_map = "<Tab>",
+		create_map = "C",
+		create_task_map = "K",
+		create_suggestion_map = "s",
+		accept_suggestion_map = "A",
+	},
+
+	-- reactions
+	reactions = {
+		default = "THUMBS_UP",
+		choices = vim.deepcopy(reactions.all_reaction_choices),
+		recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
+	},
+
+	-- PR overview window
+	overview = {
+		approve_map = "a",
+		disapprove_map = "d",
+		needs_work_map = "o",
+		edit_description_map = "<CR>",
+		open_file_map = "gf",
+		open_image_map = "i",
+	},
+
+	-- PR management (global keymaps + templates)
+	pr = {
+		create_map = "<leader>rC",
+		create_toggle_draft_map = "<leader>rt",
+		create_body_template = "",
+		merge_map = "<leader>rm",
+		merge_body_template_fn = nil,
+	},
+
+	-- Jira
+	jira = {
+		base_url = "",
+		open_map = "J",
+		open_url_map = "o",
+	},
+
+	-- stats
+	stats = {
+		map = "<leader>rS",
+		repos = "",
+		project = "",
+		since_days = 30,
+		concurrency = 10,
+		top = 20,
+		ignore_users = "",
+	},
+
+	-- drafts
+	drafts = {
+		store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
+		max_count = 50,
+	},
+
+	-- debug log: rotated when it exceeds max_size_bytes or max_age_seconds
+	log = {
+		path             = vim.fn.stdpath("state") .. "/bb_pr.log",
+		max_size_bytes   = 1024 * 1024,
+		max_age_seconds  = 24 * 60 * 60,
+	},
 }
 M.config = vim.deepcopy(default_config)
 
@@ -56,11 +93,49 @@ local state = {
 	diffview_panel_ns = vim.api.nvim_create_namespace("bb_pr_diffview_panel"),
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
+	builds_by_tab = {},
 	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
 	drafts = {},
 }
+
+local function rotate_log_if_needed(path, max_size, max_age)
+	local stat = vim.uv and vim.uv.fs_stat(path) or vim.loop.fs_stat(path)
+	if not stat then
+		return
+	end
+	local too_big = max_size and stat.size > max_size
+	local mtime = (stat.mtime and stat.mtime.sec) or 0
+	local too_old = max_age and (os.time() - mtime) > max_age
+	if too_big or too_old then
+		os.remove(path)
+	end
+end
+
+local function log(...)
+	local cfg = M.config.log or {}
+	local path = cfg.path
+	if not path or path == "" then
+		return
+	end
+	rotate_log_if_needed(path, cfg.max_size_bytes, cfg.max_age_seconds)
+	local parts = {}
+	for i = 1, select("#", ...) do
+		local v = select(i, ...)
+		if type(v) == "table" then
+			parts[#parts + 1] = vim.inspect(v, { indent = "", newline = " " })
+		else
+			parts[#parts + 1] = tostring(v)
+		end
+	end
+	local fd = io.open(path, "a")
+	if not fd then
+		return
+	end
+	fd:write(string.format("[%s] %s\n", os.date("%Y-%m-%d %H:%M:%S"), table.concat(parts, " ")))
+	fd:close()
+end
 
 local function tab_key(tabpage)
 	return tostring(tabpage)
@@ -143,6 +218,23 @@ local function format_my_review_marker(pr)
 	return "?"
 end
 
+local function format_build_marker(pr)
+	local st = type(pr.build_status) == "string" and string.upper(pr.build_status) or ""
+	if st == "SUCCESSFUL" then
+		return "✓"
+	end
+	if st == "FAILED" then
+		return "✗"
+	end
+	if st == "INPROGRESS" then
+		return "●"
+	end
+	if st == "NONE" then
+		return "○"
+	end
+	return " "
+end
+
 local function format_pr_entry(pr)
 	local approvals = 0
 	local has_needs_work = false
@@ -158,7 +250,8 @@ local function format_pr_entry(pr)
 	local needs_work_status = has_needs_work and "NW" or "OK"
 
 	return string.format(
-		"appr: %d %s %s • open %s, comm %s • %s - %s",
+		"%s appr: %d %s %s • open %s, comm %s • %s - %s",
+		format_build_marker(pr),
 		approvals,
 		needs_work_status,
 		format_my_review_marker(pr),
@@ -170,11 +263,22 @@ local function format_pr_entry(pr)
 end
 
 local function merge_config(user)
-	M.config = vim.tbl_deep_extend("force", vim.deepcopy(default_config), user or {})
+	M.config = vim.deepcopy(default_config)
+	local opts = user or {}
+	local function deep_merge(target, source)
+		for k, v in pairs(source) do
+			if type(target[k]) == "table" and type(v) == "table" then
+				deep_merge(target[k], v)
+			else
+				target[k] = v
+			end
+		end
+	end
+	deep_merge(M.config, opts)
 end
 
 local function load_reaction_recency_state()
-	local path = tostring(M.config.reaction_recency_store_path or "")
+	local path = tostring(M.config.reactions.recency_store_path or "")
 	if path == "" then
 		return
 	end
@@ -191,7 +295,7 @@ local function load_reaction_recency_state()
 end
 
 local function persist_reaction_recency_state()
-	local path = tostring(M.config.reaction_recency_store_path or "")
+	local path = tostring(M.config.reactions.recency_store_path or "")
 	if path == "" then
 		return
 	end
@@ -205,18 +309,26 @@ local function persist_reaction_recency_state()
 end
 
 local function load_drafts()
-	local path = tostring(M.config.draft_store_path or "")
-	if path == "" then return end
+	local path = tostring(M.config.drafts.store_path or "")
+	if path == "" then
+		return
+	end
 	local ok, lines = pcall(vim.fn.readfile, path)
-	if not ok or type(lines) ~= "table" or #lines == 0 then return end
+	if not ok or type(lines) ~= "table" or #lines == 0 then
+		return
+	end
 	local ok2, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
-	if not ok2 or type(decoded) ~= "table" then return end
+	if not ok2 or type(decoded) ~= "table" then
+		return
+	end
 	state.drafts = type(decoded.drafts) == "table" and decoded.drafts or {}
 end
 
 local function persist_drafts()
-	local path = tostring(M.config.draft_store_path or "")
-	if path == "" then return end
+	local path = tostring(M.config.drafts.store_path or "")
+	if path == "" then
+		return
+	end
 	local dir = vim.fn.fnamemodify(path, ":h")
 	pcall(vim.fn.mkdir, dir, "p")
 	local payload = vim.json.encode({ drafts = state.drafts })
@@ -224,7 +336,9 @@ local function persist_drafts()
 end
 
 local function save_draft(key, text, base)
-	if not key or vim.trim(text or "") == "" then return end
+	if not key or vim.trim(text or "") == "" then
+		return
+	end
 	local kept = {}
 	for _, d in ipairs(state.drafts) do
 		if d.key ~= key then
@@ -232,11 +346,15 @@ local function save_draft(key, text, base)
 		end
 	end
 	table.insert(kept, { key = key, text = text, base = base, saved_at = os.time() })
-	local max = tonumber(M.config.draft_max_count or 50) or 50
+	local max = tonumber(M.config.drafts.max_count or 50) or 50
 	if #kept > max then
-		table.sort(kept, function(a, b) return (a.saved_at or 0) > (b.saved_at or 0) end)
+		table.sort(kept, function(a, b)
+			return (a.saved_at or 0) > (b.saved_at or 0)
+		end)
 		local trimmed = {}
-		for i = 1, max do trimmed[i] = kept[i] end
+		for i = 1, max do
+			trimmed[i] = kept[i]
+		end
 		kept = trimmed
 	end
 	state.drafts = kept
@@ -244,7 +362,9 @@ local function save_draft(key, text, base)
 end
 
 local function get_draft(key)
-	if not key then return nil end
+	if not key then
+		return nil
+	end
 	local found = nil
 	for _, d in ipairs(state.drafts) do
 		if d.key == key then
@@ -257,7 +377,9 @@ local function get_draft(key)
 end
 
 local function delete_draft(key)
-	if not key then return end
+	if not key then
+		return
+	end
 	local kept = {}
 	for _, d in ipairs(state.drafts) do
 		if d.key ~= key then
@@ -272,10 +394,15 @@ end
 
 local function draft_age_label(saved_at)
 	local diff = os.time() - (saved_at or 0)
-	if diff < 60 then return diff .. "s ago"
-	elseif diff < 3600 then return math.floor(diff / 60) .. "m ago"
-	elseif diff < 86400 then return math.floor(diff / 3600) .. "h ago"
-	else return math.floor(diff / 86400) .. "d ago" end
+	if diff < 60 then
+		return diff .. "s ago"
+	elseif diff < 3600 then
+		return math.floor(diff / 60) .. "m ago"
+	elseif diff < 86400 then
+		return math.floor(diff / 3600) .. "h ago"
+	else
+		return math.floor(diff / 86400) .. "d ago"
+	end
 end
 
 local function with_repo_autodetect_flag(cmd)
@@ -354,6 +481,8 @@ local apply_comments_to_tab_windows
 local apply_pr_info_content
 local find_comment_by_id
 local resolve_reply_target_comment_id
+local set_diff_buffer_keymaps
+local open_help_float
 
 local function run_comments_provider(pr_id, cb, opts)
 	opts = opts or {}
@@ -404,6 +533,44 @@ local function consume_pending_tab_comments()
 	local payload = state.pending_comments_by_tab[key]
 	state.pending_comments_by_tab[key] = nil
 	return payload
+end
+
+local function run_builds_provider(pr_id, cb, opts)
+	opts = opts or {}
+	local cmd = vim.deepcopy(M.config.builds_cmd)
+	cmd = with_repo_autodetect_flag(cmd)
+	table.insert(cmd, tostring(pr_id))
+
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			if opts.notify_errors then
+				vim.schedule(function()
+					vim.notify("bb_pr: builds provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+				end)
+			end
+			return
+		end
+
+		local ok, decoded = pcall(vim.json.decode, res.stdout)
+		if not ok or type(decoded) ~= "table" then
+			if opts.notify_errors then
+				vim.schedule(function()
+					vim.notify("bb_pr: invalid PR builds JSON", vim.log.levels.ERROR)
+				end)
+			end
+			return
+		end
+
+		cb(decoded)
+	end)
+end
+
+local function set_tab_builds(tabpage, payload)
+	state.builds_by_tab[tab_key(tabpage)] = payload
+end
+
+local function get_current_tab_builds()
+	return state.builds_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
 end
 
 local function split_first_line(text)
@@ -763,8 +930,7 @@ local function open_comment_float(comments, line)
 		end
 		local comment_id = tonumber(c.id or 0) or 0
 		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header =
-			string.format("- %s%s%s %s", bars, status, c.author or "unknown", c.created_at or "unknown time")
+		local header = string.format("- %s%s%s %s", bars, status, c.author or "unknown", c.created_at or "unknown time")
 		if comment_id > 0 then
 			header = header .. string.format(" (#%d)", comment_id)
 		end
@@ -801,15 +967,8 @@ local function open_comment_float(comments, line)
 	vim.b[buf].bb_pr_float_source_line = line
 	vim.diagnostic.enable(false, { bufnr = buf })
 
-	local base_win = vim.api.nvim_get_current_win()
-	local base_width = vim.api.nvim_win_get_width(base_win)
-	local base_height = vim.api.nvim_win_get_height(base_win)
-	local editor_width = vim.o.columns
-	local editor_height = vim.o.lines
-	local target_width = math.max(math.floor(base_width * 0.9), math.floor(editor_width * 0.7))
-	local target_height = math.max(math.floor(base_height * 0.85), math.floor(editor_height * 0.6))
-	local width = math.max(100, target_width)
-	local height = math.min(#lines + 2, math.max(16, target_height))
+	local width = math.floor(vim.o.columns * 0.8)
+	local height = math.floor(vim.o.lines * 0.8)
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		width = width,
@@ -820,11 +979,57 @@ local function open_comment_float(comments, line)
 		border = "rounded",
 		title = "BB PR Comments",
 		title_pos = "center",
+		footer = " ? help ",
+		footer_pos = "right",
 	})
 
 	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+
+	local cfg = M.config
+	local function map(key, cmd, desc)
+		if key and key ~= "" then
+			vim.keymap.set("n", key, cmd, { buffer = buf, silent = true, desc = desc })
+		end
+	end
+	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
+	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
+	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
+	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
+	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
+	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
+	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create comment")
+	map(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
+	map(cfg.comments.create_suggestion_map, "<cmd>BBPRCreateSuggestion<CR>", "Create suggestion")
+	map(cfg.comments.accept_suggestion_map, "<cmd>BBPRAcceptSuggestion<CR>", "Accept suggestion")
+
+	vim.keymap.set("n", "?", function()
+		local c = M.config
+		local function e(key, desc)
+			return (key and key ~= "") and { key, desc } or nil
+		end
+		local entries = {}
+		for _, v in ipairs({
+			e(c.comments.reply_map, "Reply to comment"),
+			e(c.comments.react_map, "React / emoji"),
+			e(c.comments.delete_map, "Delete comment"),
+			e(c.comments.edit_map, "Edit comment"),
+			e(c.comments.resolve_map, "Resolve / unresolve thread"),
+			e(c.comments.toggle_task_map, "Toggle task done/open"),
+			e(c.comments.create_map, "Create comment"),
+			e(c.comments.create_task_map, "Create task"),
+			e(c.comments.create_suggestion_map, "Create suggestion"),
+			e(c.comments.accept_suggestion_map, "Accept suggestion"),
+			{ "q", "Close" },
+		}) do
+			if v then
+				table.insert(entries, v)
+			end
+		end
+		open_help_float(entries, "File Comment — Keymaps")
+	end, { buffer = buf, desc = "Show keymap help", silent = true })
+
 	return win
 end
 
@@ -1012,6 +1217,7 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 
 	vim.b[bufnr].bb_pr_line_comments = by_line
+	set_diff_buffer_keymaps(bufnr)
 end
 
 local function walk_diffview_components(node, rows)
@@ -1095,16 +1301,10 @@ local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payl
 							if not marked[idx] and type(line) == "string" then
 								if line:find(path, 1, true) or line:find(basename, 1, true) then
 									marked[idx] = true
-									vim.api.nvim_buf_set_extmark(
-										buf,
-										state.diffview_panel_ns,
-										idx - 1,
-										0,
-										{
-											sign_text = "💬",
-											sign_hl_group = "DiagnosticSignInfo",
-										}
-									)
+									vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, idx - 1, 0, {
+										sign_text = "💬",
+										sign_hl_group = "DiagnosticSignInfo",
+									})
 									break
 								end
 							end
@@ -1227,7 +1427,8 @@ local function build_lines(prs)
 		table.insert(
 			lines,
 			string.format(
-				"%-3s %-8s %-20s %-18s %s",
+				"%s %-3s %-8s %-20s %-18s %s",
+				format_build_marker(pr),
 				pr.id,
 				pr.state or "-",
 				author,
@@ -1285,12 +1486,18 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 	local should_open_float = opts.open_float ~= false
 	local ok, lib = pcall(require, "diffview.lib")
 	if not ok then
-		vim.notify(string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")), vim.log.levels.INFO)
+		vim.notify(
+			string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")),
+			vim.log.levels.INFO
+		)
 		return
 	end
 	local view = lib.get_current_view()
 	if type(view) ~= "table" then
-		vim.notify(string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")), vim.log.levels.INFO)
+		vim.notify(
+			string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")),
+			vim.log.levels.INFO
+		)
 		return
 	end
 
@@ -1477,6 +1684,44 @@ local function try_navigate_to_pending_comment(pr, payload)
 	vim.notify("bb_pr: comment #" .. comment_id .. " not found in PR", vim.log.levels.WARN)
 end
 
+local function close_old_pr_tabs()
+	local pr_tabs = {}
+	for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+		if state.pr_by_tab[tab_key(t)] then
+			table.insert(pr_tabs, t)
+		end
+	end
+	if #pr_tabs == 0 then
+		return
+	end
+
+	-- ensure there's at least one non-PR tab so :tabclose on the last PR tab works
+	local has_safe_tab = false
+	for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+		if not state.pr_by_tab[tab_key(t)] then
+			has_safe_tab = true
+			break
+		end
+	end
+	if not has_safe_tab then
+		vim.cmd("tabnew")
+	end
+
+	for _, t in ipairs(pr_tabs) do
+		local key = tab_key(t)
+		if vim.api.nvim_tabpage_is_valid(t) then
+			pcall(vim.api.nvim_set_current_tabpage, t)
+			pcall(vim.cmd, "silent! DiffviewClose")
+			pcall(vim.cmd, "tabclose!")
+		end
+		state.pr_by_tab[key] = nil
+		state.comments_by_tab[key] = nil
+		state.pending_comments_by_tab[key] = nil
+		state.builds_by_tab[key] = nil
+	end
+	log("close_old_pr_tabs: closed", #pr_tabs, "tab(s)")
+end
+
 local function open_diffview(pr)
 	local from_ref = pr.fromRef and pr.fromRef.displayId
 	local to_ref = pr.toRef and pr.toRef.displayId
@@ -1507,6 +1752,7 @@ local function open_diffview(pr)
 						)
 						return
 					end
+					close_old_pr_tabs()
 					vim.cmd(string.format("%s origin/%s", M.config.diffview_cmd, to_ref))
 					set_current_tab_pr(pr)
 					run_comments_provider(pr.id, function(payload)
@@ -1545,10 +1791,7 @@ local function open_diffview(pr)
 		vim.system(fetch_cmd, { text = true }, function(fetch_res)
 			if fetch_res.code ~= 0 then
 				vim.schedule(function()
-					vim.notify(
-						"bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""),
-						vim.log.levels.ERROR
-					)
+					vim.notify("bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""), vim.log.levels.ERROR)
 				end)
 				return
 			end
@@ -1840,6 +2083,47 @@ local function build_overview_comment_lines(payload)
 	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers
 end
 
+local function build_status_lines(payload)
+	if type(payload) ~= "table" then
+		return { "(loading…)" }
+	end
+
+	local summary = type(payload.summary) == "string" and string.upper(payload.summary) or "NONE"
+	local icons = {
+		SUCCESSFUL = "✓",
+		FAILED = "✗",
+		INPROGRESS = "●",
+		NONE = "○",
+	}
+	local labels = {
+		SUCCESSFUL = "Successful",
+		FAILED = "Failed",
+		INPROGRESS = "In progress",
+		NONE = "No builds",
+	}
+	local icon = icons[summary] or "○"
+	local label = labels[summary] or summary
+
+	local lines = { string.format("%s %s", icon, label) }
+
+	local builds = as_array(payload.builds)
+	for _, b in ipairs(builds) do
+		local state_up = type(b.state) == "string" and string.upper(b.state) or ""
+		local mark = icons[state_up] or "•"
+		local name = b.name
+		if type(name) ~= "string" or name == "" then
+			name = b.key or "build"
+		end
+		local line = string.format("  %s %s", mark, name)
+		if type(b.url) == "string" and b.url ~= "" then
+			line = line .. "  " .. b.url
+		end
+		table.insert(lines, line)
+	end
+
+	return lines
+end
+
 local function build_pr_info_content(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
@@ -1868,6 +2152,11 @@ local function build_pr_info_content(pr)
 	table.insert(info_lines, "")
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
+	table.insert(info_lines, "")
+	table.insert(info_lines, "## Build")
+	table.insert(info_lines, "")
+
+	vim.list_extend(info_lines, build_status_lines(get_current_tab_builds()))
 	table.insert(info_lines, "")
 	table.insert(info_lines, "## Comments")
 	table.insert(info_lines, "")
@@ -2057,8 +2346,22 @@ local function open_pr_info(pr)
 	local buf = vim.api.nvim_create_buf(false, true)
 	apply_pr_info_content(buf, pr)
 
-	local width = math.floor(vim.o.columns * 0.7)
-	local height = math.min(vim.api.nvim_buf_line_count(buf) + 2, math.floor(vim.o.lines * 0.7))
+	local pr_id = tonumber(pr.id or 0) or 0
+	if pr_id > 0 then
+		local source_tab = vim.api.nvim_get_current_tabpage()
+		run_builds_provider(pr_id, function(builds)
+			vim.schedule(function()
+				set_tab_builds(source_tab, builds)
+				if vim.api.nvim_buf_is_valid(buf) then
+					local current_pr = vim.b[buf].bb_pr_info_pr or pr
+					apply_pr_info_content(buf, current_pr)
+				end
+			end)
+		end)
+	end
+
+	local width = math.floor(vim.o.columns * 0.8)
+	local height = math.floor(vim.o.lines * 0.8)
 
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
@@ -2070,6 +2373,8 @@ local function open_pr_info(pr)
 		border = "rounded",
 		title = "PR Info",
 		title_pos = "center",
+		footer = " ? help ",
+		footer_pos = "right",
 	})
 
 	set_wrapped_window_options(win)
@@ -2106,29 +2411,37 @@ local function open_pr_info(pr)
 		end)
 	end
 
-	if M.config.pr_info_approve_map and M.config.pr_info_approve_map ~= "" then
-		vim.keymap.set("n", M.config.pr_info_approve_map, function()
+	local cfg = M.config
+	local function map(key, cmd, desc)
+		if key and key ~= "" then
+			vim.keymap.set("n", key, cmd, { buffer = buf, silent = true, desc = desc })
+		end
+	end
+
+	-- PR-level actions
+	if cfg.overview.approve_map and cfg.overview.approve_map ~= "" then
+		vim.keymap.set("n", cfg.overview.approve_map, function()
 			apply_review_action("approve")
 		end, { buffer = buf, silent = true, desc = "Approve PR" })
 	end
-	if M.config.pr_info_disapprove_map and M.config.pr_info_disapprove_map ~= "" then
-		vim.keymap.set("n", M.config.pr_info_disapprove_map, function()
+	if cfg.overview.disapprove_map and cfg.overview.disapprove_map ~= "" then
+		vim.keymap.set("n", cfg.overview.disapprove_map, function()
 			apply_review_action("disapprove")
 		end, { buffer = buf, silent = true, desc = "Disapprove PR" })
 	end
-	if M.config.pr_info_needs_work_map and M.config.pr_info_needs_work_map ~= "" then
-		vim.keymap.set("n", M.config.pr_info_needs_work_map, function()
+	if cfg.overview.needs_work_map and cfg.overview.needs_work_map ~= "" then
+		vim.keymap.set("n", cfg.overview.needs_work_map, function()
 			apply_review_action("needs-work")
 		end, { buffer = buf, silent = true, desc = "Mark PR needs work" })
 	end
-	if M.config.edit_pr_description_map and M.config.edit_pr_description_map ~= "" then
-		vim.keymap.set("n", M.config.edit_pr_description_map, function()
+	if cfg.overview.edit_description_map and cfg.overview.edit_description_map ~= "" then
+		vim.keymap.set("n", cfg.overview.edit_description_map, function()
 			local current_pr = vim.b[buf].bb_pr_info_pr or pr
 			open_edit_pr_description(current_pr, buf)
 		end, { buffer = buf, silent = true, desc = "Edit PR title and description" })
 	end
-	if M.config.pr_info_open_file_map and M.config.pr_info_open_file_map ~= "" then
-		vim.keymap.set("n", M.config.pr_info_open_file_map, function()
+	if cfg.overview.open_file_map and cfg.overview.open_file_map ~= "" then
+		vim.keymap.set("n", cfg.overview.open_file_map, function()
 			local cid = resolve_reply_target_comment_id()
 			if not cid then
 				vim.notify("bb_pr: move cursor to a file comment line", vim.log.levels.WARN)
@@ -2143,6 +2456,61 @@ local function open_pr_info(pr)
 			navigate_to_file_comment_in_diffview(target, { open_float = false })
 		end, { buffer = buf, silent = true, desc = "Open file from overview comment in diff" })
 	end
+	if cfg.jira.open_map and cfg.jira.open_map ~= "" then
+		vim.keymap.set("n", cfg.jira.open_map, function()
+			local ticket = ticket_under_cursor()
+			if not ticket then
+				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
+				return
+			end
+			open_jira_ticket(ticket)
+		end, { buffer = buf, silent = true, desc = "Open Jira ticket" })
+	end
+	if cfg.overview.open_image_map and cfg.overview.open_image_map ~= "" then
+		vim.keymap.set("n", cfg.overview.open_image_map, function()
+			open_attachment_at_cursor()
+		end, { buffer = buf, silent = true, desc = "Download and open attachment under cursor" })
+	end
+
+	-- Comment actions: same keys as file comment float
+	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
+	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
+	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
+	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
+	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
+	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
+	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create overview comment")
+
+	vim.keymap.set("n", "?", function()
+		local c = M.config
+		local function e(key, desc)
+			return (key and key ~= "") and { key, desc } or nil
+		end
+		local entries = {}
+		for _, v in ipairs({
+			e(c.overview.approve_map, "Approve PR"),
+			e(c.overview.disapprove_map, "Disapprove PR"),
+			e(c.overview.needs_work_map, "Needs work"),
+			e(c.overview.edit_description_map, "Edit title & description"),
+			e(c.overview.open_file_map, "Open file from comment in diff"),
+			e(c.jira.open_map, "Open Jira ticket"),
+			e(c.overview.open_image_map, "Open attachment"),
+			{ "─", "── Comment actions ──────────────" },
+			e(c.comments.reply_map, "Reply to comment"),
+			e(c.comments.react_map, "React / emoji"),
+			e(c.comments.delete_map, "Delete comment"),
+			e(c.comments.edit_map, "Edit comment"),
+			e(c.comments.resolve_map, "Resolve / unresolve thread"),
+			e(c.comments.toggle_task_map, "Toggle task done/open"),
+			e(c.comments.create_map, "Create overview comment"),
+			{ "q", "Close" },
+		}) do
+			if v then
+				table.insert(entries, v)
+			end
+		end
+		open_help_float(entries, "PR Info — Keymaps")
+	end, { buffer = buf, desc = "Show keymap help", silent = true })
 end
 
 local function open_pr_info_with_comments(pr)
@@ -2282,30 +2650,33 @@ end
 local function detect_line_type_for_cursor(side, line)
 	local ok, diff_hl = pcall(vim.fn.diff_hlID, line, 1)
 	if not ok then
+		log("detect_line_type: diff_hlID failed", "side=", side, "line=", line)
 		return nil
 	end
 	local hl_id = tonumber(diff_hl or 0) or 0
 	if hl_id == 0 then
+		log("detect_line_type: hl_id=0 → CONTEXT", "side=", side, "line=", line)
 		return "CONTEXT"
 	end
 	local hl_name = vim.fn.synIDattr(hl_id, "name")
 	hl_name = type(hl_name) == "string" and hl_name or ""
-	if hl_name:find("DiffDelete", 1, true) then
-		return "REMOVED"
+	local function ret(t)
+		log("detect_line_type:", "side=", side, "line=", line, "hl_name=", hl_name, "→", t)
+		return t
 	end
-	if hl_name:find("DiffAdd", 1, true) then
-		return "ADDED"
-	end
-	if hl_name:find("DiffChange", 1, true) or hl_name:find("DiffText", 1, true) then
-		return "CONTEXT"
-	end
+	if hl_name:find("DiffDelete", 1, true) then return ret("REMOVED") end
+	if hl_name:find("DiffAdd", 1, true) then return ret("ADDED") end
+	if hl_name:find("DiffChange", 1, true) or hl_name:find("DiffText", 1, true) then return ret("CONTEXT") end
 
 	if side == "left" then
+		log("detect_line_type fallback by side=left", "line=", line, "hl_name=", hl_name)
 		return "REMOVED"
 	end
 	if side == "right" then
+		log("detect_line_type fallback by side=right", "line=", line, "hl_name=", hl_name)
 		return "ADDED"
 	end
+	log("detect_line_type fallback no-side", "line=", line, "hl_name=", hl_name)
 	return "CONTEXT"
 end
 local function resolve_comment_context(mode)
@@ -2316,20 +2687,24 @@ local function resolve_comment_context(mode)
 	end
 
 	if vim.bo[bufnr].filetype == "markdown" and type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
+		log("resolve_comment_context: new_overview", "bufnr=", bufnr, "line=", line)
 		return { mode = "new_overview" }
 	end
 
-	local rel = extract_repo_relative_path(vim.api.nvim_buf_get_name(bufnr))
+	local bufname = vim.api.nvim_buf_get_name(bufnr)
+	local rel = extract_repo_relative_path(bufname)
 	local side = current_diff_side()
 	local file_type = side == "left" and "FROM" or "TO"
 	local line_type = detect_line_type_for_cursor(side, line) or "CONTEXT"
-	return {
+	local ctx = {
 		mode = "new_file",
 		path = rel,
 		line = line,
 		line_type = line_type,
 		file_type = file_type,
 	}
+	log("resolve_comment_context:", "bufname=", bufname, "rel=", rel, "side=", side, "ctx=", ctx)
+	return ctx
 end
 
 local function open_multiline_comment_input(opts, on_submit)
@@ -2340,9 +2715,7 @@ local function open_multiline_comment_input(opts, on_submit)
 
 	local fresh_text = opts.initial_text
 	local existing_draft = draft_key and get_draft(draft_key)
-	local conflict = existing_draft
-		and existing_draft.base ~= nil
-		and existing_draft.base ~= (fresh_text or "")
+	local conflict = existing_draft and existing_draft.base ~= nil and existing_draft.base ~= (fresh_text or "")
 	local initial_text = (existing_draft and not conflict) and existing_draft.text or fresh_text
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -2374,7 +2747,9 @@ local function open_multiline_comment_input(opts, on_submit)
 	vim.api.nvim_win_set_cursor(win, { 3, 0 })
 	local sep_ns = vim.api.nvim_create_namespace("bb_pr_merge_sep")
 	local function apply_separator()
-		if not opts.title_separator then return end
+		if not opts.title_separator then
+			return
+		end
 		local sep_text = string.rep("─", math.max(40, math.floor(vim.o.columns * 0.5)))
 		vim.api.nvim_buf_clear_namespace(buf, sep_ns, 0, -1)
 		vim.api.nvim_buf_set_extmark(buf, sep_ns, 2, 0, {
@@ -2385,16 +2760,15 @@ local function open_multiline_comment_input(opts, on_submit)
 	apply_separator()
 
 	if existing_draft and not conflict then
-		vim.notify(
-			"bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")",
-			vim.log.levels.INFO
-		)
+		vim.notify("bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")", vim.log.levels.INFO)
 	end
 
 	local submitted = false
 
 	local function get_typed_text()
-		if not vim.api.nvim_buf_is_valid(buf) then return "" end
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return ""
+		end
 		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 		if #lines >= 2 and lines[1]:match("^%<%!%-%-") then
 			lines = vim.list_slice(lines, 3)
@@ -2411,7 +2785,9 @@ local function open_multiline_comment_input(opts, on_submit)
 			vim.log.levels.WARN
 		)
 		vim.keymap.set({ "n", "i" }, "<C-r>", function()
-			if not vim.api.nvim_buf_is_valid(buf) then return end
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return
+			end
 			local draft_lines = vim.split(existing_draft.text, "\n", { plain = true })
 			local prompt_prefix = { "<!-- " .. prompt .. " -->", "" }
 			vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend(prompt_prefix, draft_lines))
@@ -2421,7 +2797,9 @@ local function open_multiline_comment_input(opts, on_submit)
 	end
 
 	local function submit()
-		if not vim.api.nvim_buf_is_valid(buf) then return end
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
 		local text = get_typed_text()
 		submitted = true
 		delete_draft(draft_key)
@@ -2502,7 +2880,7 @@ end
 
 local function open_create_pr_editor(source_branch, target_branch)
 	local function resolve_pr_body_template_lines()
-		local template = M.config.create_pr_body_template
+		local template = M.config.pr.create_body_template
 		if type(template) == "string" then
 			if vim.trim(template) == "" then
 				return { "" }
@@ -2536,15 +2914,15 @@ local function open_create_pr_editor(source_branch, target_branch)
 			body = table.concat(resolve_pr_body_template_lines(), "\n"),
 		})
 		local existing_draft = get_draft(pr_draft_key)
-		local pr_conflict = existing_draft
-			and existing_draft.base ~= nil
-			and existing_draft.base ~= fresh_base
+		local pr_conflict = existing_draft and existing_draft.base ~= nil and existing_draft.base ~= fresh_base
 		local draft_title = default_title
 		local draft_body_lines = resolve_pr_body_template_lines()
 		if existing_draft and not pr_conflict then
 			local ok, d = pcall(vim.json.decode, existing_draft.text)
 			if ok and type(d) == "table" then
-				if type(d.title) == "string" and d.title ~= "" then draft_title = d.title end
+				if type(d.title) == "string" and d.title ~= "" then
+					draft_title = d.title
+				end
 				if type(d.body) == "string" then
 					draft_body_lines = vim.split(d.body, "\n", { plain = true })
 				end
@@ -2565,8 +2943,8 @@ local function open_create_pr_editor(source_branch, target_branch)
 		vim.list_extend(initial_lines, draft_body_lines)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
-		local width = math.max(90, math.floor(vim.o.columns * 0.7))
-		local height = math.max(14, math.floor(vim.o.lines * 0.4))
+		local width = math.floor(vim.o.columns * 0.8)
+		local height = math.floor(vim.o.lines * 0.8)
 		local win = vim.api.nvim_open_win(buf, true, {
 			relative = "editor",
 			width = width,
@@ -2589,11 +2967,15 @@ local function open_create_pr_editor(source_branch, target_branch)
 		local submitted = false
 
 		local function get_pr_draft_text()
-			if not vim.api.nvim_buf_is_valid(buf) then return nil end
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return nil
+			end
 			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
 			local body_parts = {}
-			for i = 4, #lines do table.insert(body_parts, lines[i]) end
+			for i = 4, #lines do
+				table.insert(body_parts, lines[i])
+			end
 			return vim.json.encode({ title = title, body = table.concat(body_parts, "\n") })
 		end
 
@@ -2606,9 +2988,13 @@ local function open_create_pr_editor(source_branch, target_branch)
 				vim.log.levels.WARN
 			)
 			vim.keymap.set({ "n", "i" }, "<C-r>", function()
-				if not vim.api.nvim_buf_is_valid(buf) then return end
+				if not vim.api.nvim_buf_is_valid(buf) then
+					return
+				end
 				local ok, d = pcall(vim.json.decode, existing_draft.text)
-				if not ok or type(d) ~= "table" then return end
+				if not ok or type(d) ~= "table" then
+					return
+				end
 				local restored_lines = { "Title: " .. (d.title or ""), "", "Body:" }
 				if type(d.body) == "string" then
 					vim.list_extend(restored_lines, vim.split(d.body, "\n", { plain = true }))
@@ -2664,7 +3050,9 @@ local function open_create_pr_editor(source_branch, target_branch)
 			callback = function()
 				if not submitted then
 					local text = get_pr_draft_text()
-					if text then save_draft(pr_draft_key, text, fresh_base) end
+					if text then
+						save_draft(pr_draft_key, text, fresh_base)
+					end
 				end
 			end,
 		})
@@ -2681,10 +3069,10 @@ local function open_create_pr_editor(source_branch, target_branch)
 		vim.keymap.set("n", "q", function()
 			pcall(vim.api.nvim_win_close, win, true)
 		end, { buffer = buf, silent = true })
-		if M.config.create_pr_toggle_draft_map and M.config.create_pr_toggle_draft_map ~= "" then
+		if M.config.pr.create_toggle_draft_map and M.config.pr.create_toggle_draft_map ~= "" then
 			vim.keymap.set(
 				"n",
-				M.config.create_pr_toggle_draft_map,
+				M.config.pr.create_toggle_draft_map,
 				toggle_draft,
 				{ buffer = buf, silent = true, desc = "Toggle [DRAFT]" }
 			)
@@ -2819,8 +3207,8 @@ local function merge_current_pr()
 		end
 		local title = string.format("PR #%s: %s", tostring(pr.id or ""), tostring(pr.title or ""))
 		local body_lines = { "" }
-		if type(M.config.merge_pr_body_template_fn) == "function" then
-			local ok_tpl, tpl = pcall(M.config.merge_pr_body_template_fn, commits)
+		if type(M.config.pr.merge_body_template_fn) == "function" then
+			local ok_tpl, tpl = pcall(M.config.pr.merge_body_template_fn, commits)
 			if ok_tpl then
 				if type(tpl) == "string" then
 					body_lines = vim.split(tpl, "\n", { plain = true })
@@ -2861,7 +3249,8 @@ local function merge_current_pr()
 					vim.notify("bb_pr: merge commit title is required", vim.log.levels.WARN)
 					return
 				end
-				local cmd = bb_cmd({ "-json", "-pr-merge", tostring(pr.id), "-merge-title", title, "-merge-body", body })
+				local cmd =
+					bb_cmd({ "-json", "-pr-merge", tostring(pr.id), "-merge-title", title, "-merge-body", body })
 				vim.system(cmd, { text = true }, function(res)
 					if res.code ~= 0 then
 						vim.schedule(function()
@@ -3174,7 +3563,7 @@ local function react_to_comment()
 		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
-	local choices = as_array(M.config.reaction_choices)
+	local choices = as_array(M.config.reactions.choices)
 	local normalized = {}
 	for _, item in ipairs(choices) do
 		local v = tostring(item or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -3183,7 +3572,7 @@ local function react_to_comment()
 		end
 	end
 	if #normalized == 0 then
-		normalized = { string.upper(tostring(M.config.reaction_default or "THUMBS_UP")) }
+		normalized = { string.upper(tostring(M.config.reactions.default or "THUMBS_UP")) }
 	end
 	sort_reactions_by_recent_use(normalized)
 	vim.ui.select(normalized, {
@@ -3369,7 +3758,12 @@ local function post_comment_or_task(is_task, force_reply, opts)
 		if reply_to and reply_to > 0 then
 			comment_draft_key = "comment:reply:" .. tostring(reply_to)
 		elseif ctx and ctx.mode == "new_file" then
-			comment_draft_key = "comment:file:" .. tostring(pr.id) .. ":" .. tostring(ctx.path or "") .. ":" .. tostring(ctx.line or 0)
+			comment_draft_key = "comment:file:"
+				.. tostring(pr.id)
+				.. ":"
+				.. tostring(ctx.path or "")
+				.. ":"
+				.. tostring(ctx.line or 0)
 		else
 			comment_draft_key = "comment:overview:" .. tostring(pr.id)
 		end
@@ -3396,13 +3790,16 @@ local function post_comment_or_task(is_task, force_reply, opts)
 				table.insert(cmd, "-file-type")
 				table.insert(cmd, tostring(ctx.file_type or "TO"))
 			end
+			log("send_comment cmd:", cmd, "ctx=", ctx, "reply_to=", reply_to, "is_task=", is_task)
 			vim.system(cmd, { text = true }, function(res)
 				if res.code ~= 0 then
+					log("send_comment FAILED code=", res.code, "stderr=", res.stderr or "")
 					vim.schedule(function()
 						vim.notify("bb_pr: create comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
 					end)
 					return
 				end
+				log("send_comment OK stdout=", res.stdout or "")
 				vim.schedule(function()
 					vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
 					run_comments_provider(pr.id, function(payload)
@@ -3486,7 +3883,9 @@ local function open_jira_ticket(ticket)
 			end
 
 			local lines = {}
-			local function push(s) table.insert(lines, ((s or ""):gsub("\r", ""))) end
+			local function push(s)
+				table.insert(lines, ((s or ""):gsub("\r", "")))
+			end
 			local function split_field(s)
 				return vim.split((s or ""):gsub("\r\n", "\n"):gsub("\r", "\n"), "\n", { plain = true })
 			end
@@ -3498,12 +3897,12 @@ local function open_jira_ticket(ticket)
 					push(string.format("%-14s %s", label .. ":", val))
 				end
 			end
-			meta("Type",       issue.type)
-			meta("Status",     issue.status)
-			meta("Priority",   issue.priority)
-			meta("Assignee",   issue.assignee)
-			meta("Reporter",   issue.reporter)
-			meta("Epic",       issue.epic_link)
+			meta("Type", issue.type)
+			meta("Status", issue.status)
+			meta("Priority", issue.priority)
+			meta("Assignee", issue.assignee)
+			meta("Reporter", issue.reporter)
+			meta("Epic", issue.epic_link)
 			if type(issue.fix_versions) == "table" and #issue.fix_versions > 0 then
 				meta("Fix Versions", table.concat(issue.fix_versions, ", "))
 			end
@@ -3552,6 +3951,8 @@ local function open_jira_ticket(ticket)
 				border = "rounded",
 				title = " " .. (issue.key or ticket) .. " ",
 				title_pos = "center",
+				footer = " ? help ",
+				footer_pos = "right",
 			})
 			vim.wo[win].wrap = true
 			vim.wo[win].linebreak = true
@@ -3562,11 +3963,20 @@ local function open_jira_ticket(ticket)
 					pcall(vim.api.nvim_win_close, win, true)
 				end, { buffer = buf, silent = true })
 			end
-			if M.config.jira_open_url_map and M.config.jira_open_url_map ~= "" and url ~= "" then
-				vim.keymap.set("n", M.config.jira_open_url_map, function()
+			if M.config.jira.open_url_map and M.config.jira.open_url_map ~= "" and url ~= "" then
+				vim.keymap.set("n", M.config.jira.open_url_map, function()
 					vim.fn.jobstart({ "xdg-open", url }, { detach = true })
 				end, { buffer = buf, silent = true, desc = "Open Jira ticket in browser" })
 			end
+
+			vim.keymap.set("n", "?", function()
+				local entries = {}
+				if M.config.jira.open_url_map and M.config.jira.open_url_map ~= "" and url ~= "" then
+					table.insert(entries, { M.config.jira.open_url_map, "Open in browser" })
+				end
+				table.insert(entries, { "q / <Esc>", "Close" })
+				open_help_float(entries, "Jira — Keymaps")
+			end, { buffer = buf, desc = "Show keymap help", silent = true })
 		end)
 	end)
 end
@@ -3596,7 +4006,12 @@ local function open_attachment_at_cursor()
 
 	local self_href = (pr.links and pr.links.self and pr.links.self[1] and pr.links.self[1].href) or ""
 	local base_url = self_href:match("^(https?://[^/]+)") or ""
-	local project = (pr.toRef and pr.toRef.repository and pr.toRef.repository.project and pr.toRef.repository.project.key) or ""
+	local project = (
+		pr.toRef
+		and pr.toRef.repository
+		and pr.toRef.repository.project
+		and pr.toRef.repository.project.key
+	) or ""
 	local repo = (pr.toRef and pr.toRef.repository and pr.toRef.repository.slug) or ""
 	if base_url == "" or project == "" or repo == "" then
 		vim.notify("bb_pr: cannot determine PR context", vim.log.levels.WARN)
@@ -3665,18 +4080,22 @@ end
 
 function M.show_stats(opts)
 	opts = opts or {}
-	local repos = opts.repos or M.config.stats_repos or ""
-	local project = opts.project or M.config.stats_project or ""
-	local since_days = opts.since_days or M.config.stats_since_days or 30
-	local concurrency = opts.concurrency or M.config.stats_concurrency or 10
-	local top = opts.top or M.config.stats_top or 20
-	local ignore_users = opts.ignore_users or M.config.stats_ignore_users or ""
+	local repos = opts.repos or M.config.stats.repos or ""
+	local project = opts.project or M.config.stats.project or ""
+	local since_days = opts.since_days or M.config.stats.since_days or 30
+	local concurrency = opts.concurrency or M.config.stats.concurrency or 10
+	local top = opts.top or M.config.stats.top or 20
+	local ignore_users = opts.ignore_users or M.config.stats.ignore_users or ""
 
 	-- Auto-detect repo/project from current context when not explicitly configured.
 	if repos == "" or project == "" then
 		local detected_repo, detected_proj = stats_detect_context()
-		if repos == "" then repos = detected_repo end
-		if project == "" then project = detected_proj end
+		if repos == "" then
+			repos = detected_repo
+		end
+		if project == "" then
+			project = detected_proj
+		end
 	end
 
 	if repos == "" then
@@ -3690,12 +4109,16 @@ function M.show_stats(opts)
 	end
 
 	if not opts._period_selected then
-		local default_days = tostring(M.config.stats_since_days or 30)
+		local default_days = tostring(M.config.stats.since_days or 30)
 		local period_choices = { "7", "14", "30", "60", "90", "180", "365", "0" }
 		-- Bubble the configured default to the top so pickers pre-select it.
 		table.sort(period_choices, function(a, b)
-			if a == default_days then return true end
-			if b == default_days then return false end
+			if a == default_days then
+				return true
+			end
+			if b == default_days then
+				return false
+			end
 			return false
 		end)
 		vim.ui.select(period_choices, {
@@ -3714,7 +4137,9 @@ function M.show_stats(opts)
 				return label
 			end,
 		}, function(choice)
-			if not choice then return end
+			if not choice then
+				return
+			end
 			opts.since_days = tonumber(choice) or 0
 			opts.repos = repos
 			opts.project = project
@@ -3766,7 +4191,9 @@ function M.show_stats(opts)
 
 	vim.system(cmd, { text = true }, function(res)
 		vim.schedule(function()
-			if not vim.api.nvim_buf_is_valid(buf) then return end
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return
+			end
 			vim.bo[buf].modifiable = true
 
 			if res.code ~= 0 then
@@ -3806,6 +4233,117 @@ function M.show_stats(opts)
 			vim.bo[buf].modifiable = false
 		end)
 	end)
+end
+
+open_help_float = function(entries, title)
+	local key_width = 0
+	for _, e in ipairs(entries) do
+		key_width = math.max(key_width, #e[1])
+	end
+	key_width = key_width + 2
+	local lines = {}
+	for _, e in ipairs(entries) do
+		table.insert(lines, string.format("  %-" .. key_width .. "s  %s", e[1], e[2]))
+	end
+	local width = math.max(50, key_width + 34)
+	local height = #lines + 2
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].modifiable = false
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = math.floor((vim.o.lines - height) / 2),
+		col = math.floor((vim.o.columns - width) / 2),
+		style = "minimal",
+		border = "rounded",
+		title = " " .. title .. " ",
+		title_pos = "center",
+	})
+	for _, key in ipairs({ "q", "<Esc>", "?" }) do
+		vim.keymap.set("n", key, function()
+			pcall(vim.api.nvim_win_close, win, true)
+		end, { buffer = buf, silent = true })
+	end
+end
+
+set_diff_buffer_keymaps = function(bufnr)
+	if vim.b[bufnr].bb_pr_diff_keymaps_set then
+		return
+	end
+	vim.b[bufnr].bb_pr_diff_keymaps_set = true
+
+	local cfg = M.config
+	local buf = bufnr
+
+	local function gmap(base, cmd, desc)
+		if base and base ~= "" then
+			vim.keymap.set("n", "g" .. base, cmd, { buffer = buf, desc = desc, silent = true })
+		end
+	end
+
+	-- open comments float: hardcoded gc (base key "c" is create-comment, so open gets gc separately)
+	vim.keymap.set(
+		"n",
+		"gc",
+		"<cmd>BBPROpenLineComments<CR>",
+		{ buffer = buf, desc = "Open PR comments for current line", silent = true }
+	)
+
+	-- comment creation keys: diff buffer prefixes base key with "g"
+	-- (reply/react/delete/edit/resolve/toggle_task/accept_suggestion require cursor on
+	-- a comment line — only work in float/overview, not in the diff buffer)
+	gmap(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create comment")
+	gmap(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
+	gmap(cfg.comments.create_suggestion_map, "<cmd>BBPRCreateSuggestion<CR>", "Create suggestion")
+
+	-- diff-only utility keys: used as-is, no g prefix
+	if cfg.comments.next_map and cfg.comments.next_map ~= "" then
+		vim.keymap.set("n", cfg.comments.next_map, function()
+			jump_comment(1)
+		end, { buffer = buf, desc = "Jump to next PR comment", silent = true })
+	end
+	if cfg.comments.prev_map and cfg.comments.prev_map ~= "" then
+		vim.keymap.set("n", cfg.comments.prev_map, function()
+			jump_comment(-1)
+		end, { buffer = buf, desc = "Jump to previous PR comment", silent = true })
+	end
+	if cfg.comments.refresh_map and cfg.comments.refresh_map ~= "" then
+		vim.keymap.set(
+			"n",
+			cfg.comments.refresh_map,
+			"<cmd>BBPRRefreshComments<CR>",
+			{ buffer = buf, desc = "Force refresh PR comments", silent = true }
+		)
+	end
+
+	vim.keymap.set("n", "?", function()
+		local c = M.config
+		local function e(base, desc)
+			return (base and base ~= "") and { "g" .. base, desc } or nil
+		end
+		local function ed(key, desc)
+			return (key and key ~= "") and { key, desc } or nil
+		end
+		local entries = {}
+		for _, v in ipairs({
+			{ "gc", "Open line comments" },
+			ed(c.comments.prev_map, "Previous comment"),
+			ed(c.comments.next_map, "Next comment"),
+			e(c.comments.create_map, "Create comment"),
+			e(c.comments.create_task_map, "Create task"),
+			e(c.comments.create_suggestion_map, "Create suggestion"),
+			ed(c.comments.refresh_map, "Refresh comments"),
+		}) do
+			if v then
+				table.insert(entries, v)
+			end
+		end
+		open_help_float(entries, "PR Diff — Keymaps")
+	end, { buffer = buf, desc = "Show keymap help", silent = true })
 end
 
 function M.setup(opts)
@@ -3867,23 +4405,6 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
-	vim.keymap.set(
-		"n",
-		"gc",
-		"<cmd>BBPROpenLineComments<CR>",
-		{ desc = "Open PR comments for current line", silent = true }
-	)
-	if M.config.comment_next_map and M.config.comment_next_map ~= "" then
-		vim.keymap.set("n", M.config.comment_next_map, function()
-			jump_comment(1)
-		end, { desc = "Jump to next PR comment", silent = true })
-	end
-	if M.config.comment_prev_map and M.config.comment_prev_map ~= "" then
-		vim.keymap.set("n", M.config.comment_prev_map, function()
-			jump_comment(-1)
-		end, { desc = "Jump to previous PR comment", silent = true })
-	end
-
 	vim.api.nvim_create_user_command("BBPRCreateComment", function()
 		post_comment_or_task(false, false)
 	end, { desc = "Create or reply PR comment from cursor context" })
@@ -3933,138 +4454,18 @@ function M.setup(opts)
 		merge_current_pr()
 	end, { desc = "Merge pull request opened in current tab" })
 
-	if M.config.create_comment_map and M.config.create_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.create_comment_map,
-			"<cmd>BBPRCreateComment<CR>",
-			{ desc = "Create PR comment", silent = true }
-		)
+	if M.config.pr.create_map and M.config.pr.create_map ~= "" then
+		vim.keymap.set("n", M.config.pr.create_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
 	end
-	if M.config.create_task_map and M.config.create_task_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.create_task_map,
-			"<cmd>BBPRCreateTask<CR>",
-			{ desc = "Create PR task", silent = true }
-		)
+	if M.config.pr.merge_map and M.config.pr.merge_map ~= "" then
+		vim.keymap.set("n", M.config.pr.merge_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
 	end
-	if M.config.create_suggestion_map and M.config.create_suggestion_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.create_suggestion_map,
-			"<cmd>BBPRCreateSuggestion<CR>",
-			{ desc = "Create PR suggestion comment", silent = true }
-		)
-	end
-	if M.config.accept_suggestion_map and M.config.accept_suggestion_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.accept_suggestion_map,
-			"<cmd>BBPRAcceptSuggestion<CR>",
-			{ desc = "Accept PR suggestion", silent = true }
-		)
-	end
-	if M.config.reply_comment_map and M.config.reply_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.reply_comment_map,
-			"<cmd>BBPRReplyComment<CR>",
-			{ desc = "Reply PR comment", silent = true }
-		)
-	end
-	if M.config.react_comment_map and M.config.react_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.react_comment_map,
-			"<cmd>BBPRReactComment<CR>",
-			{ desc = "React to PR comment", silent = true }
-		)
-	end
-	if M.config.delete_comment_map and M.config.delete_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.delete_comment_map,
-			"<cmd>BBPRDeleteComment<CR>",
-			{ desc = "Delete PR comment", silent = true }
-		)
-	end
-	if M.config.edit_comment_map and M.config.edit_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.edit_comment_map,
-			"<cmd>BBPREditComment<CR>",
-			{ desc = "Edit PR comment", silent = true }
-		)
-	end
-	if M.config.toggle_task_map and M.config.toggle_task_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.toggle_task_map,
-			"<cmd>BBPRToggleTask<CR>",
-			{ desc = "Toggle PR task done/open", silent = true }
-		)
-	end
-	if M.config.resolve_comment_map and M.config.resolve_comment_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.resolve_comment_map,
-			"<cmd>BBPRResolveComment<CR>",
-			{ desc = "Resolve/unresolve PR comment thread", silent = true }
-		)
-	end
-	if M.config.refresh_comments_map and M.config.refresh_comments_map ~= "" then
-		vim.keymap.set(
-			"n",
-			M.config.refresh_comments_map,
-			"<cmd>BBPRRefreshComments<CR>",
-			{ desc = "Force refresh PR comments", silent = true }
-		)
-	end
-	if M.config.create_pr_map and M.config.create_pr_map ~= "" then
-		vim.keymap.set("n", M.config.create_pr_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
-	end
-	if M.config.merge_pr_map and M.config.merge_pr_map ~= "" then
-		vim.keymap.set("n", M.config.merge_pr_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
-	end
-	if M.config.jira_open_map and M.config.jira_open_map ~= "" then
-		vim.keymap.set("n", M.config.jira_open_map, function()
-			local ticket = ticket_under_cursor()
-			if not ticket then
-				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
-				return
-			end
-			open_jira_ticket(ticket)
-		end, { desc = "Open Jira ticket", silent = true })
-	end
-	if M.config.jira_open_url_map and M.config.jira_open_url_map ~= "" then
-		vim.keymap.set("n", M.config.jira_open_url_map, function()
-			local ticket = ticket_under_cursor()
-			if not ticket then
-				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
-				return
-			end
-			local jira_base = vim.trim(M.config.jira_base_url or "")
-			if jira_base == "" then
-				vim.notify("bb_pr: jira_base_url not configured", vim.log.levels.WARN)
-				return
-			end
-			local jira_url = jira_base:gsub("/$", "") .. "/browse/" .. ticket
-			vim.fn.jobstart({ "xdg-open", jira_url }, { detach = true })
-		end, { desc = "Open Jira ticket in browser", silent = true })
-	end
-	if M.config.image_open_map and M.config.image_open_map ~= "" then
-		vim.keymap.set("n", M.config.image_open_map, function()
-			open_attachment_at_cursor()
-		end, { desc = "Download and open attachment under cursor", silent = true })
-	end
-
 	vim.api.nvim_create_user_command("BBPRStats", function()
 		M.show_stats()
 	end, { desc = "Show PR statistics in a floating window" })
 
-	if M.config.stats_map and M.config.stats_map ~= "" then
-		vim.keymap.set("n", M.config.stats_map, "<cmd>BBPRStats<CR>", { desc = "BB PR Stats", silent = true })
+	if M.config.stats.map and M.config.stats.map ~= "" then
+		vim.keymap.set("n", M.config.stats.map, "<cmd>BBPRStats<CR>", { desc = "BB PR Stats", silent = true })
 	end
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })

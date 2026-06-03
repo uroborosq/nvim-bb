@@ -90,6 +90,7 @@ type PullRequest struct {
 	Reviewers      []Reviewer `json:"reviewers"`
 	MyReviewStatus string     `json:"my_review_status,omitempty"`
 	MyApproved     bool       `json:"my_approved,omitempty"`
+	BuildStatus    string     `json:"build_status,omitempty"` // SUCCESSFUL | FAILED | INPROGRESS | NONE
 
 	FromRef Ref `json:"fromRef"`
 	ToRef   Ref `json:"toRef"`
@@ -109,9 +110,33 @@ type Reviewer struct {
 }
 
 type Ref struct {
-	ID         string     `json:"id"`
-	DisplayID  string     `json:"displayId"`
-	Repository Repository `json:"repository"`
+	ID           string     `json:"id"`
+	DisplayID    string     `json:"displayId"`
+	LatestCommit string     `json:"latestCommit"`
+	Repository   Repository `json:"repository"`
+}
+
+type BuildStatus struct {
+	State       string `json:"state"` // SUCCESSFUL | FAILED | INPROGRESS | UNKNOWN | CANCELLED
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Description string `json:"description"`
+	DateAdded   int64  `json:"dateAdded"`
+}
+
+type BuildStatusPage struct {
+	Size       int           `json:"size"`
+	IsLastPage bool          `json:"isLastPage"`
+	Values     []BuildStatus `json:"values"`
+}
+
+// BuildSummary is the aggregated build status of a PR's latest commit.
+type BuildSummary struct {
+	Commit  string         `json:"commit"`
+	Summary string         `json:"summary"` // SUCCESSFUL | FAILED | INPROGRESS | NONE
+	Counts  map[string]int `json:"counts"`
+	Builds  []BuildStatus  `json:"builds"`
 }
 
 type Repository struct {
@@ -421,6 +446,22 @@ type JiraComment struct {
 	Created string `json:"created"`
 }
 
+// buildMarker renders an aggregated build state as a single short glyph.
+func buildMarker(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "SUCCESSFUL":
+		return "✓"
+	case "FAILED":
+		return "✗"
+	case "INPROGRESS":
+		return "●"
+	case "NONE":
+		return "○"
+	default:
+		return " "
+	}
+}
+
 func runDashboardCommand(args []string) error {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath(), "path to config")
@@ -462,11 +503,12 @@ func runDashboardCommand(args []string) error {
 	}
 
 	enrichPullRequests(page.Values, cfg)
+	enrichPullRequestBuilds(ctx, client, page.Values)
 
 	now := time.Now()
 	var sb strings.Builder
 	// header line (url field is empty so fzf skips it with --with-nth=2..)
-	sb.WriteString("\tAGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tREPO\tAUTHOR\tTITLE\n")
+	sb.WriteString("\tB\tAGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tREPO\tAUTHOR\tTITLE\n")
 	for _, pr := range page.Values {
 		prURL := ""
 		if len(pr.Links.Self) > 0 {
@@ -484,8 +526,9 @@ func runDashboardCommand(args []string) error {
 			lcomStr = humanAge(now.Sub(t))
 		}
 
-		line := fmt.Sprintf("%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
+		line := fmt.Sprintf("%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
 			prURL,
+			buildMarker(pr.BuildStatus),
 			ageStr,
 			lcomStr,
 			pr.CommentCount,
@@ -563,6 +606,7 @@ func main() {
 	}
 
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
+	buildsEnabled := flag.Bool("builds", false, "enrich PR list with aggregated build status (Jenkins)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
@@ -579,6 +623,7 @@ func main() {
 	prUpdateVersion := flag.Int("pr-update-version", -1, "current pull request version for -pr-update (optimistic lock)")
 	prMergeID := flag.Int64("pr-merge", 0, "merge pull request by id")
 	prCommitsID := flag.Int64("pr-commits", 0, "print pull request commits as JSON for the given PR id")
+	prBuildsID := flag.Int64("pr-builds", 0, "print aggregated build status (Jenkins) as JSON for the given PR id")
 	targetBranches := flag.Bool("target-branches", false, "list target branches for PR creation")
 	prTitle := flag.String("pr-title", "", "pull request title for -pr-create")
 	prBody := flag.String("pr-body", "", "pull request description for -pr-create")
@@ -801,6 +846,19 @@ func main() {
 		return
 	}
 
+	if *prBuildsID > 0 {
+		summary, err := client.GetPullRequestBuildSummary(ctx, *prBuildsID)
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(summary); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
 	if *prMergeID > 0 {
 		title := strings.TrimSpace(*mergeTitle)
 		if title == "" {
@@ -899,6 +957,9 @@ func main() {
 
 	sortPullRequests(prs, cfg)
 	enrichPullRequests(prs, cfg)
+	if *buildsEnabled {
+		enrichPullRequestBuilds(ctx, client, prs)
+	}
 
 	if cfg.JSONOutput || *jsonEnabled {
 		enc := json.NewEncoder(os.Stdout)
@@ -1889,6 +1950,80 @@ func (c *Client) GetPullRequest(ctx context.Context, prID int64) (*PullRequest, 
 	return &out, nil
 }
 
+// GetCommitBuildStatuses returns the build statuses (e.g. Jenkins) attached to a
+// commit via Bitbucket's build-status API.
+func (c *Client) GetCommitBuildStatuses(ctx context.Context, commitID string) ([]BuildStatus, error) {
+	path := fmt.Sprintf("/rest/build-status/1.0/commits/%s", url.PathEscape(commitID))
+	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var page BuildStatusPage
+	if err := json.Unmarshal(b, &page); err != nil {
+		return nil, fmt.Errorf("decode build statuses: %w", err)
+	}
+	return page.Values, nil
+}
+
+// GetPullRequestBuildSummary fetches the latest commit of a PR and aggregates its
+// build statuses into a single summary.
+func (c *Client) GetPullRequestBuildSummary(ctx context.Context, prID int64) (*BuildSummary, error) {
+	pr, err := c.GetPullRequest(ctx, prID)
+	if err != nil {
+		return nil, err
+	}
+	commit := strings.TrimSpace(pr.FromRef.LatestCommit)
+	summary := &BuildSummary{
+		Commit:  commit,
+		Summary: "NONE",
+		Counts:  map[string]int{},
+		Builds:  []BuildStatus{},
+	}
+	if commit == "" {
+		return summary, nil
+	}
+
+	builds, err := c.GetCommitBuildStatuses(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	summary.Builds = builds
+	summary.Summary = aggregateBuildState(builds)
+	for _, b := range builds {
+		summary.Counts[strings.ToUpper(strings.TrimSpace(b.State))]++
+	}
+	return summary, nil
+}
+
+// aggregateBuildState collapses multiple build statuses into one overall state:
+// any FAILED wins, then any INPROGRESS, then SUCCESSFUL, else NONE.
+func aggregateBuildState(builds []BuildStatus) string {
+	if len(builds) == 0 {
+		return "NONE"
+	}
+	var hasFailed, hasInProgress, hasSuccess bool
+	for _, b := range builds {
+		switch strings.ToUpper(strings.TrimSpace(b.State)) {
+		case "FAILED":
+			hasFailed = true
+		case "INPROGRESS":
+			hasInProgress = true
+		case "SUCCESSFUL":
+			hasSuccess = true
+		}
+	}
+	switch {
+	case hasFailed:
+		return "FAILED"
+	case hasInProgress:
+		return "INPROGRESS"
+	case hasSuccess:
+		return "SUCCESSFUL"
+	default:
+		return "NONE"
+	}
+}
+
 func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body string) error {
 	mergeability, err := c.GetPullRequestMergeability(ctx, prID)
 	if err != nil {
@@ -2323,6 +2458,41 @@ func enrichPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 		prs[i].MyReviewStatus = status
 		prs[i].MyApproved = approved
 	}
+}
+
+// enrichPullRequestBuilds fills BuildStatus for each PR by fetching build
+// statuses of its latest commit concurrently.
+func enrichPullRequestBuilds(ctx context.Context, c *Client, prs []PullRequest) {
+	const workers = 10
+	type job struct{ idx int }
+	jobs := make(chan job)
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				commit := strings.TrimSpace(prs[j.idx].FromRef.LatestCommit)
+				if commit == "" {
+					prs[j.idx].BuildStatus = "NONE"
+					continue
+				}
+				builds, err := c.GetCommitBuildStatuses(ctx, commit)
+				if err != nil {
+					prs[j.idx].BuildStatus = ""
+					continue
+				}
+				prs[j.idx].BuildStatus = aggregateBuildState(builds)
+			}
+		}()
+	}
+
+	for i := range prs {
+		jobs <- job{idx: i}
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 func myApprovalMarker(pr PullRequest, cfg RuntimeConfig) string {
