@@ -4,7 +4,8 @@
 
 ## Roadmap
 
-- etwa dashboard
+- review mode support
+- logs for debug
 
 ## Overview
 
