@@ -446,6 +446,16 @@ type JiraComment struct {
 	Created string `json:"created"`
 }
 
+// padRight pads s with spaces to the given display width, measured in runes so
+// multi-byte names (e.g. Cyrillic) align correctly.
+func padRight(s string, width int) string {
+	n := len([]rune(s))
+	if n >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-n)
+}
+
 // buildMarker renders an aggregated build state as a single short glyph.
 func buildMarker(status string) string {
 	switch strings.ToUpper(strings.TrimSpace(status)) {
@@ -506,9 +516,13 @@ func runDashboardCommand(args []string) error {
 	enrichPullRequestBuilds(ctx, client, page.Values)
 
 	now := time.Now()
-	var sb strings.Builder
-	// header line (url field is empty so fzf skips it with --with-nth=2..)
-	sb.WriteString("\tB\tAGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tREPO\tAUTHOR\tTITLE\n")
+
+	headers := []string{"B", "AGE", "LCOM", "CMTS", "NW", "APPR", "MINE", "REPO", "AUTHOR", "TITLE"}
+	type dashRow struct {
+		url   string
+		cells []string
+	}
+	rows := make([]dashRow, 0, len(page.Values))
 	for _, pr := range page.Values {
 		prURL := ""
 		if len(pr.Links.Self) > 0 {
@@ -526,20 +540,53 @@ func runDashboardCommand(args []string) error {
 			lcomStr = humanAge(now.Sub(t))
 		}
 
-		line := fmt.Sprintf("%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
-			prURL,
-			buildMarker(pr.BuildStatus),
-			ageStr,
-			lcomStr,
-			pr.CommentCount,
-			needsWorkStatus(pr.Reviewers),
-			countApprovals(pr.Reviewers),
-			myApprovalMarker(pr, cfg),
-			repoLabel,
-			displayUser(pr.Author.User),
-			sanitizeCell(pr.Title),
-		)
-		sb.WriteString(line)
+		rows = append(rows, dashRow{
+			url: prURL,
+			cells: []string{
+				buildMarker(pr.BuildStatus),
+				ageStr,
+				lcomStr,
+				strconv.Itoa(pr.CommentCount),
+				needsWorkStatus(pr.Reviewers),
+				strconv.Itoa(countApprovals(pr.Reviewers)),
+				myApprovalMarker(pr, cfg),
+				repoLabel,
+				displayUser(pr.Author.User),
+				sanitizeCell(pr.Title),
+			},
+		})
+	}
+
+	// column widths (rune-aware); the last column (TITLE) is never padded
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = len([]rune(h))
+	}
+	for _, r := range rows {
+		for i, c := range r.cells {
+			if w := len([]rune(c)); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+
+	formatCells := func(cells []string) string {
+		var parts []string
+		for i, c := range cells {
+			if i == len(cells)-1 {
+				parts = append(parts, c)
+			} else {
+				parts = append(parts, padRight(c, widths[i]))
+			}
+		}
+		return strings.Join(parts, "  ")
+	}
+
+	var sb strings.Builder
+	// header line (url field is empty so fzf skips it with --with-nth=2..)
+	sb.WriteString("\t" + formatCells(headers) + "\n")
+	for _, r := range rows {
+		sb.WriteString(r.url + "\t" + formatCells(r.cells) + "\n")
 	}
 
 	fzf := exec.Command("fzf",
@@ -550,7 +597,6 @@ func runDashboardCommand(args []string) error {
 		"--prompt=Reviewer PRs> ",
 		"--height=60%",
 		"--reverse",
-		"--tabstop=4",
 	)
 	fzf.Stdin = strings.NewReader(sb.String())
 	fzf.Stderr = os.Stderr
