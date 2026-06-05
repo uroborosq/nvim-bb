@@ -1722,6 +1722,56 @@ local function close_old_pr_tabs()
 	log("close_old_pr_tabs: closed", #pr_tabs, "tab(s)")
 end
 
+-- Resolve and cache the absolute git toplevel of the working copy the plugin
+-- drives. Every git command and DiffviewOpen below is pinned to this path:
+-- Neovim's process cwd shifts whenever a window/tab carrying a local directory
+-- (`:lcd`/`:tcd`) gains focus, and close_old_pr_tabs() reshuffles tabs between the
+-- checkout and DiffviewOpen. Relying on the ambient cwd makes the git commands
+-- and diffview intermittently fail to find the repo ("Path not a git repo").
+local function resolve_repo_root()
+	if state.repo_root and vim.fn.isdirectory(state.repo_root) == 1 then
+		return state.repo_root
+	end
+
+	local seen, candidates = {}, {}
+	local function add(dir)
+		if type(dir) == "string" and dir ~= "" and not seen[dir] then
+			seen[dir] = true
+			candidates[#candidates + 1] = dir
+		end
+	end
+
+	local bufname = vim.api.nvim_buf_get_name(0)
+	if type(bufname) == "string" and bufname:match("^diffview://") then
+		-- diffview:// buffers encode the toplevel: diffview://<top>/.git/<rev>/<path>
+		local stripped = bufname:gsub("^diffview://", "")
+		local git_idx = stripped:find("/%.git/")
+		if git_idx then
+			add(stripped:sub(1, git_idx - 1))
+		end
+	elseif type(bufname) == "string" and bufname ~= "" and vim.bo.buftype == "" then
+		add(vim.fn.fnamemodify(bufname, ":p:h"))
+	end
+
+	add(vim.fn.getcwd(-1, -1)) -- global cwd (what bare `vim.system` git calls use)
+	add(vim.fn.getcwd()) -- window-local cwd, if any
+
+	for _, dir in ipairs(candidates) do
+		if vim.fn.isdirectory(dir) == 1 then
+			local res = vim.system({ "git", "rev-parse", "--show-toplevel" }, { cwd = dir, text = true }):wait(2000)
+			if res.code == 0 then
+				local root = vim.trim(res.stdout or "")
+				if root ~= "" and vim.fn.isdirectory(root) == 1 then
+					state.repo_root = root
+					return root
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
 local function open_diffview(pr)
 	local from_ref = pr.fromRef and pr.fromRef.displayId
 	local to_ref = pr.toRef and pr.toRef.displayId
@@ -1730,9 +1780,22 @@ local function open_diffview(pr)
 		return
 	end
 
+	local repo_root = resolve_repo_root()
+	if not repo_root then
+		vim.notify(
+			"bb_pr: could not locate the git repository — open a file from the repo first",
+			vim.log.levels.ERROR
+		)
+		return
+	end
+
+	-- Pin every git command and DiffviewOpen to repo_root so the flow is immune to
+	-- the process cwd drifting as tabs/windows with local directories gain focus.
+	local git_opts = { text = true, cwd = repo_root }
+
 	local function open_after_fetch()
 		local checkout_cmd = { "git", "checkout", "-B", from_ref, "origin/" .. from_ref }
-		vim.system(checkout_cmd, { text = true }, function(co_res)
+		vim.system(checkout_cmd, git_opts, function(co_res)
 			if co_res.code ~= 0 then
 				vim.schedule(function()
 					vim.notify(
@@ -1743,7 +1806,7 @@ local function open_diffview(pr)
 				return
 			end
 			local merge_cmd = { "git", "merge", "origin/" .. to_ref, "--no-edit" }
-			vim.system(merge_cmd, { text = true }, function(merge_res)
+			vim.system(merge_cmd, git_opts, function(merge_res)
 				vim.schedule(function()
 					if merge_res.code ~= 0 then
 						vim.notify(
@@ -1753,7 +1816,14 @@ local function open_diffview(pr)
 						return
 					end
 					close_old_pr_tabs()
-					vim.cmd(string.format("%s origin/%s", M.config.diffview_cmd, to_ref))
+					vim.cmd(
+						string.format(
+							"%s -C%s origin/%s",
+							M.config.diffview_cmd,
+							vim.fn.fnameescape(repo_root),
+							to_ref
+						)
+					)
 					set_current_tab_pr(pr)
 					run_comments_provider(pr.id, function(payload)
 						vim.schedule(function()
@@ -1777,7 +1847,7 @@ local function open_diffview(pr)
 		"+refs/heads/" .. from_ref .. ":refs/remotes/origin/" .. from_ref,
 	}
 
-	vim.system({ "git", "diff", "--quiet", "HEAD" }, { text = true }, function(st_res)
+	vim.system({ "git", "diff", "--quiet", "HEAD" }, git_opts, function(st_res)
 		if st_res.code ~= 0 then
 			vim.schedule(function()
 				vim.notify(
@@ -1788,7 +1858,7 @@ local function open_diffview(pr)
 			return
 		end
 
-		vim.system(fetch_cmd, { text = true }, function(fetch_res)
+		vim.system(fetch_cmd, git_opts, function(fetch_res)
 			if fetch_res.code ~= 0 then
 				vim.schedule(function()
 					vim.notify("bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""), vim.log.levels.ERROR)
@@ -1804,7 +1874,7 @@ local function open_diffview(pr)
 				"origin/" .. from_ref,
 			}
 
-			vim.system(merge_check_cmd, { text = true }, function(_)
+			vim.system(merge_check_cmd, git_opts, function(_)
 				vim.schedule(open_after_fetch)
 			end)
 		end)
