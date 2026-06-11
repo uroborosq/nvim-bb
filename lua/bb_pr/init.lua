@@ -21,6 +21,7 @@ local default_config = {
 		edit_map = "u",
 		resolve_map = "<space>",
 		toggle_task_map = "<Tab>",
+		convert_task_map = "t",
 		create_map = "C",
 		create_task_map = "K",
 		create_suggestion_map = "s",
@@ -998,6 +999,7 @@ local function open_comment_float(comments, line)
 	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
 	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
 	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
+	map(cfg.comments.convert_task_map, "<cmd>BBPRConvertTask<CR>", "Convert comment <-> task")
 	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
 	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create comment")
 	map(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
@@ -1017,6 +1019,7 @@ local function open_comment_float(comments, line)
 			e(c.comments.edit_map, "Edit comment"),
 			e(c.comments.resolve_map, "Resolve / unresolve thread"),
 			e(c.comments.toggle_task_map, "Toggle task done/open"),
+			e(c.comments.convert_task_map, "Convert comment <-> task"),
 			e(c.comments.create_map, "Create comment"),
 			e(c.comments.create_task_map, "Create task"),
 			e(c.comments.create_suggestion_map, "Create suggestion"),
@@ -2548,6 +2551,7 @@ local function open_pr_info(pr)
 	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
 	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
 	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
+	map(cfg.comments.convert_task_map, "<cmd>BBPRConvertTask<CR>", "Convert comment <-> task")
 	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
 	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create overview comment")
 
@@ -2572,6 +2576,7 @@ local function open_pr_info(pr)
 			e(c.comments.edit_map, "Edit comment"),
 			e(c.comments.resolve_map, "Resolve / unresolve thread"),
 			e(c.comments.toggle_task_map, "Toggle task done/open"),
+			e(c.comments.convert_task_map, "Convert comment <-> task"),
 			e(c.comments.create_map, "Create overview comment"),
 			{ "q", "Close" },
 		}) do
@@ -3800,6 +3805,53 @@ local function edit_comment()
 	end)
 end
 
+local function convert_comment_task()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	local cid = resolve_reply_target_comment_id()
+	if not cid then
+		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+	local target = find_comment_by_id(cid)
+	if type(target) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	local version = tonumber(target.version or -1) or -1
+	if version < 0 then
+		vim.notify("bb_pr: selected comment has invalid version for convert", vim.log.levels.WARN)
+		return
+	end
+	local convert_to = target.is_task and "comment" or "task"
+	local cmd = bb_cmd({
+		"-json",
+		"-pr-convert-comment",
+		tostring(pr.id),
+		"-convert-comment-id",
+		tostring(cid),
+		"-convert-comment-version",
+		tostring(version),
+		"-convert-to",
+		convert_to,
+	})
+	vim.system(cmd, { text = true }, function(res)
+		if res.code ~= 0 then
+			vim.schedule(function()
+				vim.notify("bb_pr: convert failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+			end)
+			return
+		end
+		vim.schedule(function()
+			vim.notify("bb_pr: converted to " .. convert_to, vim.log.levels.INFO)
+			vim.cmd("BBPRLoadComments")
+		end)
+	end)
+end
+
 local function post_comment_or_task(is_task, force_reply, opts)
 	opts = opts or {}
 	local pr = get_current_tab_pr()
@@ -4506,6 +4558,10 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPRResolveComment", function()
 		resolve_comment()
 	end, { desc = "Resolve/unresolve PR comment thread under cursor" })
+
+	vim.api.nvim_create_user_command("BBPRConvertTask", function()
+		convert_comment_task()
+	end, { desc = "Convert PR comment to task or back under cursor" })
 
 	vim.api.nvim_create_user_command("BBPRReactComment", function()
 		react_to_comment()
