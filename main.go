@@ -660,6 +660,10 @@ func main() {
 	prUpdateCommentID := flag.Int64("pr-update-comment", 0, "update PR comment text by id for the given PR id")
 	updateCommentID := flag.Int64("update-comment-id", 0, "comment id for -pr-update-comment")
 	updateCommentVersion := flag.Int("update-comment-version", -1, "comment version for -pr-update-comment (optimistic lock)")
+	prConvertCommentID := flag.Int64("pr-convert-comment", 0, "convert PR comment to task or back for the given PR id")
+	convertCommentID := flag.Int64("convert-comment-id", 0, "comment id for -pr-convert-comment")
+	convertCommentVersion := flag.Int("convert-comment-version", -1, "comment version for -pr-convert-comment (optimistic lock)")
+	convertTo := flag.String("convert-to", "", "convert target: task|comment")
 	prReviewID := flag.Int64("pr-review", 0, "set your review state for the given PR id")
 	reviewAction := flag.String("review-action", "", "review action: approve|disapprove|needs-work")
 	prTaskStatusID := flag.Int64("pr-task-status", 0, "change state of PR task/comment by id for the given PR id")
@@ -816,6 +820,30 @@ func main() {
 			fatal(errors.New("-update-comment-version is required with -pr-update-comment"))
 		}
 		updated, err := client.UpdatePullRequestComment(ctx, *prUpdateCommentID, commentID, *updateCommentVersion, *commentText)
+		if err != nil {
+			fatal(err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(updated); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if *prConvertCommentID > 0 {
+		commentID := *convertCommentID
+		if commentID <= 0 {
+			fatal(errors.New("-convert-comment-id is required with -pr-convert-comment"))
+		}
+		if *convertCommentVersion < 0 {
+			fatal(errors.New("-convert-comment-version is required with -pr-convert-comment"))
+		}
+		to := strings.TrimSpace(*convertTo)
+		if to == "" {
+			fatal(errors.New("-convert-to is required with -pr-convert-comment (task|comment)"))
+		}
+		updated, err := client.SetPullRequestCommentSeverity(ctx, *prConvertCommentID, commentID, *convertCommentVersion, to)
 		if err != nil {
 			fatal(err)
 		}
@@ -1001,13 +1029,16 @@ func main() {
 		fatal(err)
 	}
 
-	sortPullRequests(prs, cfg)
 	enrichPullRequests(prs, cfg)
 	if *buildsEnabled {
 		enrichPullRequestBuilds(ctx, client, prs)
 	}
 
 	if cfg.JSONOutput || *jsonEnabled {
+		// Keep the bucket-based ordering for JSON consumers: the Neovim plugin's
+		// PR picker and selection rely on this order.
+		sortPullRequests(prs, cfg)
+
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 
@@ -1018,6 +1049,9 @@ func main() {
 		return
 	}
 
+	// Plain `bb` table: list every PR ordered purely by how long it has been
+	// open ("hanging time", longest first), independent of author/review buckets.
+	sortPullRequestsByOpenAge(prs)
 	printTable(prs, cfg, *reviewersEnabled)
 }
 
@@ -2154,6 +2188,35 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 	return err
 }
 
+// SetPullRequestCommentSeverity converts a comment to a task and back by
+// flipping its severity: BLOCKER marks it a task, NORMAL a plain comment.
+func (c *Client) SetPullRequestCommentSeverity(ctx context.Context, prID int64, commentID int64, version int, target string) (*PRComment, error) {
+	var severity string
+	switch strings.ToLower(strings.TrimSpace(target)) {
+	case "task", "blocker":
+		severity = "BLOCKER"
+	case "comment", "normal":
+		severity = "NORMAL"
+	default:
+		return nil, fmt.Errorf("bad -convert-to %q; expected task|comment", target)
+	}
+	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
+	body := struct {
+		Version  int    `json:"version"`
+		Severity string `json:"severity"`
+	}{Version: version, Severity: severity}
+	b, err := c.doJSON(ctx, http.MethodPut, path, body)
+	if err != nil {
+		return nil, err
+	}
+	var out PRComment
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode convert comment response: %w", err)
+	}
+	return &out, nil
+}
+
 func (c *Client) UpdatePullRequestComment(ctx context.Context, prID int64, commentID int64, version int, text string) (*PRComment, error) {
 	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
 		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
@@ -2561,6 +2624,20 @@ func sortPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 			return bucketI < bucketJ
 		}
 		return prs[i].UpdatedDate > prs[j].UpdatedDate
+	})
+}
+
+// sortPullRequestsByOpenAge orders PRs purely by how long they have been open
+// ("hanging time"): the oldest CreatedDate (longest open) comes first, matching a
+// descending AGE column. PRs with an unknown/zero CreatedDate sort last. Used only
+// for the plain table output; JSON consumers keep sortPullRequests' ordering.
+func sortPullRequestsByOpenAge(prs []PullRequest) {
+	sort.SliceStable(prs, func(i, j int) bool {
+		ci, cj := prs[i].CreatedDate, prs[j].CreatedDate
+		if (ci <= 0) != (cj <= 0) {
+			return ci > 0 // known dates before unknown ones
+		}
+		return ci < cj // older (longer open) first
 	})
 }
 
