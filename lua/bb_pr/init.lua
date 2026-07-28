@@ -52,6 +52,7 @@ local default_config = {
 		create_body_template = "",
 		merge_map = "<leader>rm",
 		merge_body_template_fn = nil,
+		close_map = "<leader>rq",
 	},
 
 	-- Jira
@@ -95,6 +96,7 @@ local state = {
 	comments_by_tab = {},
 	pending_comments_by_tab = {},
 	builds_by_tab = {},
+	conflict_by_tab = {},
 	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
@@ -527,6 +529,16 @@ end
 
 local function get_current_tab_comments()
 	return state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
+
+-- `info` is { to_ref = "<branch>" } while the PR branch sits on top of an unresolved
+-- merge with its target, nil otherwise.
+local function set_current_tab_conflict(info)
+	state.conflict_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = info
+end
+
+local function get_current_tab_conflict()
+	return state.conflict_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
 end
 
 local function consume_pending_tab_comments()
@@ -1721,6 +1733,7 @@ local function close_old_pr_tabs()
 		state.comments_by_tab[key] = nil
 		state.pending_comments_by_tab[key] = nil
 		state.builds_by_tab[key] = nil
+		state.conflict_by_tab[key] = nil
 	end
 	log("close_old_pr_tabs: closed", #pr_tabs, "tab(s)")
 end
@@ -1775,6 +1788,42 @@ local function resolve_repo_root()
 	return nil
 end
 
+-- Bail out of a merge left over from a conflicted PR checkout so the next PR can be
+-- checked out cleanly. Gated on MERGE_HEAD: a plain dirty working tree is still
+-- reported to the user instead of being silently reset.
+-- cb(ok, aborted): `aborted` says whether there actually was a merge to leave.
+local function abort_pending_merge(repo_root, cb)
+	local git_opts = { text = true, cwd = repo_root }
+	vim.system({ "git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD" }, git_opts, function(head_res)
+		if head_res.code ~= 0 then
+			cb(true, false)
+			return
+		end
+		vim.system({ "git", "merge", "--abort" }, git_opts, function(abort_res)
+			if abort_res.code == 0 then
+				log("abort_pending_merge: merge --abort succeeded")
+				cb(true, true)
+				return
+			end
+			-- `merge --abort` refuses when the resolution was partially staged or edited;
+			-- the merge is ours, so drop it outright.
+			vim.system({ "git", "reset", "--hard", "HEAD" }, git_opts, function(reset_res)
+				if reset_res.code ~= 0 then
+					vim.schedule(function()
+						vim.notify(
+							"bb_pr: failed to leave the conflicted merge: " .. (reset_res.stderr or ""),
+							vim.log.levels.ERROR
+						)
+					end)
+				else
+					log("abort_pending_merge: reset --hard after failed merge --abort")
+				end
+				cb(reset_res.code == 0, true)
+			end)
+		end)
+	end)
+end
+
 local function open_diffview(pr)
 	local from_ref = pr.fromRef and pr.fromRef.displayId
 	local to_ref = pr.toRef and pr.toRef.displayId
@@ -1811,12 +1860,21 @@ local function open_diffview(pr)
 			local merge_cmd = { "git", "merge", "origin/" .. to_ref, "--no-edit" }
 			vim.system(merge_cmd, git_opts, function(merge_res)
 				vim.schedule(function()
-					if merge_res.code ~= 0 then
+					-- A conflict is not fatal: the PR diff below still renders, with the
+					-- unmerged files carrying inline conflict markers. Diffview only builds
+					-- its 3-way "Conflicts" section for a revless `:DiffviewOpen`, because
+					-- `git diff --name-status <rev>` reports unmerged paths as M, not U —
+					-- so keep the rev here and let the user reach the merge tool manually.
+					-- The merge is rolled back by abort_pending_merge() on the next open.
+					local conflicted = merge_res.code ~= 0
+					if conflicted then
 						vim.notify(
-							"bb_pr: merge conflict with origin/" .. to_ref .. ": " .. (merge_res.stderr or ""),
-							vim.log.levels.ERROR
+							"bb_pr: merge conflict with origin/"
+								.. to_ref
+								.. " — opening the PR anyway; conflicted files carry inline markers,"
+								.. " run :DiffviewOpen with no arguments for the 3-way merge tool",
+							vim.log.levels.WARN
 						)
-						return
 					end
 					close_old_pr_tabs()
 					vim.cmd(
@@ -1828,6 +1886,7 @@ local function open_diffview(pr)
 						)
 					)
 					set_current_tab_pr(pr)
+					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
 					run_comments_provider(pr.id, function(payload)
 						vim.schedule(function()
 							set_current_tab_comments(payload)
@@ -1850,35 +1909,46 @@ local function open_diffview(pr)
 		"+refs/heads/" .. from_ref .. ":refs/remotes/origin/" .. from_ref,
 	}
 
-	vim.system({ "git", "diff", "--quiet", "HEAD" }, git_opts, function(st_res)
-		if st_res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify(
-					"bb_pr: working tree has uncommitted changes, cannot checkout " .. from_ref,
-					vim.log.levels.WARN
-				)
-			end)
-			return
+	-- Roll back a merge left behind by a previously opened conflicting PR first,
+	-- otherwise the dirty-tree gate below would refuse to check out the new branch.
+	abort_pending_merge(repo_root, function(cleanup_ok)
+		if not cleanup_ok then
+			return -- abort_pending_merge already notified
 		end
 
-		vim.system(fetch_cmd, git_opts, function(fetch_res)
-			if fetch_res.code ~= 0 then
+		vim.system({ "git", "diff", "--quiet", "HEAD" }, git_opts, function(st_res)
+			if st_res.code ~= 0 then
 				vim.schedule(function()
-					vim.notify("bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""), vim.log.levels.ERROR)
+					vim.notify(
+						"bb_pr: working tree has uncommitted changes, cannot checkout " .. from_ref,
+						vim.log.levels.WARN
+					)
 				end)
 				return
 			end
 
-			-- Match Bitbucket's merge check by trying a temporary merge of target into source.
-			local merge_check_cmd = {
-				"git",
-				"merge-tree",
-				"origin/" .. to_ref,
-				"origin/" .. from_ref,
-			}
+			vim.system(fetch_cmd, git_opts, function(fetch_res)
+				if fetch_res.code ~= 0 then
+					vim.schedule(function()
+						vim.notify(
+							"bb_pr: failed to fetch PR branches: " .. (fetch_res.stderr or ""),
+							vim.log.levels.ERROR
+						)
+					end)
+					return
+				end
 
-			vim.system(merge_check_cmd, git_opts, function(_)
-				vim.schedule(open_after_fetch)
+				-- Match Bitbucket's merge check by trying a temporary merge of target into source.
+				local merge_check_cmd = {
+					"git",
+					"merge-tree",
+					"origin/" .. to_ref,
+					"origin/" .. from_ref,
+				}
+
+				vim.system(merge_check_cmd, git_opts, function(_)
+					vim.schedule(open_after_fetch)
+				end)
 			end)
 		end)
 	end)
@@ -2214,6 +2284,12 @@ local function build_pr_info_content(pr)
 		"## Description",
 		"",
 	}
+
+	local conflict = get_current_tab_conflict()
+	if conflict then
+		-- right after "Opened:", so the conflict is the first thing visible in the header
+		table.insert(info_lines, 4, string.format("Merge: CONFLICT with origin/%s", conflict.to_ref))
+	end
 
 	vim.list_extend(info_lines, to_lines(pr.description))
 	table.insert(info_lines, "")
@@ -3339,6 +3415,31 @@ local function merge_current_pr()
 				end)
 			end)
 		end)
+	end)
+end
+
+-- Leave the PR: close its tabs and, if the checkout left an unresolved merge behind,
+-- roll that merge back so the working tree is usable again.
+local function close_current_pr()
+	local pr = get_current_tab_pr()
+	local repo_root = resolve_repo_root()
+	if not pr and not repo_root then
+		vim.notify("bb_pr: no PR open", vim.log.levels.WARN)
+		return
+	end
+
+	close_old_pr_tabs()
+
+	if not repo_root then
+		return
+	end
+
+	abort_pending_merge(repo_root, function(ok, aborted)
+		if ok and aborted then
+			vim.schedule(function()
+				vim.notify("bb_pr: left the conflicted merge, working tree reset", vim.log.levels.INFO)
+			end)
+		end
 	end)
 end
 
@@ -4579,12 +4680,18 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPRMerge", function()
 		merge_current_pr()
 	end, { desc = "Merge pull request opened in current tab" })
+	vim.api.nvim_create_user_command("BBPRClose", function()
+		close_current_pr()
+	end, { desc = "Close open PR tabs and roll back a conflicted merge" })
 
 	if M.config.pr.create_map and M.config.pr.create_map ~= "" then
 		vim.keymap.set("n", M.config.pr.create_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
 	end
 	if M.config.pr.merge_map and M.config.pr.merge_map ~= "" then
 		vim.keymap.set("n", M.config.pr.merge_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
+	end
+	if M.config.pr.close_map and M.config.pr.close_map ~= "" then
+		vim.keymap.set("n", M.config.pr.close_map, "<cmd>BBPRClose<CR>", { desc = "Close PR", silent = true })
 	end
 	vim.api.nvim_create_user_command("BBPRStats", function()
 		M.show_stats()
