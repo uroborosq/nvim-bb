@@ -6,6 +6,9 @@
 
 - review mode support
 - logs for debug
+- choice task/comment after writing
+- open bb pr in browser
+- conflicts handling
 
 ## Overview
 
@@ -70,5 +73,8 @@ Bitbucket PR helper CLI + Neovim plugin.
     - title: title of the latest commit in the PR branch
     - body: generated from `setup({ merge_pr_body_template_fn = function(commits) ... end })`, where `commits` is a list from Bitbucket API.
   - Merge mapping defaults to `<leader>rm` and can be changed via `setup({ merge_pr_map = "..." })`.
+  - Merge conflicts do not block review: when the PR branch conflicts with its target, the PR still opens with the full diff against the target, and conflicted files carry inline `<<<<<<<` markers. The conflict is reported with a warning and marked as `Merge: CONFLICT with origin/<target>` in the `:BBPRInfo` header. For a 3-way resolve, run `:DiffviewOpen` with no arguments — Diffview only builds its **Conflicts** section for a revless invocation, since `git diff --name-status <rev>` reports unmerged paths as `M` rather than `U`.
+  - Leaving a conflicted PR is automatic: opening another PR first runs `git merge --abort` (falling back to `git reset --hard HEAD`) so the new branch can be checked out. Only a real in-progress merge is rolled back — an ordinary dirty working tree is still reported instead of being reset, and untracked files are never removed.
+  - `<leader>rq` (or `:BBPRClose`) closes the open PR tabs and rolls back the conflicted merge without opening another PR. Mapping is configurable via `setup({ pr = { close_map = "..." } })`.
 
   - Your own reactions are marked with `(you)` in comment popups/overview so you can quickly see what you already added.
