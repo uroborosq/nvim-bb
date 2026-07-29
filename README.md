@@ -8,7 +8,6 @@
 - logs for debug
 - choice task/comment after writing
 - open bb pr in browser
-- conflicts handling
 
 ## Overview
 
