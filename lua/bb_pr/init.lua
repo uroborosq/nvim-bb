@@ -17,6 +17,7 @@ local default_config = {
 		refresh_map = "<C-r>",
 		reply_map = "r",
 		react_map = "R",
+		reaction_users_map = "gK",
 		delete_map = "D",
 		edit_map = "u",
 		resolve_map = "<space>",
@@ -908,6 +909,27 @@ local function set_wrapped_window_options(win)
 	vim.api.nvim_set_option_value("breakindentopt", "shift:2,sbr", { win = win })
 end
 
+-- reaction lines are rendered with this indent in both the comment float and PR Info,
+-- so the byte offsets reported by reactions.format_line must be shifted by its width
+local reaction_line_indent = "    "
+
+local function build_reaction_line_entry(segments, comment_id)
+	if type(segments) ~= "table" or #segments == 0 then
+		return nil
+	end
+	local shift = #reaction_line_indent
+	local shifted = {}
+	for _, seg in ipairs(segments) do
+		table.insert(shifted, {
+			key = seg.key,
+			count = seg.count,
+			start_col = seg.start_col + shift,
+			end_col = seg.end_col + shift,
+		})
+	end
+	return { comment_id = comment_id, segments = shifted }
+end
+
 local function open_comment_float(comments, line)
 	local source_win = vim.api.nvim_get_current_win()
 	local source_buf = vim.api.nvim_get_current_buf()
@@ -931,6 +953,7 @@ local function open_comment_float(comments, line)
 
 	local lines = { string.format("PR comments for line %d", line), "" }
 	local comment_ids_by_line = {}
+	local reaction_segments_by_line = {}
 	for _, c in ipairs(comments) do
 		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 		local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
@@ -958,10 +981,11 @@ local function open_comment_float(comments, line)
 		for _, msg_line in ipairs(msg_lines) do
 			table.insert(lines, "    " .. msg_line)
 		end
-		local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
+		local reactions_line, reaction_segments = reactions.format_line(c.reactions, c.my_reactions)
 		if reactions_line then
 			table.insert(lines, "")
-			table.insert(lines, "    " .. reactions_line)
+			table.insert(lines, reaction_line_indent .. reactions_line)
+			reaction_segments_by_line[#lines] = build_reaction_line_entry(reaction_segments, comment_id)
 		end
 		table.insert(lines, "")
 	end
@@ -975,6 +999,7 @@ local function open_comment_float(comments, line)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].filetype = "markdown"
 	vim.b[buf].bb_pr_float_comment_ids_by_line = comment_ids_by_line
+	vim.b[buf].bb_pr_float_reaction_segments = reaction_segments_by_line
 	vim.b[buf].bb_pr_float_source_win = source_win
 	vim.b[buf].bb_pr_float_source_bufnr = source_buf
 	vim.b[buf].bb_pr_float_source_line = line
@@ -1008,6 +1033,7 @@ local function open_comment_float(comments, line)
 	end
 	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
 	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
+	map(cfg.comments.reaction_users_map, "<cmd>BBPRReactionUsers<CR>", "Who reacted")
 	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
 	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
 	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
@@ -1027,6 +1053,7 @@ local function open_comment_float(comments, line)
 		for _, v in ipairs({
 			e(c.comments.reply_map, "Reply to comment"),
 			e(c.comments.react_map, "React / emoji"),
+			e(c.comments.reaction_users_map, "Who reacted (cursor on a reaction)"),
 			e(c.comments.delete_map, "Delete comment"),
 			e(c.comments.edit_map, "Edit comment"),
 			e(c.comments.resolve_map, "Resolve / unresolve thread"),
@@ -2125,6 +2152,7 @@ local function build_overview_comment_lines(payload)
 	local comment_ids_by_line_order = {}
 	local comment_ids_by_relative_line = {}
 	local thread_line_numbers = {}
+	local reaction_segments_by_relative_line = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		local root_comment = thread_comments[1] or {}
@@ -2207,13 +2235,14 @@ local function build_overview_comment_lines(payload)
 					end
 				end
 			end
-			local reactions_line = reactions.format_line(c.reactions, c.my_reactions)
+			local reactions_line, reaction_segments = reactions.format_line(c.reactions, c.my_reactions)
 			if reactions_line then
 				table.insert(lines, "")
-				table.insert(lines, "    " .. reactions_line)
+				table.insert(lines, reaction_line_indent .. reactions_line)
 				if comment_id > 0 then
 					comment_ids_by_relative_line[#lines] = comment_id
 				end
+				reaction_segments_by_relative_line[#lines] = build_reaction_line_entry(reaction_segments, comment_id)
 			end
 			table.insert(lines, "")
 		end
@@ -2223,7 +2252,12 @@ local function build_overview_comment_lines(payload)
 		table.insert(lines, "")
 	end
 
-	return lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers
+	return lines,
+		comment_line_numbers,
+		comment_ids_by_line_order,
+		comment_ids_by_relative_line,
+		thread_line_numbers,
+		reaction_segments_by_relative_line
 end
 
 local function build_status_lines(payload)
@@ -2312,7 +2346,7 @@ local function build_pr_info_content(pr)
 
 	local comments_payload = get_current_tab_comments()
 	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers =
+	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers, reaction_segments_by_relative_line =
 		build_overview_comment_lines(comments_payload)
 	vim.list_extend(info_lines, overview_lines)
 
@@ -2321,11 +2355,12 @@ local function build_pr_info_content(pr)
 		comment_line_numbers,
 		comment_ids_by_line_order,
 		comment_ids_by_relative_line,
-		thread_line_numbers
+		thread_line_numbers,
+		reaction_segments_by_relative_line
 end
 
 apply_pr_info_content = function(buf, pr)
-	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers =
+	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers, reaction_segments_by_relative_line =
 		build_pr_info_content(pr)
 
 	local prev_ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line
@@ -2370,6 +2405,12 @@ apply_pr_info_content = function(buf, pr)
 		ids_by_line[abs] = tonumber(cid) or 0
 	end
 	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
+
+	local reaction_segments = {}
+	for rel_line, entry in pairs(reaction_segments_by_relative_line or {}) do
+		reaction_segments[overview_start_line + rel_line - 1] = entry
+	end
+	vim.b[buf].bb_pr_overview_reaction_segments = reaction_segments
 
 	vim.diagnostic.enable(false, { bufnr = buf })
 
@@ -2624,6 +2665,7 @@ local function open_pr_info(pr)
 	-- Comment actions: same keys as file comment float
 	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
 	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
+	map(cfg.comments.reaction_users_map, "<cmd>BBPRReactionUsers<CR>", "Who reacted")
 	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
 	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
 	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
@@ -2648,6 +2690,7 @@ local function open_pr_info(pr)
 			{ "─", "── Comment actions ──────────────" },
 			e(c.comments.reply_map, "Reply to comment"),
 			e(c.comments.react_map, "React / emoji"),
+			e(c.comments.reaction_users_map, "Who reacted (cursor on a reaction)"),
 			e(c.comments.delete_map, "Delete comment"),
 			e(c.comments.edit_map, "Edit comment"),
 			e(c.comments.resolve_map, "Resolve / unresolve thread"),
@@ -3728,6 +3771,79 @@ local function sort_reactions_by_recent_use(choices)
 	return choices
 end
 
+local function resolve_reaction_line_entry()
+	local bufnr = vim.api.nvim_get_current_buf()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local line = cursor[1]
+	local col = cursor[2]
+
+	for _, key in ipairs({ "bb_pr_float_reaction_segments", "bb_pr_overview_reaction_segments" }) do
+		local by_line = vim.b[bufnr][key]
+		if type(by_line) == "table" then
+			local entry = by_line[line]
+			if type(entry) == "table" and type(entry.segments) == "table" and #entry.segments > 0 then
+				return entry, col
+			end
+		end
+	end
+
+	return nil
+end
+
+local function show_reaction_users()
+	local entry, col = resolve_reaction_line_entry()
+	if not entry then
+		vim.notify("bb_pr: move cursor to a reaction line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		return
+	end
+
+	local cid = tonumber(entry.comment_id or 0) or 0
+	local comment = cid > 0 and find_comment_by_id(cid) or nil
+	if type(comment) ~= "table" then
+		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		return
+	end
+	if type(comment.reaction_users) ~= "table" then
+		vim.notify(
+			"bb_pr: this bb binary does not report reaction users; rebuild bb and run BBPRLoadComments",
+			vim.log.levels.WARN
+		)
+		return
+	end
+
+	-- cursor inside a specific reaction shows only that one; anywhere else on the line shows all
+	local selected = {}
+	for _, seg in ipairs(entry.segments) do
+		if col >= seg.start_col and col < seg.end_col then
+			selected = { seg }
+			break
+		end
+	end
+	if #selected == 0 then
+		selected = entry.segments
+	end
+
+	local lines = {}
+	for _, seg in ipairs(selected) do
+		local users = as_array(comment.reaction_users[seg.key])
+		local label = string.format("%s (%d)", reactions.render_choice(seg.key), #users)
+		if #users == 0 then
+			table.insert(lines, { label, "(no users reported)" })
+		else
+			for idx, user in ipairs(users) do
+				table.insert(lines, { idx == 1 and label or "", tostring(user) })
+			end
+		end
+	end
+
+	if #lines == 0 then
+		vim.notify("bb_pr: no reactions on this comment", vim.log.levels.INFO)
+		return
+	end
+
+	open_help_float(lines, string.format("Reactions — comment #%d", cid))
+end
+
 local function react_to_comment()
 	local pr = get_current_tab_pr()
 	if not pr or not pr.id then
@@ -4459,17 +4575,22 @@ function M.show_stats(opts)
 end
 
 open_help_float = function(entries, title)
+	-- pad by display width, not byte length: reaction labels contain multibyte emoji
 	local key_width = 0
 	for _, e in ipairs(entries) do
-		key_width = math.max(key_width, #e[1])
+		key_width = math.max(key_width, vim.fn.strdisplaywidth(e[1]))
 	end
 	key_width = key_width + 2
 	local lines = {}
+	local content_width = 0
 	for _, e in ipairs(entries) do
-		table.insert(lines, string.format("  %-" .. key_width .. "s  %s", e[1], e[2]))
+		local pad = string.rep(" ", math.max(key_width - vim.fn.strdisplaywidth(e[1]), 0))
+		local line = string.format("  %s%s  %s", e[1], pad, e[2])
+		content_width = math.max(content_width, vim.fn.strdisplaywidth(line))
+		table.insert(lines, line)
 	end
-	local width = math.max(50, key_width + 34)
-	local height = #lines + 2
+	local width = math.max(50, math.min(content_width + 2, math.floor(vim.o.columns * 0.8)))
+	local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.8))
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].buftype = "nofile"
 	vim.bo[buf].bufhidden = "wipe"
@@ -4667,6 +4788,9 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPRReactComment", function()
 		react_to_comment()
 	end, { desc = "Add reaction to comment under cursor" })
+	vim.api.nvim_create_user_command("BBPRReactionUsers", function()
+		show_reaction_users()
+	end, { desc = "Show who reacted with the reaction under cursor" })
 	vim.api.nvim_create_user_command("BBPRDeleteComment", function()
 		delete_comment()
 	end, { desc = "Delete PR comment under cursor" })

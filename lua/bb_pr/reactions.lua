@@ -912,19 +912,34 @@ function M.format_line(reactions, my_reactions)
 		return a.key < b.key
 	end)
 
+	local separator = "  "
 	local chunks = {}
+	local segments = {}
+	local offset = 0
 	for _, item in ipairs(items) do
 		local mine = type(my_reactions) == "table" and my_reactions[string.upper(item.key)]
 		local upper, fallback = normalize_key(item.key)
 		local label = emoji_map[upper] or (":" .. fallback .. ":")
-				if mine then
-			table.insert(chunks, string.format("%s %d (you)", label, item.count))
+		local chunk
+		if mine then
+			chunk = string.format("%s %d (you)", label, item.count)
 		else
-			table.insert(chunks, string.format("%s %d", label, item.count))
+			chunk = string.format("%s %d", label, item.count)
 		end
+		if #chunks > 0 then
+			offset = offset + #separator
+		end
+		table.insert(chunks, chunk)
+		table.insert(segments, {
+			key = upper,
+			count = item.count,
+			start_col = offset,
+			end_col = offset + #chunk,
+		})
+		offset = offset + #chunk
 	end
 
-	return table.concat(chunks, "  ")
+	return table.concat(chunks, separator), segments
 end
 
 

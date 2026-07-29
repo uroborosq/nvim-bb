@@ -313,28 +313,29 @@ type selfUser struct {
 }
 
 type PRCommentView struct {
-	ID            int64           `json:"id"`
-	ParentID      int64           `json:"parent_id,omitempty"`
-	Depth         int             `json:"depth,omitempty"`
-	Text          string          `json:"text"`
-	Author        string          `json:"author"`
-	CreatedDate   int64           `json:"created_date_ms"`
-	CreatedAt     string          `json:"created_at"`
-	UpdatedDate   int64           `json:"updated_date_ms"`
-	UpdatedAt     string          `json:"updated_at"`
-	IsFileComment bool            `json:"is_file_comment"`
-	Path          string          `json:"path,omitempty"`
-	Line          int             `json:"line,omitempty"`
-	LineType      string          `json:"line_type,omitempty"`
-	FileType      string          `json:"file_type,omitempty"`
-	DiffType      string          `json:"diff_type,omitempty"`
-	Reactions     map[string]int  `json:"reactions,omitempty"`
-	MyReactions   map[string]bool `json:"my_reactions,omitempty"`
-	IsTask        bool            `json:"is_task,omitempty"`
-	TaskStatus    string          `json:"task_status,omitempty"`
-	IsResolved    bool            `json:"is_resolved,omitempty"`
-	IsOutdated    bool            `json:"is_outdated,omitempty"`
-	Version       int             `json:"version"`
+	ID            int64               `json:"id"`
+	ParentID      int64               `json:"parent_id,omitempty"`
+	Depth         int                 `json:"depth,omitempty"`
+	Text          string              `json:"text"`
+	Author        string              `json:"author"`
+	CreatedDate   int64               `json:"created_date_ms"`
+	CreatedAt     string              `json:"created_at"`
+	UpdatedDate   int64               `json:"updated_date_ms"`
+	UpdatedAt     string              `json:"updated_at"`
+	IsFileComment bool                `json:"is_file_comment"`
+	Path          string              `json:"path,omitempty"`
+	Line          int                 `json:"line,omitempty"`
+	LineType      string              `json:"line_type,omitempty"`
+	FileType      string              `json:"file_type,omitempty"`
+	DiffType      string              `json:"diff_type,omitempty"`
+	Reactions     map[string]int      `json:"reactions,omitempty"`
+	MyReactions   map[string]bool     `json:"my_reactions,omitempty"`
+	ReactionUsers map[string][]string `json:"reaction_users,omitempty"`
+	IsTask        bool                `json:"is_task,omitempty"`
+	TaskStatus    string              `json:"task_status,omitempty"`
+	IsResolved    bool                `json:"is_resolved,omitempty"`
+	IsOutdated    bool                `json:"is_outdated,omitempty"`
+	Version       int                 `json:"version"`
 }
 
 type PullRequestComments struct {
@@ -1597,20 +1598,22 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 
 		commentReactions := extractReactionCounts(cmt.Properties.Reactions)
 		myReactions := extractMyReactions(cmt.Properties.Reactions, self)
+		reactionUsers := extractReactionUsers(cmt.Properties.Reactions)
 
 		view := PRCommentView{
-			ID:          cmt.ID,
-			ParentID:    item.ParentID,
-			Depth:       item.Depth,
-			Text:        cmt.Text,
-			Author:      displayUser(cmt.Author),
-			CreatedDate: cmt.CreatedDate,
-			CreatedAt:   msToTime(cmt.CreatedDate).Format(time.RFC3339),
-			UpdatedDate: cmt.UpdatedDate,
-			UpdatedAt:   msToTime(cmt.UpdatedDate).Format(time.RFC3339),
-			Reactions:   commentReactions,
-			MyReactions: myReactions,
-			Version:     cmt.Version,
+			ID:            cmt.ID,
+			ParentID:      item.ParentID,
+			Depth:         item.Depth,
+			Text:          cmt.Text,
+			Author:        displayUser(cmt.Author),
+			CreatedDate:   cmt.CreatedDate,
+			CreatedAt:     msToTime(cmt.CreatedDate).Format(time.RFC3339),
+			UpdatedDate:   cmt.UpdatedDate,
+			UpdatedAt:     msToTime(cmt.UpdatedDate).Format(time.RFC3339),
+			Reactions:     commentReactions,
+			MyReactions:   myReactions,
+			ReactionUsers: reactionUsers,
+			Version:       cmt.Version,
 		}
 		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
 		if severity == "BLOCKER" {
@@ -1654,6 +1657,33 @@ func extractReactionCounts(reactions []Reaction) map[string]int {
 		}
 		count := len(reaction.Users)
 		result[key] += count
+	}
+
+	return result
+}
+
+func extractReactionUsers(reactions []Reaction) map[string][]string {
+	result := map[string][]string{}
+	for _, reaction := range reactions {
+		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
+		if key == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, name := range result[key] {
+			seen[name] = true
+		}
+		for _, u := range reaction.Users {
+			name := displayUser(u)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			result[key] = append(result[key], name)
+		}
+	}
+	if len(result) == 0 {
+		return nil
 	}
 
 	return result
