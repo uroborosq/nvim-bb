@@ -78,6 +78,8 @@ local default_config = {
 	drafts = {
 		store_path = vim.fn.stdpath("state") .. "/bb_pr_drafts.json",
 		max_count = 50,
+		-- autosave while typing; the draft also survives :qa and terminal close
+		autosave_debounce_ms = 400,
 	},
 
 	-- debug log: rotated when it exceeds max_size_bytes or max_age_seconds
@@ -363,6 +365,83 @@ local function save_draft(key, text, base)
 	end
 	state.drafts = kept
 	persist_drafts()
+end
+
+-- Keeps a draft on disk while the user types, so it survives every way the
+-- editor can go away: closing the window, :qa (WinClosed never fires there),
+-- closing the terminal (SIGHUP), or the process being killed outright.
+local function attach_draft_autosave(opts)
+	local buf, win, key, get_text = opts.buf, opts.win, opts.key, opts.get_text
+	if not key or not buf then
+		return { save_now = function() end, cancel = function() end }
+	end
+
+	local group = vim.api.nvim_create_augroup("bb_pr_draft_" .. tostring(buf), { clear = true })
+	local uv = vim.uv or vim.loop
+	local timer = nil
+	local cancelled = false
+
+	local function stop_timer()
+		if timer then
+			timer:stop()
+			if not timer:is_closing() then
+				timer:close()
+			end
+			timer = nil
+		end
+	end
+
+	local function save_now()
+		if cancelled then
+			return
+		end
+		stop_timer()
+		local text = get_text()
+		if type(text) == "string" then
+			save_draft(key, text, opts.base)
+		end
+	end
+
+	local delay = tonumber(M.config.drafts.autosave_debounce_ms or 400) or 400
+	local function schedule_save()
+		if cancelled then
+			return
+		end
+		stop_timer()
+		timer = uv.new_timer()
+		timer:start(delay, 0, vim.schedule_wrap(save_now))
+	end
+
+	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
+		group = group,
+		buffer = buf,
+		callback = schedule_save,
+	})
+	vim.api.nvim_create_autocmd({ "BufWipeout", "BufLeave" }, {
+		group = group,
+		buffer = buf,
+		callback = save_now,
+	})
+	vim.api.nvim_create_autocmd("VimLeavePre", {
+		group = group,
+		callback = save_now,
+	})
+	if win then
+		vim.api.nvim_create_autocmd("WinClosed", {
+			group = group,
+			pattern = tostring(win),
+			callback = save_now,
+		})
+	end
+
+	return {
+		save_now = save_now,
+		cancel = function()
+			cancelled = true
+			stop_timer()
+			pcall(vim.api.nvim_del_augroup_by_id, group)
+		end,
+	}
 end
 
 local function get_draft(key)
@@ -2957,8 +3036,6 @@ local function open_multiline_comment_input(opts, on_submit)
 		vim.notify("bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")", vim.log.levels.INFO)
 	end
 
-	local submitted = false
-
 	local function get_typed_text()
 		if not vim.api.nvim_buf_is_valid(buf) then
 			return ""
@@ -2990,31 +3067,26 @@ local function open_multiline_comment_input(opts, on_submit)
 		end, { buffer = buf, silent = true })
 	end
 
+	local autosave = attach_draft_autosave({
+		buf = buf,
+		win = win,
+		key = draft_key,
+		base = fresh_text or "",
+		get_text = get_typed_text,
+	})
+
 	local function submit()
 		if not vim.api.nvim_buf_is_valid(buf) then
 			return
 		end
 		local text = get_typed_text()
-		submitted = true
+		autosave.cancel()
 		delete_draft(draft_key)
 		pcall(vim.api.nvim_win_close, win, true)
 		if text ~= "" then
 			on_submit(text)
 		end
 	end
-
-	vim.api.nvim_create_autocmd("WinClosed", {
-		pattern = tostring(win),
-		once = true,
-		callback = function()
-			if not submitted and draft_key then
-				local text = get_typed_text()
-				if text ~= "" then
-					save_draft(draft_key, text, fresh_text or "")
-				end
-			end
-		end,
-	})
 
 	vim.keymap.set("n", "q", function()
 		pcall(vim.api.nvim_win_close, win, true)
@@ -3137,6 +3209,12 @@ local function open_create_pr_editor(source_branch, target_branch)
 		vim.list_extend(initial_lines, draft_body_lines)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
+		local hints = { "<C-s> submit" }
+		if M.config.pr.create_toggle_draft_map and M.config.pr.create_toggle_draft_map ~= "" then
+			table.insert(hints, M.config.pr.create_toggle_draft_map .. " toggle [DRAFT]")
+		end
+		table.insert(hints, "q cancel")
+
 		local width = math.floor(vim.o.columns * 0.8)
 		local height = math.floor(vim.o.lines * 0.8)
 		local win = vim.api.nvim_open_win(buf, true, {
@@ -3147,7 +3225,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 			col = math.floor((vim.o.columns - width) / 2),
 			style = "minimal",
 			border = "rounded",
-			title = "Create PR (<C-s> submit)",
+			title = "Create PR (" .. table.concat(hints, ", ") .. ")",
 			title_pos = "center",
 		})
 
@@ -3157,8 +3235,6 @@ local function open_create_pr_editor(source_branch, target_branch)
 				vim.log.levels.INFO
 			)
 		end
-
-		local submitted = false
 
 		local function get_pr_draft_text()
 			if not vim.api.nvim_buf_is_valid(buf) then
@@ -3170,7 +3246,13 @@ local function open_create_pr_editor(source_branch, target_branch)
 			for i = 4, #lines do
 				table.insert(body_parts, lines[i])
 			end
-			return vim.json.encode({ title = title, body = table.concat(body_parts, "\n") })
+			local body = table.concat(body_parts, "\n")
+			-- On exit the buffer can already be emptied; never overwrite a good
+			-- draft with a blank one.
+			if title == "" and vim.trim(body) == "" then
+				return nil
+			end
+			return vim.json.encode({ title = title, body = body })
 		end
 
 		if pr_conflict then
@@ -3198,6 +3280,14 @@ local function open_create_pr_editor(source_branch, target_branch)
 			end, { buffer = buf, silent = true })
 		end
 
+		local autosave = attach_draft_autosave({
+			buf = buf,
+			win = win,
+			key = pr_draft_key,
+			base = fresh_base,
+			get_text = get_pr_draft_text,
+		})
+
 		local function submit()
 			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
@@ -3210,7 +3300,7 @@ local function open_create_pr_editor(source_branch, target_branch)
 				vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
 				return
 			end
-			submitted = true
+			autosave.cancel()
 			delete_draft(pr_draft_key)
 			pcall(vim.api.nvim_win_close, win, true)
 			local cmd = bb_cmd({
@@ -3237,19 +3327,6 @@ local function open_create_pr_editor(source_branch, target_branch)
 				end)
 			end)
 		end
-
-		vim.api.nvim_create_autocmd("WinClosed", {
-			pattern = tostring(win),
-			once = true,
-			callback = function()
-				if not submitted then
-					local text = get_pr_draft_text()
-					if text then
-						save_draft(pr_draft_key, text, fresh_base)
-					end
-				end
-			end,
-		})
 
 		local function toggle_draft()
 			local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
