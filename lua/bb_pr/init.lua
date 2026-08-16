@@ -27,6 +27,9 @@ local default_config = {
 		create_task_map = "K",
 		create_suggestion_map = "s",
 		accept_suggestion_map = "A",
+		-- inside the comment input window: submit the text as a comment or as a task
+		submit_comment_map = "<C-s>",
+		submit_task_map = "<C-t>",
 	},
 
 	-- reactions
@@ -2982,7 +2985,7 @@ end
 
 local function open_multiline_comment_input(opts, on_submit)
 	opts = opts or {}
-	local title = opts.title or "Comment"
+	local title = (opts.title or "Comment") .. (opts.title_suffix or "")
 	local prompt = opts.prompt or "Write text. <C-s> submit, q cancel"
 	local draft_key = opts.draft_key
 
@@ -3075,23 +3078,40 @@ local function open_multiline_comment_input(opts, on_submit)
 		get_text = get_typed_text,
 	})
 
-	local function submit()
-		if not vim.api.nvim_buf_is_valid(buf) then
-			return
-		end
-		local text = get_typed_text()
-		autosave.cancel()
-		delete_draft(draft_key)
-		pcall(vim.api.nvim_win_close, win, true)
-		if text ~= "" then
-			on_submit(text)
+	local function submit_with(variant)
+		return function()
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return
+			end
+			local text = get_typed_text()
+			autosave.cancel()
+			delete_draft(draft_key)
+			pcall(vim.api.nvim_win_close, win, true)
+			if text ~= "" then
+				on_submit(text, variant)
+			end
 		end
 	end
+
+	local submit = submit_with(opts.default_submit_variant)
 
 	vim.keymap.set("n", "q", function()
 		pcall(vim.api.nvim_win_close, win, true)
 	end, { buffer = buf, silent = true })
-	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set(
+		{ "n", "i" },
+		opts.submit_map or "<C-s>",
+		submit_with(opts.submit_variant),
+		{ buffer = buf, silent = true }
+	)
+	if opts.alt_submit_map and opts.alt_submit_map ~= "" then
+		vim.keymap.set(
+			{ "n", "i" },
+			opts.alt_submit_map,
+			submit_with(opts.alt_submit_variant),
+			{ buffer = buf, silent = true }
+		)
+	end
 	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
 	vim.cmd("startinsert")
 end
@@ -4183,14 +4203,28 @@ local function post_comment_or_task(is_task, force_reply, opts)
 		else
 			comment_draft_key = "comment:overview:" .. tostring(pr.id)
 		end
+		local cmaps = M.config.comments
+		local submit_comment_map = cmaps.submit_comment_map or "<C-s>"
+		local submit_task_map = cmaps.submit_task_map or "<C-t>"
 		open_multiline_comment_input({
 			title = is_task and "BB PR Task" or "BB PR Comment",
-			prompt = "Write multiline text. <C-s> submit, q cancel",
+			prompt = string.format(
+				"Write multiline text. %s submit comment, %s submit task, <CR> submit %s, q cancel",
+				submit_comment_map,
+				submit_task_map,
+				is_task and "task" or "comment"
+			),
+			title_suffix = string.format(" (%s comment, %s task)", submit_comment_map, submit_task_map),
 			initial_text = opts.initial_text,
 			draft_key = comment_draft_key,
-		}, function(text)
+			submit_map = submit_comment_map,
+			submit_variant = false,
+			alt_submit_map = submit_task_map,
+			alt_submit_variant = true,
+			default_submit_variant = is_task,
+		}, function(text, as_task)
 			local cmd = bb_cmd({ "-json", "-pr-comment", tostring(pr.id), "-text", text })
-			if is_task then
+			if as_task then
 				table.insert(cmd, "-task")
 			end
 			if reply_to and reply_to > 0 then
@@ -4206,18 +4240,19 @@ local function post_comment_or_task(is_task, force_reply, opts)
 				table.insert(cmd, "-file-type")
 				table.insert(cmd, tostring(ctx.file_type or "TO"))
 			end
-			log("send_comment cmd:", cmd, "ctx=", ctx, "reply_to=", reply_to, "is_task=", is_task)
+			local kind = as_task and "task" or "comment"
+			log("send_comment cmd:", cmd, "ctx=", ctx, "reply_to=", reply_to, "as_task=", as_task)
 			vim.system(cmd, { text = true }, function(res)
 				if res.code ~= 0 then
 					log("send_comment FAILED code=", res.code, "stderr=", res.stderr or "")
 					vim.schedule(function()
-						vim.notify("bb_pr: create comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+						vim.notify("bb_pr: create " .. kind .. " failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
 					end)
 					return
 				end
 				log("send_comment OK stdout=", res.stdout or "")
 				vim.schedule(function()
-					vim.notify("bb_pr: comment sent", vim.log.levels.INFO)
+					vim.notify("bb_pr: " .. kind .. " sent", vim.log.levels.INFO)
 					run_comments_provider(pr.id, function(payload)
 						vim.schedule(function()
 							set_tab_comments(source_tab, payload)
