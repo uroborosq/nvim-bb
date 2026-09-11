@@ -30,6 +30,7 @@ Bitbucket PR helper CLI + Neovim plugin.
 
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
+- CLI: `bb -no-draft` hides draft PRs (title contains `[DRAFT]`) from the PR list; works with both table and `-json` output.
 - CLI: `bb -pr-comments <id> -json` returns structured PR comments (overview + file anchors) with timestamps for Neovim overlays (virtual text / floating windows).
 - CLI review actions:
   - `bb -pr-review <id> -review-action approve`
