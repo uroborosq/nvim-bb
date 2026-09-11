@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -655,6 +656,7 @@ func main() {
 	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
 	buildsEnabled := flag.Bool("builds", false, "enrich PR list with aggregated build status (Jenkins)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
+	noDraft := flag.Bool("no-draft", false, "hide draft pull requests (title contains [DRAFT])")
 	prCommentsID := flag.Int64("pr-comments", 0, "print PR comments (overview + file comments) as JSON for the given PR id")
 	prCommentID := flag.Int64("pr-comment", 0, "create PR comment/task for the given PR id")
 	prDeleteCommentID := flag.Int64("pr-delete-comment", 0, "delete PR comment by id for the given PR id")
@@ -1028,6 +1030,10 @@ func main() {
 	prs, err := client.GetRepoPullRequests(ctx)
 	if err != nil {
 		fatal(err)
+	}
+
+	if *noDraft {
+		prs = slices.DeleteFunc(prs, isDraftPR)
 	}
 
 	enrichPullRequests(prs, cfg)
@@ -2538,11 +2544,15 @@ func isCurrentUser(u User, candidates []string) bool {
 	return false
 }
 
+func isDraftPR(pr PullRequest) bool {
+	return strings.Contains(pr.Title, "[DRAFT]")
+}
+
 func prSortBucket(pr PullRequest, candidates []string) int {
 	if isCurrentUser(pr.Author.User, candidates) {
 		return 5
 	}
-	isDraft := strings.Contains(pr.Title, "[DRAFT]")
+	isDraft := isDraftPR(pr)
 	for _, reviewer := range pr.Reviewers {
 		if !isCurrentUser(reviewer.User, candidates) {
 			continue
