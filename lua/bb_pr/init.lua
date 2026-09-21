@@ -4741,18 +4741,21 @@ set_diff_buffer_keymaps = function(bufnr)
 		end
 	end
 
-	-- open comments float: hardcoded gc (base key "c" is create-comment, so open gets gc separately)
-	vim.keymap.set(
-		"n",
-		"gc",
-		"<cmd>BBPROpenLineComments<CR>",
-		{ buffer = buf, desc = "Open PR comments for current line", silent = true }
-	)
+	-- gc: open the comments float, or start a new comment when the line has none
+	vim.keymap.set("n", "gc", function()
+		local line = vim.api.nvim_win_get_cursor(0)[1]
+		local comments = (vim.b[buf].bb_pr_line_comments or {})[line]
+		-- vim.b round-trips sparse line tables with vim.NIL holes, so check the type
+		if type(comments) == "table" and #comments > 0 then
+			open_comment_float(comments, line)
+		else
+			post_comment_or_task(false, false)
+		end
+	end, { buffer = buf, desc = "Open PR comments for current line or create one", silent = true })
 
 	-- comment creation keys: diff buffer prefixes base key with "g"
 	-- (reply/react/delete/edit/resolve/toggle_task/accept_suggestion require cursor on
 	-- a comment line — only work in float/overview, not in the diff buffer)
-	gmap(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create comment")
 	gmap(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
 	gmap(cfg.comments.create_suggestion_map, "<cmd>BBPRCreateSuggestion<CR>", "Create suggestion")
 
@@ -4786,10 +4789,9 @@ set_diff_buffer_keymaps = function(bufnr)
 		end
 		local entries = {}
 		for _, v in ipairs({
-			{ "gc", "Open line comments" },
+			{ "gc", "Open line comments / create comment" },
 			ed(c.comments.prev_map, "Previous comment"),
 			ed(c.comments.next_map, "Next comment"),
-			e(c.comments.create_map, "Create comment"),
 			e(c.comments.create_task_map, "Create task"),
 			e(c.comments.create_suggestion_map, "Create suggestion"),
 			ed(c.comments.refresh_map, "Refresh comments"),
@@ -4854,7 +4856,7 @@ function M.setup(opts)
 		local line = vim.api.nvim_win_get_cursor(0)[1]
 		local by_line = vim.b[bufnr].bb_pr_line_comments or {}
 		local comments = by_line[line]
-		if not comments or #comments == 0 then
+		if type(comments) ~= "table" or #comments == 0 then
 			vim.notify("bb_pr: no comments on current line", vim.log.levels.INFO)
 			return
 		end
