@@ -45,7 +45,7 @@ Bitbucket PR helper CLI + Neovim plugin.
     - after action, PR info window auto-refreshes approval block
   - PR comments are auto-loaded when opening a PR diff and then auto-applied on buffer enter.
   - `:BBPRLoadComments` loads PR comments for the PR opened in current tab and renders virtual text on commented lines.
-  - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line.
+  - `gc` (normal mode) or `:BBPROpenLineComments` opens a floating window with comments for the current line; in a diff buffer, `gc` on a line without comments opens the new-comment input instead.
   - `[C` / `]C` jump between PR comments (works in both file diffs and PR overview comments).
   - `<leader>rr` (or `:BBPRRefreshComments`) force-refreshes comments from the server to pick up replies from other participants.
   - `<leader>rt` (or `:BBPRToggleTask`) toggles task comments between open/done from PR Info or line-comments float under cursor.
