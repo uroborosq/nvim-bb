@@ -28,6 +28,8 @@ Bitbucket PR helper CLI + Neovim plugin.
   - optional flag override: `setup({ force_repo_autodetect_flag = "-force-autodetect-repo" })`
 - Force refresh mapping defaults to `<leader>rr` and can be changed via `setup({ refresh_comments_map = "..." })`.
 
+- PR tab diff mode: `setup({ diff_mode = "worktree" })` (default) shows the working tree on the right (LSP, editing); `"commits"` shows read-only diffview buffers of the merge commit, which open about three times faster on first visit, and falls back to the working tree when the merge conflicts. Accepted suggestions are written to the file when it is not shown in a window.
+
 - `:BBPRList` opens a Telescope picker (when available) so selecting a PR with `<CR>` opens it directly in Diffview.
 - If Telescope is not installed, it falls back to the built-in list buffer behavior.
 - CLI: `bb -no-draft` hides draft PRs (title contains `[DRAFT]`) from the PR list; works with both table and `-json` output.
