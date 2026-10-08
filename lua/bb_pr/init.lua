@@ -10,6 +10,12 @@ local default_config = {
 	force_repo_autodetect = true,
 	force_repo_autodetect_flag = "-force-autodetect-repo",
 	diffview_cmd = "DiffviewOpen",
+	-- what the right side of the PR tab shows:
+	--   "worktree": the working tree files (LSP, editing; every new file runs the
+	--               full BufRead/FileType chain, so the first open is slower)
+	--   "commits":  read-only diffview buffers of the merge commit (faster to open,
+	--               no LSP); falls back to "worktree" when the merge conflicts
+	diff_mode = "worktree",
 
 	-- comment actions: popup windows use the key as-is; diff buffer prepends "g"
 	comments = {
@@ -609,10 +615,16 @@ local function run_comments_provider(pr_id, cb, opts)
 	end)
 end
 
+local prefetch_comment_file_texts
+
 local function set_tab_comments(tabpage, payload)
 	local key = tab_key(tabpage)
 	state.comments_by_tab[key] = payload
 	state.pending_comments_by_tab[key] = payload
+	local info = state.diff_base_by_tab[key]
+	if info then
+		prefetch_comment_file_texts(info, payload)
+	end
 end
 
 local function set_current_tab_comments(payload)
@@ -805,7 +817,7 @@ local function current_buffer_repo_path(bufnr)
 	return ""
 end
 
-local function resolve_apply_target_bufnr(target_path)
+local function resolve_apply_target_bufnr(target_path, repo_root)
 	local cur = vim.api.nvim_get_current_buf()
 	local source = vim.b[cur].bb_pr_float_source_bufnr
 	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
@@ -841,7 +853,7 @@ local function resolve_apply_target_bufnr(target_path)
 	end
 
 	if target_path ~= "" then
-		local abs = vim.fn.fnamemodify(target_path, ":p")
+		local abs = repo_root and vim.fs.joinpath(repo_root, target_path) or vim.fn.fnamemodify(target_path, ":p")
 		local file_buf = vim.fn.bufadd(abs)
 		pcall(vim.fn.bufload, file_buf)
 		if type(file_buf) == "number" and file_buf > 0 and vim.api.nvim_buf_is_valid(file_buf) then
@@ -1019,6 +1031,97 @@ local function git_file_text(root, rev, path)
 	local text = res.code == 0 and (res.stdout or "") or ""
 	state.git_text_cache[key] = text
 	return text
+end
+
+-- Parses `git cat-file --batch` output into one text per requested object, in
+-- request order; a missing object (file absent at that commit) is "", anything
+-- else unexpected is false.
+local function parse_cat_file_batch(out, count)
+	local texts = {}
+	local pos = 1
+	for i = 1, count do
+		local eol = out:find("\n", pos, true)
+		if not eol then
+			break
+		end
+		local header = out:sub(pos, eol - 1)
+		local size = header:match("^%x+ blob (%d+)$")
+		if size then
+			size = tonumber(size)
+			texts[i] = out:sub(eol + 1, eol + size)
+			pos = eol + size + 2 -- content is followed by a newline
+		else
+			texts[i] = header:match(" missing$") and "" or false
+			pos = eol + 1
+		end
+	end
+	return texts
+end
+
+-- Loads both versions of every file that has comments into state.git_text_cache
+-- in one background git process, so opening such a file does not wait on
+-- `git show`. Files without comments are not read: they only need their text
+-- when a comment is created there.
+prefetch_comment_file_texts = function(info, payload)
+	local commented = {}
+	for _, c in ipairs(as_array(payload and payload.file_comments)) do
+		if not c.is_outdated and type(c.path) == "string" and c.path ~= "" then
+			commented[normalize_repo_path(c.path)] = true
+		end
+	end
+	if next(commented) == nil then
+		return
+	end
+	-- the name-status pass maps renamed files to their merge-base path
+	local diff_cmd = { "git", "diff", "--name-status", "-z", "-M", info.base, info.source }
+	vim.system(diff_cmd, { cwd = info.root, text = true }, function(diff_res)
+		if diff_res.code ~= 0 then
+			return
+		end
+		local fields = vim.split(diff_res.stdout or "", "\0", { plain = true })
+		local pairs_to_load = {}
+		local i = 1
+		while i <= #fields and fields[i] ~= "" do
+			local renamed = fields[i]:match("^[RC]") ~= nil
+			local from_path = fields[i + 1]
+			local path = renamed and fields[i + 2] or from_path
+			i = i + (renamed and 3 or 2)
+			if path and commented[normalize_repo_path(path)] then
+				table.insert(pairs_to_load, { info.base, from_path })
+				table.insert(pairs_to_load, { info.source, path })
+			end
+		end
+		vim.schedule(function()
+			local keys = {}
+			for _, rp in ipairs(pairs_to_load) do
+				local key = rp[1] .. ":" .. rp[2] -- same key as git_file_text
+				-- cat-file --batch reads one object name per line
+				if state.git_text_cache[key] == nil and not key:find("\n", 1, true) then
+					table.insert(keys, key)
+				end
+			end
+			if #keys == 0 then
+				return
+			end
+			-- binary output: text mode rewrites \r\n and would shift the blob sizes
+			local cat_opts = { cwd = info.root, text = false, stdin = table.concat(keys, "\n") .. "\n" }
+			vim.system({ "git", "cat-file", "--batch" }, cat_opts, function(cat_res)
+				if cat_res.code ~= 0 then
+					return
+				end
+				local texts = parse_cat_file_batch(cat_res.stdout or "", #keys)
+				vim.schedule(function()
+					for idx, key in ipairs(keys) do
+						if texts[idx] and state.git_text_cache[key] == nil then
+							-- match git_file_text, which reads `git show` in text mode
+							state.git_text_cache[key] = texts[idx]:gsub("\r\n", "\n")
+						end
+					end
+					log("prefetch_comment_file_texts: cached", #keys, "file versions")
+				end)
+			end)
+		end)
+	end)
 end
 
 -- merge base → source tip: the PR diff as Bitbucket shows it
@@ -2214,12 +2317,19 @@ local function open_diffview(pr)
 						)
 					end
 					close_old_pr_tabs()
+					-- "commits" diffs the target tip against the merge commit HEAD, which
+					-- holds the same content as the clean working tree; a conflicted merge
+					-- has no such commit, so it keeps the working tree
+					local rev = "origin/" .. to_ref
+					if M.config.diff_mode == "commits" and not conflicted then
+						rev = rev .. "..HEAD"
+					end
 					vim.cmd(
 						string.format(
-							"%s -C%s origin/%s",
+							"%s -C%s %s",
 							M.config.diffview_cmd,
 							vim.fn.fnameescape(repo_root),
-							to_ref
+							rev
 						)
 					)
 					set_current_tab_pr(pr)
@@ -4073,7 +4183,8 @@ local function accept_suggestion()
 		return
 	end
 	local target_path = normalize_repo_path(comment.path or "")
-	local buf = resolve_apply_target_bufnr(target_path)
+	local info = tab_diff_base()
+	local buf = resolve_apply_target_bufnr(target_path, info and info.root)
 	local cur_buf_path = current_buffer_repo_path(buf)
 	if target_path == "" or not path_matches(cur_buf_path, target_path) then
 		vim.notify(
@@ -4087,7 +4198,6 @@ local function accept_suggestion()
 		)
 		return
 	end
-	local info = tab_diff_base()
 	if info then
 		-- the buffer is the working tree with the target merged in: translate the
 		-- Bitbucket TO line into it
@@ -4106,6 +4216,22 @@ local function accept_suggestion()
 	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
 	if not ok_apply then
 		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
+		return
+	end
+	-- with diff_mode = "commits" the tab shows no working tree file, so an edit to a
+	-- hidden buffer would go unnoticed: write it out
+	if #vim.fn.win_findbuf(buf) == 0 then
+		local ok_write, write_err = pcall(vim.api.nvim_buf_call, buf, function()
+			vim.cmd("silent write")
+		end)
+		if not ok_write then
+			vim.notify("bb_pr: suggestion applied but not saved: " .. tostring(write_err), vim.log.levels.ERROR)
+			return
+		end
+		vim.notify(
+			"bb_pr: suggestion applied and saved to " .. target_path .. ". Commit and push manually (git add/commit/push).",
+			vim.log.levels.INFO
+		)
 		return
 	end
 	vim.notify("bb_pr: suggestion applied. Commit and push manually (git add/commit/push).", vim.log.levels.INFO)
