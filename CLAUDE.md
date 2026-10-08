@@ -38,6 +38,9 @@ Single-file; all types, API client, and flag handling live there.
 
 - `init.lua` — all plugin logic. Requires `bb_pr.reactions`.
 - `reactions.lua` — emoji map + `format_line`, `render_choice` helpers, and `all_reaction_choices` list.
+- `linemap.lua` — pure line-number translation between two file versions via `vim.diff` hunks.
+
+**Line numbers**: Bitbucket anchors FROM lines to the merge base and TO lines to the source tip, but the PR tab shows the target tip against the working tree with the target merged in. `open_diffview` records both commits (`state.diff_base_by_tab`); `local_line_to_anchor` / `anchor_to_local_line` translate every comment line (create, display, jump, accept suggestion), and line types come from the merge-base..source diff, not from Vim's diff highlights.
 
 **State** is module-level, tab-scoped via `state.pr_by_tab[tab_key]` and `state.comments_by_tab[tab_key]`. A `pending_comments_by_tab` slot holds comments waiting to be applied on the next `BufEnter`.
 

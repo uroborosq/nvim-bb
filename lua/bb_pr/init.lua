@@ -1,5 +1,6 @@
 local M = {}
 local reactions = require("bb_pr.reactions")
+local linemap = require("bb_pr.linemap")
 
 local default_config = {
 	-- internals
@@ -103,6 +104,11 @@ local state = {
 	pending_comments_by_tab = {},
 	builds_by_tab = {},
 	conflict_by_tab = {},
+	-- per PR tab: { root, base, source } — the commits Bitbucket anchors FROM / TO lines to
+	diff_base_by_tab = {},
+	git_text_cache = {},
+	hunks_cache = {},
+	buf_hunks_cache = {},
 	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
@@ -624,6 +630,27 @@ local function get_current_tab_conflict()
 	return state.conflict_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
 end
 
+-- Records the commits Bitbucket anchors comment lines to: FROM lines to the merge
+-- base of source and target, TO lines to the source tip. Left unset (comments then
+-- use raw line numbers) when git cannot resolve them.
+local function set_current_tab_diff_base(repo_root, from_ref, to_ref)
+	local key = tab_key(vim.api.nvim_get_current_tabpage())
+	local opts = { cwd = repo_root, text = true }
+	local source = vim.system({ "git", "rev-parse", "origin/" .. from_ref }, opts):wait()
+	local base = vim.system({ "git", "merge-base", "origin/" .. from_ref, "origin/" .. to_ref }, opts):wait()
+	if source.code ~= 0 or base.code ~= 0 then
+		log("set_current_tab_diff_base failed:", source.stderr, base.stderr)
+		state.diff_base_by_tab[key] = nil
+		return
+	end
+	state.diff_base_by_tab[key] = {
+		root = repo_root,
+		base = vim.trim(base.stdout),
+		source = vim.trim(source.stdout),
+	}
+	log("set_current_tab_diff_base:", state.diff_base_by_tab[key])
+end
+
 local function consume_pending_tab_comments()
 	local key = tab_key(vim.api.nvim_get_current_tabpage())
 	local payload = state.pending_comments_by_tab[key]
@@ -885,6 +912,181 @@ local function current_diff_side()
 		return "left"
 	end
 	return "right"
+end
+
+-- Locates the diffview file shown in `win`. The repo path comes from the view's
+-- entry, so it does not depend on the cwd, worktree layout or buffer name.
+-- Returns nil when `win` is not a file window of a diffview layout.
+local function diffview_window_file(win)
+	local ok, lib = pcall(require, "diffview.lib")
+	if not ok then
+		return nil
+	end
+	local view = lib.get_current_view()
+	local layout = view and view.cur_layout
+	local entry = view and view.cur_entry
+	if not (layout and entry and type(layout.windows) == "table") then
+		return nil
+	end
+	for _, w in ipairs(layout.windows) do
+		if w.id == win and w.file then
+			return {
+				path = entry.path,
+				from_path = entry.oldpath,
+				symbol = w.file.symbol,
+				nulled = w.file.nulled or w.file.binary,
+			}
+		end
+	end
+	return nil
+end
+
+-- Repo-relative path of a plain file buffer, computed from its git root.
+local function plain_buffer_repo_path(bufnr)
+	if vim.bo[bufnr].buftype ~= "" then
+		return nil
+	end
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	if name == "" or name:match("^%a[%w+.-]*://") then
+		return nil
+	end
+	local abs = vim.fs.normalize(vim.fn.fnamemodify(name, ":p"))
+	local root = vim.fs.root(abs, ".git")
+	if not root then
+		return nil
+	end
+	root = vim.fs.normalize(root)
+	if abs:sub(1, #root + 1) ~= root .. "/" then
+		return nil
+	end
+	return abs:sub(#root + 2)
+end
+
+-- Describes the file shown in `win`: repo path (BB anchor path), path on the FROM
+-- side (differs for renames) and diff side. Returns nil, reason when the window
+-- shows no repository file (file panel, commit log, null side of an added file).
+local function window_file_info(win)
+	local bufnr = vim.api.nvim_win_get_buf(win)
+	local dv = diffview_window_file(win)
+	if dv then
+		if dv.nulled then
+			return nil, "this side of the diff has no file"
+		end
+		local side
+		if dv.symbol == "a" then
+			side = "left"
+		elseif dv.symbol == "b" then
+			side = vim.wo[win].diff and "right" or "single"
+		else
+			return nil, "comments are only supported in a two-way diff"
+		end
+		if type(dv.path) ~= "string" or dv.path == "" then
+			return nil, "cannot determine the file path"
+		end
+		return { bufnr = bufnr, path = dv.path, from_path = dv.from_path or dv.path, side = side }
+	end
+	local rel = plain_buffer_repo_path(bufnr)
+	if not rel then
+		return nil, "current buffer is not a repository file"
+	end
+	return { bufnr = bufnr, path = rel, from_path = rel, side = vim.api.nvim_win_call(win, current_diff_side) }
+end
+
+-- PR line translation.
+--
+-- Bitbucket anchors FROM lines to the merge base and TO lines to the source tip.
+-- The PR tab instead shows the target tip (left) against the working tree with
+-- the target merged in (right), so line numbers drift whenever the target branch
+-- touched a PR file. Each window's content is diffed against the commit
+-- Bitbucket uses for that side, and line types come from the merge-base..source
+-- diff — the same diff Bitbucket renders.
+
+local function git_file_text(root, rev, path)
+	local key = rev .. ":" .. path
+	local cached = state.git_text_cache[key]
+	if cached then
+		return cached
+	end
+	local res = vim.system({ "git", "show", key }, { cwd = root, text = true }):wait()
+	-- a path missing at that commit (added or deleted file) is an empty version
+	local text = res.code == 0 and (res.stdout or "") or ""
+	state.git_text_cache[key] = text
+	return text
+end
+
+-- merge base → source tip: the PR diff as Bitbucket shows it
+local function pr_hunks(info, finfo)
+	local key = table.concat({ info.base, info.source, finfo.from_path, finfo.path }, "\0")
+	local hunks = state.hunks_cache[key]
+	if not hunks then
+		hunks = linemap.hunks(
+			git_file_text(info.root, info.base, finfo.from_path),
+			git_file_text(info.root, info.source, finfo.path)
+		)
+		state.hunks_cache[key] = hunks
+	end
+	return hunks
+end
+
+-- Bitbucket's version of this side → what the window shows (recomputed on edits)
+local function window_hunks(info, finfo)
+	local rev = finfo.side == "left" and info.base or info.source
+	local path = finfo.side == "left" and finfo.from_path or finfo.path
+	local tick = vim.api.nvim_buf_get_changedtick(finfo.bufnr)
+	local key = table.concat({ rev, path }, "\0")
+	local cached = state.buf_hunks_cache[finfo.bufnr]
+	if cached and cached.key == key and cached.tick == tick then
+		return cached.hunks
+	end
+	local shown = linemap.lines_to_text(vim.api.nvim_buf_get_lines(finfo.bufnr, 0, -1, false))
+	local hunks = linemap.hunks(git_file_text(info.root, rev, path), shown)
+	state.buf_hunks_cache[finfo.bufnr] = { key = key, tick = tick, hunks = hunks }
+	return hunks
+end
+
+local function tab_diff_base(tabpage)
+	return state.diff_base_by_tab[tab_key(tabpage or vim.api.nvim_get_current_tabpage())]
+end
+
+-- Local line of the window described by `finfo` → Bitbucket anchor
+-- { line, line_type, file_type }, or nil, reason when Bitbucket has no such line.
+local function local_line_to_anchor(info, finfo, line)
+	local local_to_bb = linemap.b_to_a(window_hunks(info, finfo), line)
+	if finfo.side == "left" then
+		if not local_to_bb then
+			return nil, "this line was changed in the target branch after the PR branched off"
+		end
+		local removed = linemap.in_a(pr_hunks(info, finfo), local_to_bb)
+		return { line = local_to_bb, line_type = removed and "REMOVED" or "CONTEXT", file_type = "FROM" }
+	end
+	if not local_to_bb then
+		return nil, "this line is not in the PR source (it comes from the merged target branch or a local edit)"
+	end
+	local added = linemap.in_b(pr_hunks(info, finfo), local_to_bb)
+	return { line = local_to_bb, line_type = added and "ADDED" or "CONTEXT", file_type = "TO" }
+end
+
+-- Bitbucket comment anchor → line in the window described by `finfo`, or nil
+-- when the commented line is not shown there.
+local function anchor_to_local_line(info, finfo, c)
+	local line = tonumber(c.line or 0) or 0
+	if line <= 0 then
+		return nil
+	end
+	local file_type = tostring(c.file_type or ""):upper()
+	local bb_line = line
+	if finfo.side == "left" then
+		if file_type ~= "FROM" then
+			-- a context line anchored on the TO side still exists in the merge base
+			bb_line = linemap.b_to_a(pr_hunks(info, finfo), line)
+		end
+	elseif file_type == "FROM" then
+		bb_line = linemap.a_to_b(pr_hunks(info, finfo), line)
+	end
+	if not bb_line then
+		return nil
+	end
+	return linemap.a_to_b(window_hunks(info, finfo), bb_line)
 end
 
 local function comment_matches_side(c, side)
@@ -1284,19 +1486,28 @@ apply_comments_to_current_buffer = function(comments_payload)
 	local rel = vim.fn.fnamemodify(file, ":.")
 	local rel_norm = normalize_repo_path(rel)
 	local line_count = vim.api.nvim_buf_line_count(bufnr)
-	local side = current_diff_side()
+	local finfo = window_file_info(vim.api.nvim_get_current_win())
+	local cur_path = finfo and finfo.path or rel_norm
+	local side = finfo and finfo.side or current_diff_side()
+	-- translate Bitbucket line numbers when the PR tab knows its commits
+	local info = finfo and tab_diff_base()
 
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
 	local seen_comment_ids = {}
 
 	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
-		if not c.is_outdated and path_matches(rel_norm, c.path) and comment_matches_side(c, side) then
+		if not c.is_outdated and path_matches(cur_path, c.path) and comment_matches_side(c, side) then
 			local cid = tonumber(c.id or 0) or 0
 			if cid > 0 and seen_comment_ids[cid] then
 				goto continue
 			end
-			local line = tonumber(c.line or 0)
+			local line
+			if info then
+				line = anchor_to_local_line(info, finfo, c) or 0
+			else
+				line = tonumber(c.line or 0) or 0
+			end
 			if line > 0 then
 				if cid > 0 then
 					seen_comment_ids[cid] = true
@@ -1341,7 +1552,13 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 
 	vim.b[bufnr].bb_pr_line_comments = by_line
-	set_diff_buffer_keymaps(bufnr)
+	-- only file buffers get the comment keymaps: the diffview file panel, commit log
+	-- and null buffer share the tab but have no repo file to anchor a comment to
+	local buftype = vim.bo[bufnr].buftype
+	local is_diffview_file = buftype == "nowrite" and file:match("^diffview://") and file ~= "diffview://null"
+	if buftype == "" or is_diffview_file then
+		set_diff_buffer_keymaps(bufnr)
+	end
 end
 
 local function walk_diffview_components(node, rows)
@@ -1656,6 +1873,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 		return
 	end
 	local file_type = string.upper(tostring(c.file_type or "TO"))
+	local bb_line = line
 
 	local function jump_cursor()
 		local target_win = nil
@@ -1673,6 +1891,12 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 		end
 		if not target_win then
 			return nil
+		end
+		local info = tab_diff_base()
+		local finfo = info and window_file_info(target_win)
+		if finfo then
+			-- unmapped (line no longer shown) → keep the raw number as a best guess
+			line = anchor_to_local_line(info, finfo, c) or bb_line
 		end
 		local buf = vim.api.nvim_win_get_buf(target_win)
 		local line_count = vim.api.nvim_buf_line_count(buf)
@@ -1843,7 +2067,11 @@ local function close_old_pr_tabs()
 		state.pending_comments_by_tab[key] = nil
 		state.builds_by_tab[key] = nil
 		state.conflict_by_tab[key] = nil
+		state.diff_base_by_tab[key] = nil
 	end
+	state.git_text_cache = {}
+	state.hunks_cache = {}
+	state.buf_hunks_cache = {}
 	log("close_old_pr_tabs: closed", #pr_tabs, "tab(s)")
 end
 
@@ -1996,6 +2224,7 @@ local function open_diffview(pr)
 					)
 					set_current_tab_pr(pr)
 					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
+					set_current_tab_diff_base(repo_root, from_ref, to_ref)
 					run_comments_provider(pr.id, function(payload)
 						vim.schedule(function()
 							set_current_tab_comments(payload)
@@ -2934,27 +3163,42 @@ local function detect_line_type_for_cursor(side, line)
 		log("detect_line_type: hl_id=0 → CONTEXT", "side=", side, "line=", line)
 		return "CONTEXT"
 	end
-	local hl_name = vim.fn.synIDattr(hl_id, "name")
-	hl_name = type(hl_name) == "string" and hl_name or ""
-	local function ret(t)
-		log("detect_line_type:", "side=", side, "line=", line, "hl_name=", hl_name, "→", t)
-		return t
-	end
-	if hl_name:find("DiffDelete", 1, true) then return ret("REMOVED") end
-	if hl_name:find("DiffAdd", 1, true) then return ret("ADDED") end
-	if hl_name:find("DiffChange", 1, true) or hl_name:find("DiffText", 1, true) then return ret("CONTEXT") end
-
-	if side == "left" then
-		log("detect_line_type fallback by side=left", "line=", line, "hl_name=", hl_name)
-		return "REMOVED"
-	end
-	if side == "right" then
-		log("detect_line_type fallback by side=right", "line=", line, "hl_name=", hl_name)
-		return "ADDED"
-	end
-	log("detect_line_type fallback no-side", "line=", line, "hl_name=", hl_name)
-	return "CONTEXT"
+	-- Vim highlights a line that exists only in this window as DiffAdd on either
+	-- side, and a modified line as DiffChange/DiffText. Bitbucket's unified diff
+	-- has no such distinction: every highlighted line is a removal on the old
+	-- (FROM) side and an addition on the new (TO) side.
+	local t = side == "left" and "REMOVED" or "ADDED"
+	log("detect_line_type:", "side=", side, "line=", line, "hl_name=", vim.fn.synIDattr(hl_id, "name"), "→", t)
+	return t
 end
+
+-- Resolves the anchor for a new file comment on `line` of the file shown in `win`.
+-- Returns ctx or nil plus a reason.
+local function resolve_file_comment_context(win, line)
+	local finfo, err = window_file_info(win)
+	if not finfo then
+		return nil, err
+	end
+	local ctx = { mode = "new_file", bufnr = finfo.bufnr, path = finfo.path }
+	local info = tab_diff_base(vim.api.nvim_win_get_tabpage(win))
+	if info then
+		local anchor, anchor_err = local_line_to_anchor(info, finfo, line)
+		if not anchor then
+			return nil, anchor_err
+		end
+		ctx.line, ctx.line_type, ctx.file_type = anchor.line, anchor.line_type, anchor.file_type
+	else
+		-- PR tab without recorded commits: fall back to the diff highlight of the line
+		ctx.line = line
+		ctx.line_type = vim.api.nvim_win_call(win, function()
+			return detect_line_type_for_cursor(finfo.side, line)
+		end) or "CONTEXT"
+		ctx.file_type = finfo.side == "left" and "FROM" or "TO"
+	end
+	log("resolve_file_comment_context:", "local_line=", line, "side=", finfo.side, "mapped=", info ~= nil, "ctx=", ctx)
+	return ctx
+end
+
 local function resolve_comment_context(mode)
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -2967,20 +3211,17 @@ local function resolve_comment_context(mode)
 		return { mode = "new_overview" }
 	end
 
-	local bufname = vim.api.nvim_buf_get_name(bufnr)
-	local rel = extract_repo_relative_path(bufname)
-	local side = current_diff_side()
-	local file_type = side == "left" and "FROM" or "TO"
-	local line_type = detect_line_type_for_cursor(side, line) or "CONTEXT"
-	local ctx = {
-		mode = "new_file",
-		path = rel,
-		line = line,
-		line_type = line_type,
-		file_type = file_type,
-	}
-	log("resolve_comment_context:", "bufname=", bufname, "rel=", rel, "side=", side, "ctx=", ctx)
-	return ctx
+	-- line comments float: anchor to the diff line the float was opened from
+	local source_win = vim.b[bufnr].bb_pr_float_source_win
+	if source_win then
+		local source_line = tonumber(vim.b[bufnr].bb_pr_float_source_line or 0) or 0
+		if not (vim.api.nvim_win_is_valid(source_win) and source_line > 0) then
+			return nil, "the diff window of this float is gone"
+		end
+		return resolve_file_comment_context(source_win, source_line)
+	end
+
+	return resolve_file_comment_context(vim.api.nvim_get_current_win(), line)
 end
 
 local function open_multiline_comment_input(opts, on_submit)
@@ -3847,6 +4088,21 @@ local function accept_suggestion()
 		)
 		return
 	end
+	local info = tab_diff_base()
+	if info then
+		-- the buffer is the working tree with the target merged in: translate the
+		-- Bitbucket TO line into it
+		local mapped = anchor_to_local_line(
+			info,
+			{ bufnr = buf, path = target_path, from_path = target_path, side = "right" },
+			comment
+		)
+		if not mapped then
+			vim.notify("bb_pr: the commented line is no longer in the working tree", vim.log.levels.WARN)
+			return
+		end
+		line = mapped
+	end
 	local replacement_lines = vim.split(replacement, "\n", { plain = true })
 	local ok_apply, apply_err = apply_suggestion_lines(buf, line, replacement_lines)
 	if not ok_apply then
@@ -4173,9 +4429,9 @@ local function post_comment_or_task(is_task, force_reply, opts)
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
 		return
 	end
-	local ctx = resolve_comment_context(force_reply and "reply" or "auto")
+	local ctx, ctx_err = resolve_comment_context(force_reply and "reply" or "auto")
 	if not ctx and not force_reply then
-		vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
+		vim.notify("bb_pr: cannot create comment here: " .. (ctx_err or "unknown context"), vim.log.levels.WARN)
 		return
 	end
 
@@ -4183,13 +4439,6 @@ local function post_comment_or_task(is_task, force_reply, opts)
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		local comment_win = vim.api.nvim_get_current_win()
 		local comment_bufnr = vim.api.nvim_get_current_buf()
-		local suggestion_line = ""
-		if ctx and ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
-			local current_line = vim.api.nvim_buf_get_lines(comment_bufnr, ctx.line - 1, ctx.line, false)[1]
-			if type(current_line) == "string" then
-				suggestion_line = current_line
-			end
-		end
 		local comment_draft_key
 		if reply_to and reply_to > 0 then
 			comment_draft_key = "comment:reply:" .. tostring(reply_to)
@@ -4286,16 +4535,15 @@ local function suggestion_prefill_for_context(ctx, suggestion_line)
 end
 
 local function create_suggestion_comment()
-	local ctx = resolve_comment_context("auto")
+	local ctx, ctx_err = resolve_comment_context("auto")
 	if not ctx then
-		vim.notify("bb_pr: cannot resolve comment context", vim.log.levels.WARN)
+		vim.notify("bb_pr: cannot create comment here: " .. (ctx_err or "unknown context"), vim.log.levels.WARN)
 		return
 	end
 
 	local suggestion_line = ""
 	if ctx.mode == "new_file" and type(ctx.line) == "number" and ctx.line > 0 then
-		local bufnr = vim.api.nvim_get_current_buf()
-		local line = vim.api.nvim_buf_get_lines(bufnr, ctx.line - 1, ctx.line, false)[1]
+		local line = vim.api.nvim_buf_get_lines(ctx.bufnr, ctx.line - 1, ctx.line, false)[1]
 		if type(line) == "string" then
 			suggestion_line = line
 		end
