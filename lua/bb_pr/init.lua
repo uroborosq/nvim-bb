@@ -113,6 +113,9 @@ local state = {
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
 	drafts = {},
+	-- bufnr -> { [line] = { comment, ... } }; kept in Lua because vim.b turns the sparse
+	-- line-keyed table into a list as long as the last commented line on every write/read
+	line_comments_by_buf = {},
 }
 
 local function rotate_log_if_needed(path, max_size, max_age)
@@ -618,6 +621,10 @@ end
 
 local function get_current_tab_comments()
 	return state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+end
+
+local function get_buf_line_comments(bufnr)
+	return state.line_comments_by_buf[bufnr] or {}
 end
 
 -- `info` is { to_ref = "<branch>" } while the PR branch sits on top of an unresolved
@@ -1361,10 +1368,7 @@ end
 
 local function jump_file_comment(direction)
 	local bufnr = vim.api.nvim_get_current_buf()
-	local by_line = vim.b[bufnr].bb_pr_line_comments
-	if type(by_line) ~= "table" then
-		by_line = {}
-	end
+	local by_line = get_buf_line_comments(bufnr)
 	local current_line = vim.api.nvim_win_get_cursor(0)[1]
 	local lines = {}
 	for line, comments in pairs(by_line) do
@@ -1551,7 +1555,7 @@ apply_comments_to_current_buffer = function(comments_payload)
 		end
 	end
 
-	vim.b[bufnr].bb_pr_line_comments = by_line
+	state.line_comments_by_buf[bufnr] = by_line
 	-- only file buffers get the comment keymaps: the diffview file panel, commit log
 	-- and null buffer share the tab but have no repo file to anchor a comment to
 	local buftype = vim.bo[bufnr].buftype
@@ -1911,11 +1915,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 	local target_comment_id = tonumber(c.id or 0) or 0
 
 	local function open_float_for_line(buf)
-		local by_line = vim.b[buf].bb_pr_line_comments
-		if type(by_line) ~= "table" then
-			return false
-		end
-		local line_comments = by_line[line]
+		local line_comments = get_buf_line_comments(buf)[line]
 		if type(line_comments) ~= "table" or #line_comments == 0 then
 			return false
 		end
@@ -3877,8 +3877,7 @@ local function refresh_float_window_if_needed(win, buf)
 	end
 	local reopened_win = nil
 	vim.api.nvim_win_call(source_win, function()
-		local by_line = vim.b[source_bufnr].bb_pr_line_comments or {}
-		local updated_comments = by_line[source_line]
+		local updated_comments = get_buf_line_comments(source_bufnr)[source_line]
 		if updated_comments and #updated_comments > 0 then
 			reopened_win = open_comment_float(updated_comments, source_line)
 		end
@@ -4992,9 +4991,8 @@ set_diff_buffer_keymaps = function(bufnr)
 	-- gc: open the comments float, or start a new comment when the line has none
 	vim.keymap.set("n", "gc", function()
 		local line = vim.api.nvim_win_get_cursor(0)[1]
-		local comments = (vim.b[buf].bb_pr_line_comments or {})[line]
-		-- vim.b round-trips sparse line tables with vim.NIL holes, so check the type
-		if type(comments) == "table" and #comments > 0 then
+		local comments = get_buf_line_comments(buf)[line]
+		if comments and #comments > 0 then
 			open_comment_float(comments, line)
 		else
 			post_comment_or_task(false, false)
@@ -5102,9 +5100,8 @@ function M.setup(opts)
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
 		local bufnr = vim.api.nvim_get_current_buf()
 		local line = vim.api.nvim_win_get_cursor(0)[1]
-		local by_line = vim.b[bufnr].bb_pr_line_comments or {}
-		local comments = by_line[line]
-		if type(comments) ~= "table" or #comments == 0 then
+		local comments = get_buf_line_comments(bufnr)[line]
+		if not comments or #comments == 0 then
 			vim.notify("bb_pr: no comments on current line", vim.log.levels.INFO)
 			return
 		end
@@ -5201,6 +5198,12 @@ function M.setup(opts)
 			if payload then
 				apply_comments_to_tab_windows(payload)
 			end
+		end,
+	})
+	vim.api.nvim_create_autocmd("BufWipeout", {
+		group = aug,
+		callback = function(ev)
+			state.line_comments_by_buf[ev.buf] = nil
 		end,
 	})
 end
