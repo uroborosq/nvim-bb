@@ -42,7 +42,8 @@ local default_config = {
 	-- reactions
 	reactions = {
 		default = "THUMBS_UP",
-		choices = vim.deepcopy(reactions.all_reaction_choices),
+		-- merge_config deep-copies the defaults, so the shared list is never mutated
+		choices = reactions.all_reaction_choices,
 		recency_store_path = vim.fn.stdpath("state") .. "/bb_pr_reaction_recency.json",
 	},
 
@@ -103,18 +104,20 @@ M.config = vim.deepcopy(default_config)
 
 local state = {
 	prs = {},
-	pr_by_tab = {},
+	-- tab_key -> per-tab state (see tab_state):
+	--   pr, comments, pending_comments (applied by the next BufEnter/CursorMoved), builds,
+	--   conflict ({ to_ref } while the PR branch sits on an unresolved merge),
+	--   diff_base ({ root, base, source }: the commits Bitbucket anchors FROM / TO lines to)
+	tabs = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 	diffview_panel_ns = vim.api.nvim_create_namespace("bb_pr_diffview_panel"),
-	comments_by_tab = {},
-	pending_comments_by_tab = {},
-	builds_by_tab = {},
-	conflict_by_tab = {},
-	-- per PR tab: { root, base, source } — the commits Bitbucket anchors FROM / TO lines to
-	diff_base_by_tab = {},
 	git_text_cache = {},
 	hunks_cache = {},
 	buf_hunks_cache = {},
+	-- bufnr -> what the comment extmarks of that buffer were last rendered from
+	rendered_by_buf = {},
+	-- diffview file panel bufnr -> what its comment signs were last rendered from
+	panel_rendered_by_buf = {},
 	pending_nav_by_pr_id = {},
 	reaction_usage_by_key = {},
 	reaction_usage_seq = 0,
@@ -122,6 +125,13 @@ local state = {
 	-- bufnr -> { [line] = { comment, ... } }; kept in Lua because vim.b turns the sparse
 	-- line-keyed table into a list as long as the last commented line on every write/read
 	line_comments_by_buf = {},
+	-- bufnr -> what a comment view buffer shows (Lua-side for the same reason):
+	--   kind = "float" (line comments float) or "overview" (PR Info),
+	--   ids_by_line = { [line] = comment_id } for the lines that act on a comment,
+	--   reaction_segments = { [line] = { comment_id, segments } } for reaction lines,
+	--   thread_lines (overview) = ascending lines of the "### Thread" headings,
+	--   pr (overview) = the PR the buffer renders
+	comment_view_by_buf = {},
 }
 
 local function rotate_log_if_needed(path, max_size, max_age)
@@ -165,30 +175,35 @@ local function tab_key(tabpage)
 	return tostring(tabpage)
 end
 
-local function set_current_tab_pr(pr, opts)
-	opts = opts or {}
-	local key = tab_key(vim.api.nvim_get_current_tabpage())
-	state.pr_by_tab[key] = pr
-	if not opts.preserve_comments then
-		state.comments_by_tab[key] = nil
+-- Per-tab state of `tabpage` (default: current tab), created on first use.
+local function tab_state(tabpage)
+	local key = tab_key(tabpage or vim.api.nvim_get_current_tabpage())
+	local ts = state.tabs[key]
+	if not ts then
+		ts = {}
+		state.tabs[key] = ts
 	end
+	return ts
 end
 
 local function set_tab_pr(tabpage, pr, opts)
-	opts = opts or {}
-	local key = tab_key(tabpage)
-	state.pr_by_tab[key] = pr
-	if not opts.preserve_comments then
-		state.comments_by_tab[key] = nil
+	local ts = tab_state(tabpage)
+	ts.pr = pr
+	if not (opts and opts.preserve_comments) then
+		ts.comments = nil
 	end
 end
 
-local function get_current_tab_pr()
-	return state.pr_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+local function set_current_tab_pr(pr, opts)
+	set_tab_pr(nil, pr, opts)
 end
 
 local function get_tab_pr(tabpage)
-	return state.pr_by_tab[tab_key(tabpage)]
+	return tab_state(tabpage).pr
+end
+
+local function get_current_tab_pr()
+	return get_tab_pr()
 end
 
 local function format_opened_age(ms)
@@ -242,32 +257,36 @@ local function format_my_review_marker(pr)
 	return "?"
 end
 
+-- build state -> marker, shared by the PR list and the PR Info "## Build" section
+local BUILD_ICONS = {
+	SUCCESSFUL = "✓",
+	FAILED = "✗",
+	INPROGRESS = "●",
+	NONE = "○",
+}
+
 local function format_build_marker(pr)
 	local st = type(pr.build_status) == "string" and string.upper(pr.build_status) or ""
-	if st == "SUCCESSFUL" then
-		return "✓"
+	return BUILD_ICONS[st] or " "
+end
+
+-- APPROVED / NEEDS_WORK / UNAPPROVED / PENDING (no status), or the upper-cased raw status
+local function reviewer_status(reviewer)
+	if reviewer.approved or reviewer.status == "APPROVED" then
+		return "APPROVED"
 	end
-	if st == "FAILED" then
-		return "✗"
-	end
-	if st == "INPROGRESS" then
-		return "●"
-	end
-	if st == "NONE" then
-		return "○"
-	end
-	return " "
+	local raw = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
+	return raw == "" and "PENDING" or raw
 end
 
 local function format_pr_entry(pr)
 	local approvals = 0
 	local has_needs_work = false
 	for _, reviewer in ipairs(pr.reviewers or {}) do
-		if reviewer.approved or reviewer.status == "APPROVED" then
+		local status = reviewer_status(reviewer)
+		if status == "APPROVED" then
 			approvals = approvals + 1
-		end
-		local reviewer_status = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
-		if reviewer_status == "NEEDS_WORK" then
+		elseif status == "NEEDS_WORK" then
 			has_needs_work = true
 		end
 	end
@@ -286,89 +305,80 @@ local function format_pr_entry(pr)
 	)
 end
 
+-- Lists (e.g. provider_cmd) in the user config replace the default list wholesale.
 local function merge_config(user)
-	M.config = vim.deepcopy(default_config)
-	local opts = user or {}
-	local function deep_merge(target, source)
-		for k, v in pairs(source) do
-			if type(target[k]) == "table" and type(v) == "table" then
-				deep_merge(target[k], v)
-			else
-				target[k] = v
-			end
-		end
-	end
-	deep_merge(M.config, opts)
+	M.config = vim.tbl_deep_extend("force", vim.deepcopy(default_config), user or {})
 end
 
-local function load_reaction_recency_state()
-	local path = tostring(M.config.reactions.recency_store_path or "")
+-- Decoded JSON object stored at `path`, or nil when the path is unset, missing or invalid.
+local function read_json_file(path)
+	path = tostring(path or "")
 	if path == "" then
-		return
+		return nil
 	end
 	local ok_read, lines = pcall(vim.fn.readfile, path)
 	if not ok_read or type(lines) ~= "table" or #lines == 0 then
-		return
+		return nil
 	end
 	local ok_json, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
 	if not ok_json or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded
+end
+
+local function write_json_file(path, data)
+	path = tostring(path or "")
+	if path == "" then
+		return
+	end
+	pcall(vim.fn.mkdir, vim.fn.fnamemodify(path, ":h"), "p")
+	pcall(vim.fn.writefile, { vim.json.encode(data) }, path)
+end
+
+local function load_reaction_recency_state()
+	local decoded = read_json_file(M.config.reactions.recency_store_path)
+	if not decoded then
 		return
 	end
 	state.reaction_usage_by_key = type(decoded.by_key) == "table" and decoded.by_key or {}
-	state.reaction_usage_seq = tonumber(decoded.seq or 0) or 0
+	state.reaction_usage_seq = tonumber(decoded.seq) or 0
 end
 
 local function persist_reaction_recency_state()
-	local path = tostring(M.config.reactions.recency_store_path or "")
-	if path == "" then
-		return
-	end
-	local dir = vim.fn.fnamemodify(path, ":h")
-	pcall(vim.fn.mkdir, dir, "p")
-	local payload = vim.json.encode({
-		seq = tonumber(state.reaction_usage_seq or 0) or 0,
-		by_key = state.reaction_usage_by_key or {},
+	write_json_file(M.config.reactions.recency_store_path, {
+		seq = state.reaction_usage_seq,
+		by_key = state.reaction_usage_by_key,
 	})
-	pcall(vim.fn.writefile, { payload }, path)
 end
 
 local function load_drafts()
-	local path = tostring(M.config.drafts.store_path or "")
-	if path == "" then
-		return
-	end
-	local ok, lines = pcall(vim.fn.readfile, path)
-	if not ok or type(lines) ~= "table" or #lines == 0 then
-		return
-	end
-	local ok2, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
-	if not ok2 or type(decoded) ~= "table" then
+	local decoded = read_json_file(M.config.drafts.store_path)
+	if not decoded then
 		return
 	end
 	state.drafts = type(decoded.drafts) == "table" and decoded.drafts or {}
 end
 
 local function persist_drafts()
-	local path = tostring(M.config.drafts.store_path or "")
-	if path == "" then
-		return
-	end
-	local dir = vim.fn.fnamemodify(path, ":h")
-	pcall(vim.fn.mkdir, dir, "p")
-	local payload = vim.json.encode({ drafts = state.drafts })
-	pcall(vim.fn.writefile, { payload }, path)
+	write_json_file(M.config.drafts.store_path, { drafts = state.drafts })
 end
 
-local function save_draft(key, text, base)
-	if not key or vim.trim(text or "") == "" then
-		return
-	end
+local function drafts_without(key)
 	local kept = {}
 	for _, d in ipairs(state.drafts) do
 		if d.key ~= key then
 			table.insert(kept, d)
 		end
 	end
+	return kept
+end
+
+local function save_draft(key, text, base)
+	if not key or vim.trim(text or "") == "" then
+		return
+	end
+	local kept = drafts_without(key)
 	table.insert(kept, { key = key, text = text, base = base, saved_at = os.time() })
 	local max = tonumber(M.config.drafts.max_count or 50) or 50
 	if #kept > max then
@@ -391,33 +401,36 @@ end
 local function attach_draft_autosave(opts)
 	local buf, win, key, get_text = opts.buf, opts.win, opts.key, opts.get_text
 	if not key or not buf then
-		return { save_now = function() end, cancel = function() end }
+		return { cancel = function() end }
 	end
 
 	local group = vim.api.nvim_create_augroup("bb_pr_draft_" .. tostring(buf), { clear = true })
-	local uv = vim.uv or vim.loop
-	local timer = nil
+	local timer = (vim.uv or vim.loop).new_timer()
 	local cancelled = false
-
-	local function stop_timer()
-		if timer then
-			timer:stop()
-			if not timer:is_closing() then
-				timer:close()
-			end
-			timer = nil
-		end
-	end
+	local last_saved = nil
 
 	local function save_now()
 		if cancelled then
 			return
 		end
-		stop_timer()
+		timer:stop()
 		local text = get_text()
-		if type(text) == "string" then
+		if type(text) == "string" and text ~= last_saved then
+			last_saved = text
 			save_draft(key, text, opts.base)
 		end
+	end
+
+	local function cancel()
+		if cancelled then
+			return
+		end
+		cancelled = true
+		timer:stop()
+		if not timer:is_closing() then
+			timer:close()
+		end
+		pcall(vim.api.nvim_del_augroup_by_id, group)
 	end
 
 	local delay = tonumber(M.config.drafts.autosave_debounce_ms or 400) or 400
@@ -425,8 +438,7 @@ local function attach_draft_autosave(opts)
 		if cancelled then
 			return
 		end
-		stop_timer()
-		timer = uv.new_timer()
+		timer:stop()
 		timer:start(delay, 0, vim.schedule_wrap(save_now))
 	end
 
@@ -435,10 +447,19 @@ local function attach_draft_autosave(opts)
 		buffer = buf,
 		callback = schedule_save,
 	})
-	vim.api.nvim_create_autocmd({ "BufWipeout", "BufLeave" }, {
+	vim.api.nvim_create_autocmd("BufLeave", {
 		group = group,
 		buffer = buf,
 		callback = save_now,
+	})
+	-- the buffer is gone: save what it held, then release the timer and autocmds
+	vim.api.nvim_create_autocmd("BufWipeout", {
+		group = group,
+		buffer = buf,
+		callback = function()
+			save_now()
+			cancel()
+		end,
 	})
 	vim.api.nvim_create_autocmd("VimLeavePre", {
 		group = group,
@@ -452,14 +473,7 @@ local function attach_draft_autosave(opts)
 		})
 	end
 
-	return {
-		save_now = save_now,
-		cancel = function()
-			cancelled = true
-			stop_timer()
-			pcall(vim.api.nvim_del_augroup_by_id, group)
-		end,
-	}
+	return { cancel = cancel }
 end
 
 local function get_draft(key)
@@ -481,12 +495,7 @@ local function delete_draft(key)
 	if not key then
 		return
 	end
-	local kept = {}
-	for _, d in ipairs(state.drafts) do
-		if d.key ~= key then
-			table.insert(kept, d)
-		end
-	end
+	local kept = drafts_without(key)
 	if #kept ~= #state.drafts then
 		state.drafts = kept
 		persist_drafts()
@@ -504,6 +513,39 @@ local function draft_age_label(saved_at)
 	else
 		return math.floor(diff / 86400) .. "d ago"
 	end
+end
+
+-- The draft saved under `key` (nil when none) and whether it conflicts: it was written
+-- against a different starting text than `fresh_base` (template or original changed).
+local function load_draft(key, fresh_base)
+	local draft = get_draft(key)
+	local conflict = draft ~= nil and draft.base ~= nil and draft.base ~= fresh_base
+	return draft, conflict
+end
+
+-- Tells the user about the draft load_draft found for the editor in `buf`: a matching
+-- draft was restored; a conflicting one is offered on <C-r>, which calls restore()
+-- (returning false means there was nothing to restore).
+local function announce_draft(buf, draft, conflict, restore)
+	if not draft then
+		return
+	end
+	if not conflict then
+		vim.notify("bb_pr: draft restored (" .. draft_age_label(draft.saved_at) .. ")", vim.log.levels.INFO)
+		return
+	end
+	vim.notify(
+		string.format(
+			"bb_pr: draft from %s conflicts with updated template — <C-r> to restore draft",
+			draft_age_label(draft.saved_at)
+		),
+		vim.log.levels.WARN
+	)
+	vim.keymap.set({ "n", "i" }, "<C-r>", function()
+		if vim.api.nvim_buf_is_valid(buf) and restore() ~= false then
+			vim.notify("bb_pr: draft loaded", vim.log.levels.INFO)
+		end
+	end, { buffer = buf, silent = true })
 end
 
 local function with_repo_autodetect_flag(cmd)
@@ -532,107 +574,132 @@ local function bb_cmd(parts)
 	return with_repo_autodetect_flag(cmd)
 end
 
-local function run_provider(cb)
-	vim.system(with_repo_autodetect_flag(M.config.provider_cmd), { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-
-		local ok, decoded = pcall(vim.json.decode, res.stdout)
-		if not ok or type(decoded) ~= "table" then
-			vim.schedule(function()
-				vim.notify("bb_pr: invalid JSON provider output", vim.log.levels.ERROR)
-			end)
-			return
-		end
-
-		cb(decoded)
-	end)
+-- Runs a bb command. On success on_ok runs on the main loop (nvim API is safe there)
+-- with the decoded JSON when opts.json, otherwise with the vim.system result.
+-- Failures notify "bb_pr: <opts.fail_msg>: <stderr>" and, for undecodable JSON,
+-- "bb_pr: <opts.invalid_msg>", unless opts.notify_errors == false.
+local function run_bb_cmd(cmd, opts, on_ok)
+	opts = opts or {}
+	local notify_errors = opts.notify_errors ~= false
+	vim.system(
+		cmd,
+		{ text = true },
+		vim.schedule_wrap(function(res)
+			if res.code ~= 0 then
+				log("bb command failed:", cmd, "code=", res.code, "stderr=", res.stderr or "")
+				if notify_errors then
+					vim.notify(
+						"bb_pr: " .. (opts.fail_msg or "bb failed") .. ": " .. (res.stderr or ""),
+						vim.log.levels.ERROR
+					)
+				end
+				return
+			end
+			if not opts.json then
+				on_ok(res)
+				return
+			end
+			local ok, decoded = pcall(vim.json.decode, res.stdout)
+			if not ok or type(decoded) ~= "table" then
+				if notify_errors then
+					vim.notify("bb_pr: " .. (opts.invalid_msg or "invalid bb JSON output"), vim.log.levels.ERROR)
+				end
+				return
+			end
+			on_ok(decoded)
+		end)
+	)
 end
 
-local function refresh_current_pr(cb, tabpage)
-	local current = tabpage and get_tab_pr(tabpage) or get_current_tab_pr()
-	if type(current) ~= "table" then
-		cb(nil)
-		return
+-- run_bb_cmd for `bb <args>`
+local function run_bb(args, opts, on_ok)
+	run_bb_cmd(bb_cmd(args), opts, on_ok)
+end
+
+-- cb(prs) runs on the main loop. opts.without_builds drops "-builds" from
+-- provider_cmd: the CLI then skips the build lookup it does for every open PR.
+local function run_provider(cb, opts)
+	local cmd = M.config.provider_cmd
+	if opts and opts.without_builds then
+		cmd = vim.tbl_filter(function(part)
+			return part ~= "-builds"
+		end, cmd)
 	end
-	local current_id = tonumber(current.id or 0) or 0
+	run_bb_cmd(
+		with_repo_autodetect_flag(cmd),
+		{ json = true, fail_msg = "provider failed", invalid_msg = "invalid JSON provider output" },
+		cb
+	)
+end
+
+-- cb(pr or nil) runs on the main loop. Build status is not fetched: the PR tab
+-- shows builds from run_builds_provider, never pr.build_status.
+local function fetch_pr_by_id(pr_id, cb)
+	run_provider(function(prs)
+		for _, pr in ipairs(prs) do
+			if tonumber(pr.id or 0) == pr_id then
+				cb(pr)
+				return
+			end
+		end
+		cb(nil)
+	end, { without_builds = true })
+end
+
+-- cb(fresh_pr or nil) for the PR of `tabpage` (default: current tab)
+local function refresh_current_pr(cb, tabpage)
+	local current = get_tab_pr(tabpage)
+	local current_id = type(current) == "table" and (tonumber(current.id or 0) or 0) or 0
 	if current_id <= 0 then
 		cb(nil)
 		return
 	end
-
-	run_provider(function(decoded)
-		local found = nil
-		for _, pr in ipairs(decoded) do
-			if tonumber(pr.id or 0) == current_id then
-				found = pr
-				break
-			end
-		end
-		cb(found)
-	end)
+	fetch_pr_by_id(current_id, cb)
 end
 
 local apply_comments_to_current_buffer
-local apply_comments_to_tab_windows
 local apply_pr_info_content
 local find_comment_by_id
 local resolve_reply_target_comment_id
 local set_diff_buffer_keymaps
 local open_help_float
+local open_pr_info_with_comments
+local ticket_under_cursor
+local open_jira_ticket
+local open_attachment_at_cursor
 
+-- cb(payload) runs on the main loop
 local function run_comments_provider(pr_id, cb, opts)
-	opts = opts or {}
-	local cmd = vim.deepcopy(M.config.comments_cmd)
-	cmd = with_repo_autodetect_flag(cmd)
+	local cmd = with_repo_autodetect_flag(M.config.comments_cmd)
 	table.insert(cmd, tostring(pr_id))
-
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			if opts.notify_errors ~= false then
-				vim.schedule(function()
-					vim.notify("bb_pr: comments provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
-			end
-			return
-		end
-
-		local ok, decoded = pcall(vim.json.decode, res.stdout)
-		if not ok or type(decoded) ~= "table" then
-			if opts.notify_errors ~= false then
-				vim.schedule(function()
-					vim.notify("bb_pr: invalid PR comments JSON", vim.log.levels.ERROR)
-				end)
-			end
-			return
-		end
-
-		cb(decoded)
-	end)
+	run_bb_cmd(cmd, {
+		json = true,
+		notify_errors = not (opts and opts.notify_errors == false),
+		fail_msg = "comments provider failed",
+		invalid_msg = "invalid PR comments JSON",
+	}, cb)
 end
 
 local prefetch_comment_file_texts
 
 local function set_tab_comments(tabpage, payload)
-	local key = tab_key(tabpage)
-	state.comments_by_tab[key] = payload
-	state.pending_comments_by_tab[key] = payload
-	local info = state.diff_base_by_tab[key]
-	if info then
-		prefetch_comment_file_texts(info, payload)
+	local ts = tab_state(tabpage)
+	ts.comments = payload
+	ts.pending_comments = payload
+	-- the render memos are keyed on the payload anyway; drop the stale entries
+	state.rendered_by_buf = {}
+	state.panel_rendered_by_buf = {}
+	if ts.diff_base then
+		prefetch_comment_file_texts(ts.diff_base, payload)
 	end
 end
 
 local function set_current_tab_comments(payload)
-	set_tab_comments(vim.api.nvim_get_current_tabpage(), payload)
+	set_tab_comments(nil, payload)
 end
 
 local function get_current_tab_comments()
-	return state.comments_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+	return tab_state().comments
 end
 
 local function get_buf_line_comments(bufnr)
@@ -642,77 +709,62 @@ end
 -- `info` is { to_ref = "<branch>" } while the PR branch sits on top of an unresolved
 -- merge with its target, nil otherwise.
 local function set_current_tab_conflict(info)
-	state.conflict_by_tab[tab_key(vim.api.nvim_get_current_tabpage())] = info
+	tab_state().conflict = info
 end
 
 local function get_current_tab_conflict()
-	return state.conflict_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+	return tab_state().conflict
 end
 
 -- Records the commits Bitbucket anchors comment lines to: FROM lines to the merge
 -- base of source and target, TO lines to the source tip. Left unset (comments then
 -- use raw line numbers) when git cannot resolve them.
 local function set_current_tab_diff_base(repo_root, from_ref, to_ref)
-	local key = tab_key(vim.api.nvim_get_current_tabpage())
+	local ts = tab_state()
 	local opts = { cwd = repo_root, text = true }
-	local source = vim.system({ "git", "rev-parse", "origin/" .. from_ref }, opts):wait()
-	local base = vim.system({ "git", "merge-base", "origin/" .. from_ref, "origin/" .. to_ref }, opts):wait()
+	-- both run concurrently; wait for each
+	local source_job = vim.system({ "git", "rev-parse", "origin/" .. from_ref }, opts)
+	local base_job = vim.system({ "git", "merge-base", "origin/" .. from_ref, "origin/" .. to_ref }, opts)
+	local source = source_job:wait()
+	local base = base_job:wait()
 	if source.code ~= 0 or base.code ~= 0 then
 		log("set_current_tab_diff_base failed:", source.stderr, base.stderr)
-		state.diff_base_by_tab[key] = nil
+		ts.diff_base = nil
 		return
 	end
-	state.diff_base_by_tab[key] = {
+	ts.diff_base = {
 		root = repo_root,
 		base = vim.trim(base.stdout),
 		source = vim.trim(source.stdout),
 	}
-	log("set_current_tab_diff_base:", state.diff_base_by_tab[key])
+	log("set_current_tab_diff_base:", ts.diff_base)
 end
 
 local function consume_pending_tab_comments()
-	local key = tab_key(vim.api.nvim_get_current_tabpage())
-	local payload = state.pending_comments_by_tab[key]
-	state.pending_comments_by_tab[key] = nil
+	local ts = tab_state()
+	local payload = ts.pending_comments
+	ts.pending_comments = nil
 	return payload
 end
 
+-- cb(builds) runs on the main loop; errors are silent unless opts.notify_errors
 local function run_builds_provider(pr_id, cb, opts)
-	opts = opts or {}
-	local cmd = vim.deepcopy(M.config.builds_cmd)
-	cmd = with_repo_autodetect_flag(cmd)
+	local cmd = with_repo_autodetect_flag(M.config.builds_cmd)
 	table.insert(cmd, tostring(pr_id))
-
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			if opts.notify_errors then
-				vim.schedule(function()
-					vim.notify("bb_pr: builds provider failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
-			end
-			return
-		end
-
-		local ok, decoded = pcall(vim.json.decode, res.stdout)
-		if not ok or type(decoded) ~= "table" then
-			if opts.notify_errors then
-				vim.schedule(function()
-					vim.notify("bb_pr: invalid PR builds JSON", vim.log.levels.ERROR)
-				end)
-			end
-			return
-		end
-
-		cb(decoded)
-	end)
+	run_bb_cmd(cmd, {
+		json = true,
+		notify_errors = (opts and opts.notify_errors) and true or false,
+		fail_msg = "builds provider failed",
+		invalid_msg = "invalid PR builds JSON",
+	}, cb)
 end
 
 local function set_tab_builds(tabpage, payload)
-	state.builds_by_tab[tab_key(tabpage)] = payload
+	tab_state(tabpage).builds = payload
 end
 
 local function get_current_tab_builds()
-	return state.builds_by_tab[tab_key(vim.api.nvim_get_current_tabpage())]
+	return tab_state().builds
 end
 
 local function split_first_line(text)
@@ -720,23 +772,6 @@ local function split_first_line(text)
 		return "(empty)"
 	end
 	return (vim.split(text, "\n", { plain = true })[1] or ""):gsub("%s+", " ")
-end
-
-local function task_checkbox_prefix(c)
-	if type(c) ~= "table" then
-		return nil
-	end
-	if c.is_task then
-		local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
-		if status == "DONE" or status == "RESOLVED" then
-			return "- [x] "
-		end
-		return "- [ ] "
-	end
-	if c.is_resolved then
-		return "- [~] "
-	end
-	return nil
 end
 
 local function as_array(value)
@@ -799,7 +834,7 @@ end
 
 local function current_buffer_repo_path(bufnr)
 	local name = vim.api.nvim_buf_get_name(bufnr)
-	local primary = normalize_repo_path(extract_repo_relative_path(name))
+	local primary = extract_repo_relative_path(name)
 	if primary ~= "" then
 		return primary
 	end
@@ -818,41 +853,30 @@ local function current_buffer_repo_path(bufnr)
 end
 
 local function resolve_apply_target_bufnr(target_path, repo_root)
+	-- a buffer of a working tree file (not a diffview:// revision) showing target_path
+	local function candidate(b)
+		return vim.api.nvim_buf_is_valid(b)
+			and not vim.api.nvim_buf_get_name(b):match("^diffview://")
+			and (target_path == "" or path_matches(current_buffer_repo_path(b), target_path))
+	end
+
 	local cur = vim.api.nvim_get_current_buf()
 	local source = vim.b[cur].bb_pr_float_source_bufnr
-	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
-		local source_name = vim.api.nvim_buf_get_name(source)
-		if not tostring(source_name):match("^diffview://") then
-			local source_path = current_buffer_repo_path(source)
-			if target_path == "" or path_matches(source_path, target_path) then
-				return source
-			end
-		end
+	local has_source = type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source)
+	if has_source and candidate(source) then
+		return source
 	end
-
-	if vim.api.nvim_buf_is_valid(cur) then
-		local cur_name = vim.api.nvim_buf_get_name(cur)
-		if not tostring(cur_name):match("^diffview://") then
-			local cur_path = current_buffer_repo_path(cur)
-			if target_path == "" or path_matches(cur_path, target_path) then
-				return cur
-			end
-		end
-	end
-
-	for _, b in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_is_valid(b) and vim.bo[b].buftype == "" then
-			local name = vim.api.nvim_buf_get_name(b)
-			if name ~= "" and not tostring(name):match("^diffview://") then
-				local p = current_buffer_repo_path(b)
-				if target_path ~= "" and path_matches(p, target_path) then
-					return b
-				end
-			end
-		end
+	if candidate(cur) then
+		return cur
 	end
 
 	if target_path ~= "" then
+		for _, b in ipairs(vim.api.nvim_list_bufs()) do
+			if vim.bo[b].buftype == "" and vim.api.nvim_buf_get_name(b) ~= "" and candidate(b) then
+				return b
+			end
+		end
+
 		local abs = repo_root and vim.fs.joinpath(repo_root, target_path) or vim.fn.fnamemodify(target_path, ":p")
 		local file_buf = vim.fn.bufadd(abs)
 		pcall(vim.fn.bufload, file_buf)
@@ -861,7 +885,7 @@ local function resolve_apply_target_bufnr(target_path, repo_root)
 		end
 	end
 
-	if type(source) == "number" and source > 0 and vim.api.nvim_buf_is_valid(source) then
+	if has_source then
 		return source
 	end
 	return cur
@@ -884,8 +908,9 @@ local function apply_suggestion_lines(buf, line, replacement_lines)
 	end
 	return true, nil
 end
-local function current_diff_side()
-	local win = vim.api.nvim_get_current_win()
+-- "left" / "right" for a window of a two-way diff (by column among the diff windows
+-- of its tab), "single" otherwise
+local function diff_side(win)
 	if not vim.api.nvim_win_is_valid(win) then
 		return "single"
 	end
@@ -893,7 +918,7 @@ local function current_diff_side()
 		return "single"
 	end
 
-	local tab_wins = vim.api.nvim_tabpage_list_wins(0)
+	local tab_wins = vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(win))
 	local diff_wins = {}
 	for _, w in ipairs(tab_wins) do
 		if vim.api.nvim_win_is_valid(w) and vim.wo[w].diff then
@@ -931,6 +956,10 @@ local function current_diff_side()
 		return "left"
 	end
 	return "right"
+end
+
+local function current_diff_side()
+	return diff_side(vim.api.nvim_get_current_win())
 end
 
 -- Locates the diffview file shown in `win`. The repo path comes from the view's
@@ -1008,7 +1037,7 @@ local function window_file_info(win)
 	if not rel then
 		return nil, "current buffer is not a repository file"
 	end
-	return { bufnr = bufnr, path = rel, from_path = rel, side = vim.api.nvim_win_call(win, current_diff_side) }
+	return { bufnr = bufnr, path = rel, from_path = rel, side = diff_side(win) }
 end
 
 -- PR line translation.
@@ -1058,6 +1087,38 @@ local function parse_cat_file_batch(out, count)
 	return texts
 end
 
+-- cb({ { from_path, path }, ... }) on the main loop with the files the PR changes
+-- (merge base → source tip); the name-status pass maps renamed files to their
+-- merge-base path. Parsed once per diff-base object, i.e. per (base, source).
+local function with_pr_changed_files(info, cb)
+	if info.changed_files then
+		cb(info.changed_files)
+		return
+	end
+	local diff_cmd = { "git", "diff", "--name-status", "-z", "-M", info.base, info.source }
+	vim.system(diff_cmd, { cwd = info.root, text = true }, function(diff_res)
+		if diff_res.code ~= 0 then
+			return
+		end
+		local fields = vim.split(diff_res.stdout or "", "\0", { plain = true })
+		local changed = {}
+		local i = 1
+		while i <= #fields and fields[i] ~= "" do
+			local renamed = fields[i]:match("^[RC]") ~= nil
+			local from_path = fields[i + 1]
+			local path = renamed and fields[i + 2] or from_path
+			i = i + (renamed and 3 or 2)
+			if path then
+				table.insert(changed, { from_path = from_path, path = path })
+			end
+		end
+		vim.schedule(function()
+			info.changed_files = changed
+			cb(changed)
+		end)
+	end)
+end
+
 -- Loads both versions of every file that has comments into state.git_text_cache
 -- in one background git process, so opening such a file does not wait on
 -- `git show`. Files without comments are not read: they only need their text
@@ -1072,53 +1133,39 @@ prefetch_comment_file_texts = function(info, payload)
 	if next(commented) == nil then
 		return
 	end
-	-- the name-status pass maps renamed files to their merge-base path
-	local diff_cmd = { "git", "diff", "--name-status", "-z", "-M", info.base, info.source }
-	vim.system(diff_cmd, { cwd = info.root, text = true }, function(diff_res)
-		if diff_res.code ~= 0 then
+	with_pr_changed_files(info, function(changed)
+		local keys = {}
+		local function want(rev, path)
+			local key = rev .. ":" .. path -- same key as git_file_text
+			-- cat-file --batch reads one object name per line
+			if state.git_text_cache[key] == nil and not key:find("\n", 1, true) then
+				table.insert(keys, key)
+			end
+		end
+		for _, f in ipairs(changed) do
+			if commented[normalize_repo_path(f.path)] then
+				want(info.base, f.from_path)
+				want(info.source, f.path)
+			end
+		end
+		if #keys == 0 then
 			return
 		end
-		local fields = vim.split(diff_res.stdout or "", "\0", { plain = true })
-		local pairs_to_load = {}
-		local i = 1
-		while i <= #fields and fields[i] ~= "" do
-			local renamed = fields[i]:match("^[RC]") ~= nil
-			local from_path = fields[i + 1]
-			local path = renamed and fields[i + 2] or from_path
-			i = i + (renamed and 3 or 2)
-			if path and commented[normalize_repo_path(path)] then
-				table.insert(pairs_to_load, { info.base, from_path })
-				table.insert(pairs_to_load, { info.source, path })
-			end
-		end
-		vim.schedule(function()
-			local keys = {}
-			for _, rp in ipairs(pairs_to_load) do
-				local key = rp[1] .. ":" .. rp[2] -- same key as git_file_text
-				-- cat-file --batch reads one object name per line
-				if state.git_text_cache[key] == nil and not key:find("\n", 1, true) then
-					table.insert(keys, key)
-				end
-			end
-			if #keys == 0 then
+		-- binary output: text mode rewrites \r\n and would shift the blob sizes
+		local cat_opts = { cwd = info.root, text = false, stdin = table.concat(keys, "\n") .. "\n" }
+		vim.system({ "git", "cat-file", "--batch" }, cat_opts, function(cat_res)
+			if cat_res.code ~= 0 then
 				return
 			end
-			-- binary output: text mode rewrites \r\n and would shift the blob sizes
-			local cat_opts = { cwd = info.root, text = false, stdin = table.concat(keys, "\n") .. "\n" }
-			vim.system({ "git", "cat-file", "--batch" }, cat_opts, function(cat_res)
-				if cat_res.code ~= 0 then
-					return
-				end
-				local texts = parse_cat_file_batch(cat_res.stdout or "", #keys)
-				vim.schedule(function()
-					for idx, key in ipairs(keys) do
-						if texts[idx] and state.git_text_cache[key] == nil then
-							-- match git_file_text, which reads `git show` in text mode
-							state.git_text_cache[key] = texts[idx]:gsub("\r\n", "\n")
-						end
+			local texts = parse_cat_file_batch(cat_res.stdout or "", #keys)
+			vim.schedule(function()
+				for idx, key in ipairs(keys) do
+					if texts[idx] and state.git_text_cache[key] == nil then
+						-- match git_file_text, which reads `git show` in text mode
+						state.git_text_cache[key] = texts[idx]:gsub("\r\n", "\n")
 					end
-					log("prefetch_comment_file_texts: cached", #keys, "file versions")
-				end)
+				end
+				log("prefetch_comment_file_texts: cached", #keys, "file versions")
 			end)
 		end)
 	end)
@@ -1155,7 +1202,7 @@ local function window_hunks(info, finfo)
 end
 
 local function tab_diff_base(tabpage)
-	return state.diff_base_by_tab[tab_key(tabpage or vim.api.nvim_get_current_tabpage())]
+	return tab_state(tabpage).diff_base
 end
 
 -- Local line of the window described by `finfo` → Bitbucket anchor
@@ -1200,33 +1247,14 @@ local function anchor_to_local_line(info, finfo, c)
 end
 
 local function comment_matches_side(c, side)
-	if side == "single" then
-		return true
-	end
-
 	local file_type = tostring(c.file_type or ""):upper()
 	local line_type = tostring(c.line_type or ""):upper()
-
 	if side == "left" then
-		if file_type == "FROM" then
-			return true
-		end
-		if line_type == "REMOVED" then
-			return true
-		end
-		return false
+		return file_type == "FROM" or line_type == "REMOVED"
 	end
-
 	if side == "right" then
-		if file_type == "TO" or file_type == "" then
-			return true
-		end
-		if line_type == "ADDED" or line_type == "CONTEXT" then
-			return true
-		end
-		return false
+		return file_type == "TO" or file_type == "" or line_type == "ADDED" or line_type == "CONTEXT"
 	end
-
 	return true
 end
 
@@ -1279,21 +1307,13 @@ local function enable_markview(buf, win)
 		return false
 	end
 
-	if win then
-		vim.schedule(function()
-			pcall(vim.api.nvim_win_call, win, function()
-				local ok_attach = try_attach()
-				if not ok_attach then
-					vim.cmd("silent! Markview attach")
-				end
-			end)
+	vim.schedule(function()
+		pcall(vim.api.nvim_win_call, win, function()
+			if not try_attach() then
+				vim.cmd("silent! Markview attach")
+			end
 		end)
-	else
-		local ok_attach = try_attach()
-		if not ok_attach then
-			vim.cmd("silent! Markview attach")
-		end
-	end
+	end)
 end
 
 local function set_wrapped_window_options(win)
@@ -1303,105 +1323,23 @@ local function set_wrapped_window_options(win)
 	vim.api.nvim_set_option_value("breakindentopt", "shift:2,sbr", { win = win })
 end
 
--- reaction lines are rendered with this indent in both the comment float and PR Info,
--- so the byte offsets reported by reactions.format_line must be shifted by its width
-local reaction_line_indent = "    "
-
-local function build_reaction_line_entry(segments, comment_id)
-	if type(segments) ~= "table" or #segments == 0 then
-		return nil
+-- Scratch buffer (nofile, no swap file) wiped once no window shows it. A filetype also
+-- turns diagnostics off: the editors and views hold prose, not code.
+local function create_scratch_buf(filetype)
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].bufhidden = "wipe"
+	if filetype then
+		vim.bo[buf].filetype = filetype
+		vim.diagnostic.enable(false, { bufnr = buf })
 	end
-	local shift = #reaction_line_indent
-	local shifted = {}
-	for _, seg in ipairs(segments) do
-		table.insert(shifted, {
-			key = seg.key,
-			count = seg.count,
-			start_col = seg.start_col + shift,
-			end_col = seg.end_col + shift,
-		})
-	end
-	return { comment_id = comment_id, segments = shifted }
+	return buf
 end
 
-local function open_comment_float(comments, line)
-	local source_win = vim.api.nvim_get_current_win()
-	local source_buf = vim.api.nvim_get_current_buf()
-	local function trim_edge_empty_lines(items)
-		local first = 1
-		local last = #items
-
-		while first <= last and (items[first] or ""):match("^%s*$") do
-			first = first + 1
-		end
-		while last >= first and (items[last] or ""):match("^%s*$") do
-			last = last - 1
-		end
-
-		local out = {}
-		for i = first, last do
-			table.insert(out, items[i])
-		end
-		return out
-	end
-
-	local lines = { string.format("PR comments for line %d", line), "" }
-	local comment_ids_by_line = {}
-	local reaction_segments_by_line = {}
-	for _, c in ipairs(comments) do
-		local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-		local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
-		local status = ""
-		if c.is_task then
-			local task_status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
-			status = (task_status == "DONE" or task_status == "RESOLVED") and "☑ " or "☐ "
-		elseif c.is_resolved then
-			status = "~ "
-		end
-		local comment_id = tonumber(c.id or 0) or 0
-		local reply_to = tonumber(c.parent_id or 0) or 0
-		local header = string.format("- %s%s%s %s", bars, status, c.author or "unknown", c.created_at or "unknown time")
-		if comment_id > 0 then
-			header = header .. string.format(" (#%d)", comment_id)
-		end
-		if reply_to > 0 then
-			header = header .. string.format(" ↳ reply to #%d", reply_to)
-		end
-		table.insert(lines, header)
-		if comment_id > 0 then
-			comment_ids_by_line[#lines] = comment_id
-		end
-		local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
-		for _, msg_line in ipairs(msg_lines) do
-			table.insert(lines, "    " .. msg_line)
-		end
-		local reactions_line, reaction_segments = reactions.format_line(c.reactions, c.my_reactions)
-		if reactions_line then
-			table.insert(lines, "")
-			table.insert(lines, reaction_line_indent .. reactions_line)
-			reaction_segments_by_line[#lines] = build_reaction_line_entry(reaction_segments, comment_id)
-		end
-		table.insert(lines, "")
-	end
-
-	if lines[#lines] ~= "" then
-		table.insert(lines, "")
-	end
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].filetype = "markdown"
-	vim.b[buf].bb_pr_float_comment_ids_by_line = comment_ids_by_line
-	vim.b[buf].bb_pr_float_reaction_segments = reaction_segments_by_line
-	vim.b[buf].bb_pr_float_source_win = source_win
-	vim.b[buf].bb_pr_float_source_bufnr = source_buf
-	vim.b[buf].bb_pr_float_source_line = line
-	vim.diagnostic.enable(false, { bufnr = buf })
-
-	local width = math.floor(vim.o.columns * 0.8)
-	local height = math.floor(vim.o.lines * 0.8)
-	local win = vim.api.nvim_open_win(buf, true, {
+-- Opens and enters a minimal, rounded float of opts.width x opts.height centered in the
+-- editor, titled opts.title, with opts.footer (if any) on the right.
+local function open_centered_float(buf, opts)
+	local width, height = opts.width, opts.height
+	return vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		width = width,
 		height = height,
@@ -1409,196 +1347,288 @@ local function open_comment_float(comments, line)
 		col = math.floor((vim.o.columns - width) / 2),
 		style = "minimal",
 		border = "rounded",
-		title = "BB PR Comments",
+		title = opts.title,
 		title_pos = "center",
-		footer = " ? help ",
-		footer_pos = "right",
+		footer = opts.footer,
+		footer_pos = opts.footer and "right" or nil,
 	})
+end
 
+-- Sets the normal-mode maps of `specs` on `buf` (nil: global maps). A spec is
+-- { key, rhs, desc = ..., help = ... }: rhs is a command string or a function, nil to
+-- only list the spec in the help; a nil or "" key skips the spec. `help` is its help
+-- text (default: desc), false leaves it out. With `help_title`, "?" opens a help float
+-- listing the specs in order.
+local function bind_keymaps(buf, specs, help_title)
+	local entries = {}
+	for _, spec in ipairs(specs) do
+		local key, rhs = spec[1], spec[2]
+		if key and key ~= "" then
+			if rhs then
+				vim.keymap.set("n", key, rhs, { buffer = buf, silent = true, desc = spec.desc })
+			end
+			local help = spec.help
+			if help == nil then
+				help = spec.desc
+			end
+			if help then
+				table.insert(entries, { key, help })
+			end
+		end
+	end
+	if help_title then
+		vim.keymap.set("n", "?", function()
+			open_help_float(entries, help_title)
+		end, { buffer = buf, desc = "Show keymap help", silent = true })
+	end
+end
+
+-- The comment actions of the comment views, in help order: key in M.config.comments,
+-- command, map description; `help` replaces the description in the help float, and
+-- `overview` in PR Info, which binds none of the `float_only` actions.
+local COMMENT_ACTIONS = {
+	{ "reply_map", "BBPRReplyComment", "Reply to comment" },
+	{ "react_map", "BBPRReactComment", "React / emoji" },
+	{ "reaction_users_map", "BBPRReactionUsers", "Who reacted", help = "Who reacted (cursor on a reaction)" },
+	{ "delete_map", "BBPRDeleteComment", "Delete comment" },
+	{ "edit_map", "BBPREditComment", "Edit comment" },
+	{ "resolve_map", "BBPRResolveComment", "Resolve / unresolve thread" },
+	{ "toggle_task_map", "BBPRToggleTask", "Toggle task done/open" },
+	{ "convert_task_map", "BBPRConvertTask", "Convert comment <-> task" },
+	{ "create_map", "BBPRCreateComment", "Create comment", overview = "Create overview comment" },
+	{ "create_task_map", "BBPRCreateTask", "Create task", float_only = true },
+	{ "create_suggestion_map", "BBPRCreateSuggestion", "Create suggestion", float_only = true },
+	{ "accept_suggestion_map", "BBPRAcceptSuggestion", "Accept suggestion", float_only = true },
+}
+
+-- bind_keymaps specs of the comment actions of the line comments float, or of PR Info
+-- with `overview`, ending with the help entry of the q map open_comment_view_float sets
+local function comment_action_specs(overview)
+	local specs = {}
+	for _, action in ipairs(COMMENT_ACTIONS) do
+		if not (overview and action.float_only) then
+			table.insert(specs, {
+				M.config.comments[action[1]],
+				"<cmd>" .. action[2] .. "<CR>",
+				desc = overview and action.overview or action[3],
+				help = action.help,
+			})
+		end
+	end
+	table.insert(specs, { "q", nil, help = "Close" })
+	return specs
+end
+
+-- Opens the float of a comment view (line comments float, PR Info) on `buf`; q closes it
+local function open_comment_view_float(buf, title)
+	local win = open_centered_float(buf, {
+		width = math.floor(vim.o.columns * 0.8),
+		height = math.floor(vim.o.lines * 0.8),
+		title = title,
+		footer = " ? help ",
+	})
 	set_wrapped_window_options(win)
 	enable_markview(buf, win)
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
-
-	local cfg = M.config
-	local function map(key, cmd, desc)
-		if key and key ~= "" then
-			vim.keymap.set("n", key, cmd, { buffer = buf, silent = true, desc = desc })
-		end
-	end
-	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
-	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
-	map(cfg.comments.reaction_users_map, "<cmd>BBPRReactionUsers<CR>", "Who reacted")
-	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
-	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
-	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
-	map(cfg.comments.convert_task_map, "<cmd>BBPRConvertTask<CR>", "Convert comment <-> task")
-	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
-	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create comment")
-	map(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
-	map(cfg.comments.create_suggestion_map, "<cmd>BBPRCreateSuggestion<CR>", "Create suggestion")
-	map(cfg.comments.accept_suggestion_map, "<cmd>BBPRAcceptSuggestion<CR>", "Accept suggestion")
-
-	vim.keymap.set("n", "?", function()
-		local c = M.config
-		local function e(key, desc)
-			return (key and key ~= "") and { key, desc } or nil
-		end
-		local entries = {}
-		for _, v in ipairs({
-			e(c.comments.reply_map, "Reply to comment"),
-			e(c.comments.react_map, "React / emoji"),
-			e(c.comments.reaction_users_map, "Who reacted (cursor on a reaction)"),
-			e(c.comments.delete_map, "Delete comment"),
-			e(c.comments.edit_map, "Edit comment"),
-			e(c.comments.resolve_map, "Resolve / unresolve thread"),
-			e(c.comments.toggle_task_map, "Toggle task done/open"),
-			e(c.comments.convert_task_map, "Convert comment <-> task"),
-			e(c.comments.create_map, "Create comment"),
-			e(c.comments.create_task_map, "Create task"),
-			e(c.comments.create_suggestion_map, "Create suggestion"),
-			e(c.comments.accept_suggestion_map, "Accept suggestion"),
-			{ "q", "Close" },
-		}) do
-			if v then
-				table.insert(entries, v)
-			end
-		end
-		open_help_float(entries, "File Comment — Keymaps")
-	end, { buffer = buf, desc = "Show keymap help", silent = true })
-
 	return win
 end
 
+-- Comment views: the line comments float and the PR Info overview render comments
+-- the same way and record per line which comment it acts on.
+
+local function comment_view(buf)
+	return state.comment_view_by_buf[buf]
+end
+
+-- PR rendered by the PR Info buffer `buf`, nil for any other buffer
+local function pr_info_buffer_pr(buf)
+	local view = comment_view(buf)
+	return view and view.kind == "overview" and view.pr or nil
+end
+
+-- First line of `view` that acts on comment `cid`, nil when none does
+local function line_of_comment(view, cid)
+	local found = nil
+	for line, id in pairs(view and view.ids_by_line or {}) do
+		if id == cid and (not found or line < found) then
+			found = line
+		end
+	end
+	return found
+end
+
+-- Cursor of `win` plus the comment its line acts on in the view of `buf`
+local function save_comment_cursor(win, buf)
+	local cur = vim.api.nvim_win_get_cursor(win)
+	local view = comment_view(buf)
+	return { line = cur[1], col = cur[2], comment_id = view and view.ids_by_line[cur[1]] }
+end
+
+-- Puts the cursor of `win` (showing `buf`) back on the comment of `saved`, or on its old
+-- line when that comment is gone, clamped to the buffer.
+local function restore_comment_cursor(win, buf, saved)
+	local line = saved.comment_id and line_of_comment(comment_view(buf), saved.comment_id) or saved.line
+	line = math.max(math.min(line, vim.api.nvim_buf_line_count(buf)), 1)
+	pcall(vim.api.nvim_win_set_cursor, win, { line, saved.col or 0 })
+end
+
+local function trim_edge_empty_lines(items)
+	local first = 1
+	local last = #items
+	while first <= last and (items[first] or ""):match("^%s*$") do
+		first = first + 1
+	end
+	while last >= first and (items[last] or ""):match("^%s*$") do
+		last = last - 1
+	end
+	local out = {}
+	for i = first, last do
+		table.insert(out, items[i])
+	end
+	return out
+end
+
+local function is_task_done(c)
+	local status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
+	return status == "DONE" or status == "RESOLVED"
+end
+
+-- "- │ ☐ author time (#id) ↳ reply to #parent"
+local function format_comment_header(c)
+	local depth = math.max(tonumber(c.depth or 0) or 0, 0)
+	local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
+	local status = ""
+	if c.is_task then
+		status = is_task_done(c) and "☑ " or "☐ "
+	elseif c.is_resolved then
+		status = "~ "
+	end
+	local header = string.format("- %s%s%s %s", bars, status, c.author or "unknown", c.created_at or "unknown time")
+	local comment_id = tonumber(c.id or 0) or 0
+	local reply_to = tonumber(c.parent_id or 0) or 0
+	if comment_id > 0 then
+		header = header .. string.format(" (#%d)", comment_id)
+	end
+	if reply_to > 0 then
+		header = header .. string.format(" ↳ reply to #%d", reply_to)
+	end
+	return header
+end
+
+-- comment bodies and reaction lines are indented by this in both views
+local comment_indent = "    "
+
+-- Appends `text` to `lines`; a positive comment_id makes the line act on that comment.
+local function push_view_line(lines, view, text, comment_id)
+	table.insert(lines, text)
+	if comment_id and comment_id > 0 then
+		view.ids_by_line[#lines] = comment_id
+	end
+end
+
+-- Appends comment `c` to `lines`: header, indented body, reactions, blank separator.
+-- The header acts on the comment in both views; the PR Info overview (`overview`)
+-- also maps the body and reaction lines and shows "(empty)" for an empty body.
+local function append_comment_lines(lines, view, c, overview)
+	local comment_id = tonumber(c.id or 0) or 0
+	local body_id = overview and comment_id or nil
+	push_view_line(lines, view, format_comment_header(c), comment_id)
+	local body = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
+	if #body == 0 and overview then
+		body = { "(empty)" }
+	end
+	for _, body_line in ipairs(body) do
+		push_view_line(lines, view, comment_indent .. body_line, body_id)
+	end
+	local reactions_line, segments = reactions.format_line(c.reactions, c.my_reactions, comment_indent)
+	if reactions_line then
+		push_view_line(lines, view, "")
+		push_view_line(lines, view, reactions_line, body_id)
+		view.reaction_segments[#lines] = { comment_id = comment_id, segments = segments }
+	end
+	push_view_line(lines, view, "")
+end
+
+local function open_comment_float(comments, line)
+	local source_win = vim.api.nvim_get_current_win()
+	local source_buf = vim.api.nvim_get_current_buf()
+
+	local lines = { string.format("PR comments for line %d", line), "" }
+	local view = { kind = "float", ids_by_line = {}, reaction_segments = {} }
+	for _, c in ipairs(comments) do
+		append_comment_lines(lines, view, c, false)
+	end
+
+	local buf = create_scratch_buf("markdown")
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	state.comment_view_by_buf[buf] = view
+	vim.b[buf].bb_pr_float_source_win = source_win
+	vim.b[buf].bb_pr_float_source_bufnr = source_buf
+	vim.b[buf].bb_pr_float_source_line = line
+
+	local win = open_comment_view_float(buf, "BB PR Comments")
+	bind_keymaps(buf, comment_action_specs(false), "File Comment — Keymaps")
+	return win
+end
+
+-- First entry after `cur` (dir > 0) or before it (dir < 0) in the ascending list
+-- `sorted`, wrapping around at either end
+local function wrapped_target(sorted, cur, dir)
+	if dir > 0 then
+		for _, v in ipairs(sorted) do
+			if v > cur then
+				return v
+			end
+		end
+		return sorted[1]
+	end
+	for i = #sorted, 1, -1 do
+		if sorted[i] < cur then
+			return sorted[i]
+		end
+	end
+	return sorted[#sorted]
+end
+
+-- render_buffer_comments records every line it marks in state.line_comments_by_buf,
+-- so that map alone lists the commented lines
 local function jump_file_comment(direction)
-	local bufnr = vim.api.nvim_get_current_buf()
-	local by_line = get_buf_line_comments(bufnr)
-	local current_line = vim.api.nvim_win_get_cursor(0)[1]
 	local lines = {}
-	for line, comments in pairs(by_line) do
-		if type(comments) == "table" and #comments > 0 then
+	for line, comments in pairs(get_buf_line_comments(vim.api.nvim_get_current_buf())) do
+		if #comments > 0 then
 			table.insert(lines, line)
 		end
 	end
-
-	if #lines == 0 then
-		local extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.comment_ns, 0, -1, { details = true })
-		local seen = {}
-		for _, mark in ipairs(extmarks) do
-			local details = mark[4] or {}
-			if details.sign_text ~= "💬" and details.sign_text ~= "✅" then
-				goto continue
-			end
-			local row = tonumber(mark[2] or -1)
-			if row >= 0 then
-				local line = row + 1
-				if not seen[line] then
-					seen[line] = true
-					table.insert(lines, line)
-				end
-			end
-			::continue::
-		end
-	end
-
 	if #lines == 0 then
 		vim.notify("bb_pr: no file comments in current buffer", vim.log.levels.INFO)
 		return
 	end
-
 	table.sort(lines)
-	local target = nil
-
-	if direction > 0 then
-		for _, line in ipairs(lines) do
-			if line > current_line then
-				target = line
-				break
-			end
-		end
-		target = target or lines[1]
-	else
-		for i = #lines, 1, -1 do
-			local line = lines[i]
-			if line < current_line then
-				target = line
-				break
-			end
-		end
-		target = target or lines[#lines]
-	end
-
-	vim.api.nvim_win_set_cursor(0, { target, 0 })
+	vim.api.nvim_win_set_cursor(0, { wrapped_target(lines, vim.api.nvim_win_get_cursor(0)[1], direction), 0 })
 end
 
-local function jump_overview_comment(direction)
-	local bufnr = vim.api.nvim_get_current_buf()
-	local overview_lines = vim.b[bufnr].bb_pr_overview_comment_lines
-	if type(overview_lines) ~= "table" or #overview_lines == 0 then
-		overview_lines = {}
-		local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-		for idx, line in ipairs(all_lines) do
-			if type(line) == "string" and line:match("^### Thread %d+") then
-				table.insert(overview_lines, idx)
-			end
-		end
-		vim.b[bufnr].bb_pr_overview_comment_lines = overview_lines
-	end
-
-	if #overview_lines == 0 then
+local function jump_overview_comment(view, direction)
+	if #view.thread_lines == 0 then
 		vim.notify("bb_pr: no comment threads in current buffer", vim.log.levels.INFO)
 		return
 	end
-
-	local current_line = vim.api.nvim_win_get_cursor(0)[1]
-	local target = nil
-
-	if direction > 0 then
-		for _, line in ipairs(overview_lines) do
-			if line > current_line then
-				target = line
-				break
-			end
-		end
-		target = target or overview_lines[1]
-	else
-		for i = #overview_lines, 1, -1 do
-			local line = overview_lines[i]
-			if line < current_line then
-				target = line
-				break
-			end
-		end
-		target = target or overview_lines[#overview_lines]
-	end
-
+	local target = wrapped_target(view.thread_lines, vim.api.nvim_win_get_cursor(0)[1], direction)
 	vim.api.nvim_win_set_cursor(0, { target, 0 })
 end
 
 local function jump_comment(direction)
-	local bufnr = vim.api.nvim_get_current_buf()
-	if type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
-		jump_overview_comment(direction)
+	local view = comment_view(vim.api.nvim_get_current_buf())
+	if view and view.kind == "overview" then
+		jump_overview_comment(view, direction)
 		return
 	end
-
 	jump_file_comment(direction)
 end
 
-apply_comments_to_current_buffer = function(comments_payload)
-	local bufnr = vim.api.nvim_get_current_buf()
-	if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
-		return
-	end
-	local file = vim.api.nvim_buf_get_name(bufnr)
-	local rel = vim.fn.fnamemodify(file, ":.")
-	local rel_norm = normalize_repo_path(rel)
+-- Places the comment signs / virtual text / underlines of `bufnr` and records the
+-- comments per local line in state.line_comments_by_buf.
+local function render_buffer_comments(bufnr, comments_payload, cur_path, side, info, finfo)
 	local line_count = vim.api.nvim_buf_line_count(bufnr)
-	local finfo = window_file_info(vim.api.nvim_get_current_win())
-	local cur_path = finfo and finfo.path or rel_norm
-	local side = finfo and finfo.side or current_diff_side()
-	-- translate Bitbucket line numbers when the PR tab knows its commits
-	local info = finfo and tab_diff_base()
-
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
 	local seen_comment_ids = {}
@@ -1654,13 +1684,60 @@ apply_comments_to_current_buffer = function(comments_payload)
 			local line_text = vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or ""
 			local first_non_ws = line_text:find("%S")
 			local text_start_col = first_non_ws and (first_non_ws - 1) or 0
-			vim.api.nvim_buf_add_highlight(bufnr, state.comment_ns, underline_hl, line - 1, text_start_col, -1)
+			vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, text_start_col, {
+				end_col = #line_text,
+				hl_group = underline_hl,
+			})
 		end
 	end
 
 	state.line_comments_by_buf[bufnr] = by_line
+end
+
+apply_comments_to_current_buffer = function(comments_payload)
+	local bufnr = vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+		return
+	end
+	local file = vim.api.nvim_buf_get_name(bufnr)
+	local rel = vim.fn.fnamemodify(file, ":.")
+	local rel_norm = normalize_repo_path(rel)
+	local finfo = window_file_info(vim.api.nvim_get_current_win())
+	local cur_path = finfo and finfo.path or rel_norm
+	local side = finfo and finfo.side or current_diff_side()
+	-- translate Bitbucket line numbers when the PR tab knows its commits
+	local info = finfo and tab_diff_base()
+
+	-- The marks are buffer extmarks (eol virtual text needs no window width), so they
+	-- depend only on these inputs. CursorMoved / WinScrolled re-run this for every
+	-- window of the tab: skip the clear + redraw when nothing changed. The changedtick
+	-- covers edits, reloads and the line count.
+	local memo = {
+		payload = comments_payload,
+		path = cur_path,
+		from_path = finfo and finfo.from_path or false,
+		side = side,
+		info = info or false,
+		tick = vim.api.nvim_buf_get_changedtick(bufnr),
+	}
+	local prev = state.rendered_by_buf[bufnr]
+	local unchanged = prev ~= nil
+	if prev then
+		for k, v in pairs(memo) do
+			if prev[k] ~= v then
+				unchanged = false
+				break
+			end
+		end
+	end
+	if not unchanged then
+		state.rendered_by_buf[bufnr] = memo
+		render_buffer_comments(bufnr, comments_payload, cur_path, side, info, finfo)
+	end
+
 	-- only file buffers get the comment keymaps: the diffview file panel, commit log
-	-- and null buffer share the tab but have no repo file to anchor a comment to
+	-- and null buffer share the tab but have no repo file to anchor a comment to.
+	-- Outside the memo: buftype is not part of its key, and the call is a b: lookup.
 	local buftype = vim.bo[bufnr].buftype
 	local is_diffview_file = buftype == "nowrite" and file:match("^diffview://") and file ~= "diffview://null"
 	if buftype == "" or is_diffview_file then
@@ -1668,19 +1745,16 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 end
 
-local function walk_diffview_components(node, rows)
+-- Calls fn(comp) for every file component in a diffview panel component tree.
+local function each_diffview_file_comp(node, fn)
 	if type(node) ~= "table" then
 		return
 	end
 	if node._name == "file" and type(node.comp) == "table" then
-		local ctx = node.comp.context
-		local lstart = node.comp.lstart
-		if type(ctx) == "table" and type(ctx.path) == "string" and type(lstart) == "number" then
-			rows[ctx.path] = lstart
-		end
+		fn(node.comp)
 	end
 	for i = 1, #node do
-		walk_diffview_components(node[i], rows)
+		each_diffview_file_comp(node[i], fn)
 	end
 end
 
@@ -1700,11 +1774,23 @@ local function collect_diffview_file_rows(panel_buf)
 		return nil
 	end
 	local rows = {}
-	walk_diffview_components(view.panel.components, rows)
+	each_diffview_file_comp(view.panel.components, function(comp)
+		local ctx = comp.context
+		if type(ctx) == "table" and type(ctx.path) == "string" and type(comp.lstart) == "number" then
+			rows[ctx.path] = comp.lstart
+		end
+	end)
 	if next(rows) == nil then
 		return nil
 	end
 	return rows
+end
+
+local function mark_panel_row(buf, row)
+	vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, row, 0, {
+		sign_text = "💬",
+		sign_hl_group = "DiagnosticSignInfo",
+	})
 end
 
 local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payload)
@@ -1728,32 +1814,45 @@ local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payl
 			local buf = vim.api.nvim_win_get_buf(win)
 			local ft = vim.bo[buf].filetype
 			if ft == "DiffviewFiles" or ft == "DiffviewFileHistory" then
-				vim.api.nvim_buf_clear_namespace(buf, state.diffview_panel_ns, 0, -1)
 				local rows = collect_diffview_file_rows(buf)
-				if rows then
-					for path, row in pairs(rows) do
-						if paths_with_comments[normalize_repo_path(path)] then
-							vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, row, 0, {
-								sign_text = "💬",
-								sign_hl_group = "DiagnosticSignInfo",
-							})
+				-- diffview rewrites the panel lines (changedtick) whenever its rows
+				-- move; `rows` is nil while the panel is not the current view's, and
+				-- the line-match fallback is replaced once the precise rows exist
+				local memo = {
+					payload = comments_payload,
+					tick = vim.api.nvim_buf_get_changedtick(buf),
+					precise = rows ~= nil,
+				}
+				local prev = state.panel_rendered_by_buf[buf]
+				if
+					not (
+						prev
+						and prev.payload == memo.payload
+						and prev.tick == memo.tick
+						and prev.precise == memo.precise
+					)
+				then
+					state.panel_rendered_by_buf[buf] = memo
+					vim.api.nvim_buf_clear_namespace(buf, state.diffview_panel_ns, 0, -1)
+					if rows then
+						for path, row in pairs(rows) do
+							if paths_with_comments[normalize_repo_path(path)] then
+								mark_panel_row(buf, row)
+							end
 						end
-					end
-				else
-					-- Fallback for older diffview versions: full path / basename match.
-					local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-					local marked = {}
-					for path, _ in pairs(paths_with_comments) do
-						local basename = path:match("([^/]+)$") or path
-						for idx, line in ipairs(lines) do
-							if not marked[idx] and type(line) == "string" then
-								if line:find(path, 1, true) or line:find(basename, 1, true) then
-									marked[idx] = true
-									vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, idx - 1, 0, {
-										sign_text = "💬",
-										sign_hl_group = "DiagnosticSignInfo",
-									})
-									break
+					else
+						-- Fallback for older diffview versions: full path / basename match.
+						local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+						local marked = {}
+						for path, _ in pairs(paths_with_comments) do
+							local basename = path:match("([^/]+)$") or path
+							for idx, line in ipairs(lines) do
+								if not marked[idx] and type(line) == "string" then
+									if line:find(path, 1, true) or line:find(basename, 1, true) then
+										marked[idx] = true
+										mark_panel_row(buf, idx - 1)
+										break
+									end
 								end
 							end
 						end
@@ -1764,101 +1863,70 @@ local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payl
 	end
 end
 
-apply_comments_to_tab_windows = function(comments_payload)
-	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-		if vim.api.nvim_win_is_valid(win) then
-			pcall(vim.api.nvim_win_call, win, function()
-				apply_comments_to_current_buffer(comments_payload)
-			end)
-		end
-	end
-	apply_comment_indicators_to_diffview_panel(vim.api.nvim_get_current_tabpage(), comments_payload)
-end
-
-local function apply_comments_to_specific_tab(tabpage, comments_payload)
+-- Renders the comments into every window of `tabpage` and the diffview file panel.
+-- opts.refresh_info also rebuilds a PR Info window open in the tab; the
+-- CursorMoved path leaves it alone.
+local function apply_comments_to_tab(tabpage, comments_payload, opts)
 	if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
 		return
 	end
-
+	local refresh_info = opts and opts.refresh_info
 	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
 		if vim.api.nvim_win_is_valid(win) then
-			vim.api.nvim_win_call(win, function()
+			local ok, err = pcall(vim.api.nvim_win_call, win, function()
 				apply_comments_to_current_buffer(comments_payload)
-				local bufnr = vim.api.nvim_get_current_buf()
-				local info_pr = vim.b[bufnr].bb_pr_info_pr
-				if type(info_pr) == "table" then
-					apply_pr_info_content(bufnr, info_pr)
+				if refresh_info then
+					local bufnr = vim.api.nvim_get_current_buf()
+					local info_pr = pr_info_buffer_pr(bufnr)
+					if info_pr then
+						apply_pr_info_content(bufnr, info_pr)
+					end
 				end
 			end)
+			if not ok then
+				log("apply_comments_to_tab: window", win, "failed:", err)
+			end
 		end
 	end
 	apply_comment_indicators_to_diffview_panel(tabpage, comments_payload)
 end
 
-local function apply_comments_to_specific_tab_when_ready(tabpage, comments_payload, opts)
-	opts = opts or {}
-	local retries_left = opts.retries or 20
-	local delay_ms = opts.delay_ms or 100
-
+-- Calls fn until it returns true: at most opts.tries calls, opts.delay ms apart.
+-- The first call runs after opts.first_delay ms, or right away when that is nil.
+local function retry(fn, opts)
+	local tries_left = opts.tries
 	local function attempt()
-		if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
+		if fn() then
 			return
 		end
-
-		local has_stable_diff_side = false
-		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
-				local side = vim.api.nvim_win_call(win, current_diff_side)
-				if side == "left" or side == "right" then
-					has_stable_diff_side = true
-					break
-				end
-			end
-		end
-
-		if has_stable_diff_side then
-			apply_comments_to_specific_tab(tabpage, comments_payload)
-			return
-		end
-
-		retries_left = retries_left - 1
-		if retries_left > 0 then
-			vim.defer_fn(attempt, delay_ms)
+		tries_left = tries_left - 1
+		if tries_left > 0 then
+			vim.defer_fn(attempt, opts.delay)
 		end
 	end
-
-	attempt()
+	if opts.first_delay then
+		vim.defer_fn(attempt, opts.first_delay)
+	else
+		attempt()
+	end
 end
 
-local function apply_comments_when_diffview_ready(comments_payload, opts)
-	opts = opts or {}
-	local retries_left = opts.retries or 20
-	local delay_ms = opts.delay_ms or 100
-
-	local function attempt()
-		local has_stable_diff_side = false
-		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
-				local side = vim.api.nvim_win_call(win, current_diff_side)
-				if side == "left" or side == "right" then
-					has_stable_diff_side = true
-					break
-				end
+-- apply_comments_to_tab once diffview has laid out its two diff windows
+-- (gives up after ~2s); `refresh_info` as in apply_comments_to_tab.
+local function apply_comments_when_diffview_ready(tabpage, comments_payload, refresh_info)
+	retry(function()
+		if not vim.api.nvim_tabpage_is_valid(tabpage) then
+			return true
+		end
+		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+			local side = diff_side(win)
+			if side == "left" or side == "right" then
+				apply_comments_to_tab(tabpage, comments_payload, { refresh_info = refresh_info })
+				return true
 			end
 		end
-
-		if has_stable_diff_side then
-			apply_comments_to_tab_windows(comments_payload)
-			return
-		end
-
-		retries_left = retries_left - 1
-		if retries_left > 0 then
-			vim.defer_fn(attempt, delay_ms)
-		end
-	end
-
-	attempt()
+		return false
+	end, { tries = 20, delay = 100 })
 end
 
 local function build_lines(prs)
@@ -1889,26 +1957,15 @@ local function build_lines(prs)
 	return lines
 end
 
-local open_pr_info_with_comments_fwd
-
 local function collect_diffview_file_entries(view)
 	local entries = {}
-	local function walk(node)
-		if type(node) ~= "table" then
-			return
-		end
-		if node._name == "file" and type(node.comp) == "table" then
-			local ctx = node.comp.context
+	if view and view.panel and type(view.panel.components) == "table" then
+		each_diffview_file_comp(view.panel.components, function(comp)
+			local ctx = comp.context
 			if type(ctx) == "table" and type(ctx.path) == "string" then
 				table.insert(entries, ctx)
 			end
-		end
-		for i = 1, #node do
-			walk(node[i])
-		end
-	end
-	if view and view.panel and type(view.panel.components) == "table" then
-		walk(view.panel.components)
+		end)
 	end
 	if #entries == 0 and view and type(view.files) == "table" then
 		local files_iter = view.files
@@ -1933,14 +1990,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 	opts = opts or {}
 	local should_open_float = opts.open_float ~= false
 	local ok, lib = pcall(require, "diffview.lib")
-	if not ok then
-		vim.notify(
-			string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")),
-			vim.log.levels.INFO
-		)
-		return
-	end
-	local view = lib.get_current_view()
+	local view = ok and lib.get_current_view() or nil
 	if type(view) ~= "table" then
 		vim.notify(
 			string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")),
@@ -1986,7 +2036,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 		local target_win = nil
 		for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
 			if vim.api.nvim_win_is_valid(win) and vim.wo[win].diff then
-				local side = vim.api.nvim_win_call(win, current_diff_side)
+				local side = diff_side(win)
 				if (file_type == "TO" and side == "right") or (file_type == "FROM" and side == "left") then
 					target_win = win
 					break
@@ -2025,78 +2075,39 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 		local float_win = open_comment_float(line_comments, line)
 		if target_comment_id > 0 and float_win and vim.api.nvim_win_is_valid(float_win) then
 			local float_buf = vim.api.nvim_win_get_buf(float_win)
-			local ids_by_line = vim.b[float_buf].bb_pr_float_comment_ids_by_line
-			if type(ids_by_line) == "table" then
-				local target_line = nil
-				for lnum, cid in pairs(ids_by_line) do
-					if tonumber(cid) == target_comment_id then
-						target_line = tonumber(lnum)
-						break
-					end
-				end
-				if target_line then
-					pcall(vim.api.nvim_win_set_cursor, float_win, { target_line, 0 })
-				end
+			local target_line = line_of_comment(comment_view(float_buf), target_comment_id)
+			if target_line then
+				pcall(vim.api.nvim_win_set_cursor, float_win, { target_line, 0 })
 			end
 		end
 		return true
 	end
 
-	local attempts = 0
-	local function attempt()
+	retry(function()
 		local jumped = jump_cursor()
-		if jumped then
-			if should_open_float then
-				local float_attempts = 0
-				local function try_float()
-					if open_float_for_line(jumped.buf) then
-						return
-					end
-					float_attempts = float_attempts + 1
-					if float_attempts < 20 then
-						vim.defer_fn(try_float, 100)
-					end
-				end
-				try_float()
-			end
-			return
+		if not jumped then
+			return false
 		end
-		attempts = attempts + 1
-		if attempts < 20 then
-			vim.defer_fn(attempt, 100)
+		if should_open_float then
+			retry(function()
+				return open_float_for_line(jumped.buf)
+			end, { tries = 20, delay = 100 })
 		end
-	end
-	vim.defer_fn(attempt, 50)
+		return true
+	end, { tries = 20, delay = 100, first_delay = 50 })
 end
 
 local function navigate_to_overview_comment(pr, comment_id)
-	if type(open_pr_info_with_comments_fwd) ~= "function" then
-		return
-	end
-	open_pr_info_with_comments_fwd(pr)
-	local attempts = 0
-	local function attempt()
-		local cur_buf = vim.api.nvim_get_current_buf()
-		local ids_by_line = vim.b[cur_buf].bb_pr_overview_comment_ids_by_line
-		if type(ids_by_line) == "table" then
-			local target_line = nil
-			for line, id in pairs(ids_by_line) do
-				if tonumber(id) == tonumber(comment_id) then
-					target_line = tonumber(line)
-					break
-				end
-			end
-			if target_line then
-				pcall(vim.api.nvim_win_set_cursor, 0, { target_line, 0 })
-				return
-			end
+	open_pr_info_with_comments(pr)
+	retry(function()
+		local view = comment_view(vim.api.nvim_get_current_buf())
+		local line = view and view.kind == "overview" and line_of_comment(view, tonumber(comment_id))
+		if line then
+			pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
+			return true
 		end
-		attempts = attempts + 1
-		if attempts < 20 then
-			vim.defer_fn(attempt, 100)
-		end
-	end
-	vim.defer_fn(attempt, 50)
+		return false
+	end, { tries = 20, delay = 100, first_delay = 50 })
 end
 
 local function consume_pending_nav(pr_id)
@@ -2137,9 +2148,12 @@ end
 
 local function close_old_pr_tabs()
 	local pr_tabs = {}
+	local has_safe_tab = false
 	for _, t in ipairs(vim.api.nvim_list_tabpages()) do
-		if state.pr_by_tab[tab_key(t)] then
+		if get_tab_pr(t) then
 			table.insert(pr_tabs, t)
+		else
+			has_safe_tab = true
 		end
 	end
 	if #pr_tabs == 0 then
@@ -2147,34 +2161,23 @@ local function close_old_pr_tabs()
 	end
 
 	-- ensure there's at least one non-PR tab so :tabclose on the last PR tab works
-	local has_safe_tab = false
-	for _, t in ipairs(vim.api.nvim_list_tabpages()) do
-		if not state.pr_by_tab[tab_key(t)] then
-			has_safe_tab = true
-			break
-		end
-	end
 	if not has_safe_tab then
 		vim.cmd("tabnew")
 	end
 
 	for _, t in ipairs(pr_tabs) do
-		local key = tab_key(t)
 		if vim.api.nvim_tabpage_is_valid(t) then
 			pcall(vim.api.nvim_set_current_tabpage, t)
 			pcall(vim.cmd, "silent! DiffviewClose")
 			pcall(vim.cmd, "tabclose!")
 		end
-		state.pr_by_tab[key] = nil
-		state.comments_by_tab[key] = nil
-		state.pending_comments_by_tab[key] = nil
-		state.builds_by_tab[key] = nil
-		state.conflict_by_tab[key] = nil
-		state.diff_base_by_tab[key] = nil
+		state.tabs[tab_key(t)] = nil
 	end
 	state.git_text_cache = {}
 	state.hunks_cache = {}
 	state.buf_hunks_cache = {}
+	state.rendered_by_buf = {}
+	state.panel_rendered_by_buf = {}
 	log("close_old_pr_tabs: closed", #pr_tabs, "tab(s)")
 end
 
@@ -2335,14 +2338,13 @@ local function open_diffview(pr)
 					set_current_tab_pr(pr)
 					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
 					set_current_tab_diff_base(repo_root, from_ref, to_ref)
+					local pr_tab = vim.api.nvim_get_current_tabpage()
 					run_comments_provider(pr.id, function(payload)
-						vim.schedule(function()
-							set_current_tab_comments(payload)
-							apply_comments_when_diffview_ready(payload)
-							vim.defer_fn(function()
-								try_navigate_to_pending_comment(pr, payload)
-							end, 300)
-						end)
+						set_tab_comments(pr_tab, payload)
+						apply_comments_when_diffview_ready(pr_tab, payload)
+						vim.defer_fn(function()
+							try_navigate_to_pending_comment(pr, payload)
+						end, 300)
 					end, { notify_errors = false })
 				end)
 			end)
@@ -2386,17 +2388,7 @@ local function open_diffview(pr)
 					return
 				end
 
-				-- Match Bitbucket's merge check by trying a temporary merge of target into source.
-				local merge_check_cmd = {
-					"git",
-					"merge-tree",
-					"origin/" .. to_ref,
-					"origin/" .. from_ref,
-				}
-
-				vim.system(merge_check_cmd, git_opts, function(_)
-					vim.schedule(open_after_fetch)
-				end)
+				vim.schedule(open_after_fetch)
 			end)
 		end)
 	end)
@@ -2411,100 +2403,45 @@ local function format_opened_date(ms)
 end
 
 local function build_approval_lines(pr)
-	local lines = {}
 	local reviewers = pr.reviewers or {}
-
 	if #reviewers == 0 then
 		return { "None" }
 	end
 
 	local grouped = {}
-	local order = { "APPROVED", "UNAPPROVED", "NEEDS_WORK", "PENDING" }
-
-	local function normalize_status(reviewer)
-		if reviewer.approved or reviewer.status == "APPROVED" then
-			return "APPROVED"
-		end
-
-		local raw = type(reviewer.status) == "string" and string.upper(reviewer.status) or ""
-		if raw == "NEEDS_WORK" then
-			return "NEEDS_WORK"
-		end
-		if raw == "UNAPPROVED" then
-			return "UNAPPROVED"
-		end
-		if raw == "" then
-			return "PENDING"
-		end
-
-		return raw
-	end
-
+	local statuses = {}
 	for _, reviewer in ipairs(reviewers) do
 		local user = reviewer.user or {}
-		local name = user.displayName or user.name or user.slug or "unknown"
-		local status = "**" .. normalize_status(reviewer) .. "**"
-		grouped[status] = grouped[status] or {}
-		table.insert(grouped[status], name)
-	end
-
-	local emitted = {}
-	for _, status in ipairs(order) do
-		local names = grouped[status]
-		if names and #names > 0 then
-			table.sort(names)
-			table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
-			emitted[status] = true
+		local status = reviewer_status(reviewer)
+		if not grouped[status] then
+			grouped[status] = {}
+			table.insert(statuses, status)
 		end
+		table.insert(grouped[status], user.displayName or user.name or user.slug or "unknown")
 	end
 
-	local remaining_statuses = {}
-	for status, _ in pairs(grouped) do
-		if not emitted[status] then
-			table.insert(remaining_statuses, status)
-		end
-	end
-	table.sort(remaining_statuses)
-
-	for _, status in ipairs(remaining_statuses) do
+	-- statuses are listed alphabetically: the APPROVED, UNAPPROVED, NEEDS_WORK, PENDING
+	-- order this once intended never applied (it was matched against "**STATUS**" keys)
+	table.sort(statuses)
+	local lines = {}
+	for _, status in ipairs(statuses) do
 		local names = grouped[status]
 		table.sort(names)
-		table.insert(lines, string.format("%s: %s", status, table.concat(names, ", ")))
+		table.insert(lines, string.format("**%s**: %s", status, table.concat(names, ", ")))
 	end
-
 	return lines
 end
 
-local function build_overview_comment_lines(payload)
-	local function trim_edge_empty_lines(items)
-		local first = 1
-		local last = #items
-		while first <= last and (items[first] or ""):match("^%s*$") do
-			first = first + 1
-		end
-		while last >= first and (items[last] or ""):match("^%s*$") do
-			last = last - 1
-		end
-		local out = {}
-		for i = first, last do
-			table.insert(out, items[i])
-		end
-		return out
-	end
-
-	local overview_comments = as_array(payload and payload.overview_comments)
-	local file_comments = as_array(payload and payload.file_comments)
+-- Appends the body of the PR Info "## Comments" section to `lines` (every comment of the
+-- PR, grouped into threads, most recently active thread first) and records in `view`
+-- which comment each line acts on, the reaction lines and the thread heading lines.
+local function append_overview_comment_lines(lines, view, payload)
 	local comments = {}
-	for _, c in ipairs(overview_comments) do
-		c.__scope = "overview"
-		table.insert(comments, c)
-	end
-	for _, c in ipairs(file_comments) do
-		c.__scope = "file"
-		table.insert(comments, c)
-	end
+	vim.list_extend(comments, as_array(payload and payload.overview_comments))
+	vim.list_extend(comments, as_array(payload and payload.file_comments))
 	if #comments == 0 then
-		return { "None" }
+		table.insert(lines, "None")
+		return
 	end
 
 	local comments_by_id = {}
@@ -2540,145 +2477,54 @@ local function build_overview_comment_lines(payload)
 
 	local thread_order = {}
 	local comments_by_thread = {}
+	local last_created_at = {}
 	for idx, c in ipairs(comments) do
 		local root = thread_root_key(c, idx)
 		if not comments_by_thread[root] then
 			comments_by_thread[root] = {}
+			last_created_at[root] = ""
 			table.insert(thread_order, root)
 		end
 		table.insert(comments_by_thread[root], c)
-	end
-	local function thread_last_created_at(root)
-		local thread_comments = comments_by_thread[root] or {}
-		local latest = ""
-		for _, c in ipairs(thread_comments) do
-			local created_at = tostring(c.created_at or "")
-			if created_at > latest then
-				latest = created_at
-			end
+		local created_at = tostring(c.created_at or "")
+		if created_at > last_created_at[root] then
+			last_created_at[root] = created_at
 		end
-		return latest
 	end
 	table.sort(thread_order, function(a, b)
-		local a_last = thread_last_created_at(a)
-		local b_last = thread_last_created_at(b)
+		local a_last = last_created_at[a]
+		local b_last = last_created_at[b]
 		if a_last == b_last then
 			return tostring(a) < tostring(b)
 		end
 		return a_last > b_last
 	end)
 
-	local lines = {}
-	local comment_line_numbers = {}
-	local comment_ids_by_line_order = {}
-	local comment_ids_by_relative_line = {}
-	local thread_line_numbers = {}
-	local reaction_segments_by_relative_line = {}
 	for thread_idx, root in ipairs(thread_order) do
 		local thread_comments = comments_by_thread[root]
 		local root_comment = thread_comments[1] or {}
+		local root_id = tonumber(root_comment.id or 0) or 0
 		if thread_idx > 1 then
-			table.insert(lines, "")
+			push_view_line(lines, view, "")
 		end
-		local thread_root_id = tonumber(root_comment.id or 0) or 0
-		local function tag_with_root()
-			if thread_root_id > 0 then
-				comment_ids_by_relative_line[#lines] = thread_root_id
-			end
-		end
-		table.insert(lines, string.format("### Thread %d", thread_idx))
-		tag_with_root()
-		table.insert(thread_line_numbers, #lines)
-		if root_comment.__scope == "file" then
+		push_view_line(lines, view, string.format("### Thread %d", thread_idx), root_id)
+		table.insert(view.thread_lines, #lines)
+		if root_comment.is_file_comment then
 			local path = root_comment.path or "(unknown file)"
 			local line = tonumber(root_comment.line or 0) or 0
 			local side = root_comment.file_type or ""
 			local line_type = root_comment.line_type or ""
 			local loc = line > 0 and string.format(":%d", line) or ""
-			table.insert(lines, string.format("_Scope: file • `%s%s` %s %s_", path, loc, side, line_type))
-			tag_with_root()
-			if root_comment.diff_hunk and root_comment.diff_hunk ~= "" then
-				table.insert(lines, "```diff")
-				tag_with_root()
-				for _, hline in ipairs(vim.split(root_comment.diff_hunk, "\n", { plain = true })) do
-					table.insert(lines, hline)
-					tag_with_root()
-				end
-				table.insert(lines, "```")
-				tag_with_root()
-			end
+			push_view_line(lines, view, string.format("_Scope: file • `%s%s` %s %s_", path, loc, side, line_type), root_id)
 		else
-			table.insert(lines, "_Scope: overview_")
-			tag_with_root()
+			push_view_line(lines, view, "_Scope: overview_", root_id)
 		end
-		table.insert(lines, "")
+		push_view_line(lines, view, "")
 
 		for _, c in ipairs(thread_comments) do
-			local depth = math.max(tonumber(c.depth or 0) or 0, 0)
-			local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
-			local status = ""
-			if c.is_task then
-				local task_status = type(c.task_status) == "string" and string.upper(c.task_status) or "OPEN"
-				status = (task_status == "DONE" or task_status == "RESOLVED") and "☑ " or "☐ "
-			elseif c.is_resolved then
-				status = "~ "
-			end
-
-			local author = c.author or "unknown"
-			local created_at = c.created_at or "unknown time"
-			local comment_id = tonumber(c.id or 0) or 0
-			local reply_to = tonumber(c.parent_id or 0) or 0
-			local header = string.format("- %s%s%s %s", bars, status, author, created_at)
-			if comment_id > 0 then
-				header = header .. string.format(" (#%d)", comment_id)
-			end
-			if reply_to > 0 then
-				header = header .. string.format(" ↳ reply to #%d", reply_to)
-			end
-			table.insert(lines, header)
-			table.insert(comment_line_numbers, #lines)
-			table.insert(comment_ids_by_line_order, comment_id)
-			if comment_id > 0 then
-				comment_ids_by_relative_line[#lines] = comment_id
-			end
-
-			local msg_lines = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
-			if #msg_lines == 0 then
-				table.insert(lines, "    (empty)")
-				if comment_id > 0 then
-					comment_ids_by_relative_line[#lines] = comment_id
-				end
-			else
-				for _, msg_line in ipairs(msg_lines) do
-					table.insert(lines, "    " .. msg_line)
-					if comment_id > 0 then
-						comment_ids_by_relative_line[#lines] = comment_id
-					end
-				end
-			end
-			local reactions_line, reaction_segments = reactions.format_line(c.reactions, c.my_reactions)
-			if reactions_line then
-				table.insert(lines, "")
-				table.insert(lines, reaction_line_indent .. reactions_line)
-				if comment_id > 0 then
-					comment_ids_by_relative_line[#lines] = comment_id
-				end
-				reaction_segments_by_relative_line[#lines] = build_reaction_line_entry(reaction_segments, comment_id)
-			end
-			table.insert(lines, "")
+			append_comment_lines(lines, view, c, true)
 		end
 	end
-
-	if lines[#lines] ~= "" then
-		table.insert(lines, "")
-	end
-
-	return lines,
-		comment_line_numbers,
-		comment_ids_by_line_order,
-		comment_ids_by_relative_line,
-		thread_line_numbers,
-		reaction_segments_by_relative_line
 end
 
 local function build_status_lines(payload)
@@ -2687,19 +2533,13 @@ local function build_status_lines(payload)
 	end
 
 	local summary = type(payload.summary) == "string" and string.upper(payload.summary) or "NONE"
-	local icons = {
-		SUCCESSFUL = "✓",
-		FAILED = "✗",
-		INPROGRESS = "●",
-		NONE = "○",
-	}
 	local labels = {
 		SUCCESSFUL = "Successful",
 		FAILED = "Failed",
 		INPROGRESS = "In progress",
 		NONE = "No builds",
 	}
-	local icon = icons[summary] or "○"
+	local icon = BUILD_ICONS[summary] or "○"
 	local label = labels[summary] or summary
 
 	local lines = { string.format("%s %s", icon, label) }
@@ -2707,7 +2547,7 @@ local function build_status_lines(payload)
 	local builds = as_array(payload.builds)
 	for _, b in ipairs(builds) do
 		local state_up = type(b.state) == "string" and string.upper(b.state) or ""
-		local mark = icons[state_up] or "•"
+		local mark = BUILD_ICONS[state_up] or "•"
 		local name = b.name
 		if type(name) ~= "string" or name == "" then
 			name = b.key or "build"
@@ -2722,6 +2562,7 @@ local function build_status_lines(payload)
 	return lines
 end
 
+-- The PR Info lines of `pr` and their comment view (see state.comment_view_by_buf)
 local function build_pr_info_content(pr)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
@@ -2765,97 +2606,91 @@ local function build_pr_info_content(pr)
 	table.insert(info_lines, "## Comments")
 	table.insert(info_lines, "")
 
-	local comments_payload = get_current_tab_comments()
-	local overview_start_line = #info_lines + 1
-	local overview_lines, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers, reaction_segments_by_relative_line =
-		build_overview_comment_lines(comments_payload)
-	vim.list_extend(info_lines, overview_lines)
-
-	return info_lines,
-		overview_start_line,
-		comment_line_numbers,
-		comment_ids_by_line_order,
-		comment_ids_by_relative_line,
-		thread_line_numbers,
-		reaction_segments_by_relative_line
+	local view = { kind = "overview", pr = pr, ids_by_line = {}, reaction_segments = {}, thread_lines = {} }
+	append_overview_comment_lines(info_lines, view, get_current_tab_comments())
+	return info_lines, view
 end
 
 apply_pr_info_content = function(buf, pr)
-	local info_lines, overview_start_line, comment_line_numbers, comment_ids_by_line_order, comment_ids_by_relative_line, thread_line_numbers, reaction_segments_by_relative_line =
-		build_pr_info_content(pr)
+	local info_lines, view = build_pr_info_content(pr)
 
-	local prev_ids_by_line = vim.b[buf].bb_pr_overview_comment_ids_by_line
-	local saved_positions = {}
-	for _, win in ipairs(vim.api.nvim_list_wins()) do
-		if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-			local cur = vim.api.nvim_win_get_cursor(win)
-			local cid = nil
-			if type(prev_ids_by_line) == "table" then
-				cid = tonumber(prev_ids_by_line[cur[1]] or 0)
-				if cid == 0 then
-					cid = nil
-				end
-			end
-			table.insert(saved_positions, { win = win, comment_id = cid, line = cur[1], col = cur[2] })
-		end
+	local saved_cursors = {}
+	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+		saved_cursors[win] = save_comment_cursor(win, buf)
 	end
 
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-
-	vim.b[buf].bb_pr_info_pr = pr
-
-	local new_thread_lines = {}
-	for _, line in ipairs(thread_line_numbers or {}) do
-		table.insert(new_thread_lines, overview_start_line + line - 1)
+	-- set once: re-setting it would re-run every FileType autocmd on each refresh
+	if vim.bo[buf].filetype ~= "markdown" then
+		vim.bo[buf].filetype = "markdown"
+		vim.diagnostic.enable(false, { bufnr = buf })
 	end
-	vim.b[buf].bb_pr_overview_comment_lines = new_thread_lines
+	state.comment_view_by_buf[buf] = view
 
-	local ids_by_line = {}
-	for idx, line in ipairs(comment_line_numbers or {}) do
-		local abs = overview_start_line + line - 1
-		local cid = tonumber((comment_ids_by_line_order or {})[idx] or 0) or 0
-		if cid > 0 then
-			ids_by_line[abs] = cid
+	for win, saved in pairs(saved_cursors) do
+		if vim.api.nvim_win_is_valid(win) then
+			restore_comment_cursor(win, buf, saved)
 		end
 	end
-	for rel_line, cid in pairs(comment_ids_by_relative_line or {}) do
-		local abs = overview_start_line + rel_line - 1
-		ids_by_line[abs] = tonumber(cid) or 0
-	end
-	vim.b[buf].bb_pr_overview_comment_ids_by_line = ids_by_line
+end
 
-	local reaction_segments = {}
-	for rel_line, entry in pairs(reaction_segments_by_relative_line or {}) do
-		reaction_segments[overview_start_line + rel_line - 1] = entry
-	end
-	vim.b[buf].bb_pr_overview_reaction_segments = reaction_segments
+-- Title/Body editor: "Title: <title>", a blank line, "Body:", then the body lines
+local TITLE_PREFIX = "Title: "
 
-	vim.diagnostic.enable(false, { bufnr = buf })
+local function title_body_lines(title, body_lines)
+	return vim.list_extend({ TITLE_PREFIX .. title, "", "Body:" }, body_lines or {})
+end
 
-	local line_count = vim.api.nvim_buf_line_count(buf)
-	for _, pos in ipairs(saved_positions) do
-		if vim.api.nvim_win_is_valid(pos.win) then
-			local new_line = pos.line
-			if pos.comment_id then
-				for ln, cid in pairs(ids_by_line) do
-					if tonumber(cid) == pos.comment_id then
-						new_line = tonumber(ln) or new_line
-						break
-					end
-				end
-			end
-			if new_line > line_count then
-				new_line = line_count
-			end
-			if new_line < 1 then
-				new_line = 1
-			end
-			pcall(vim.api.nvim_win_set_cursor, pos.win, { new_line, pos.col or 0 })
+-- Trimmed title and untrimmed body of the Title/Body editor lines `lines`
+local function parse_title_body(lines)
+	local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
+	return title, table.concat(vim.list_slice(lines, 4), "\n")
+end
+
+-- Opens a Title/Body editor float (opts.win_title, opts.width, opts.height) holding
+-- opts.title and opts.body_lines. <C-s> (normal and insert) and <CR> submit, q cancels.
+-- A submit with an empty title only warns; otherwise on_submit(title, trimmed body)
+-- runs and the float closes. Returns buf, win.
+local function open_title_body_editor(opts, on_submit)
+	local buf = create_scratch_buf("markdown")
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, title_body_lines(opts.title, opts.body_lines))
+	local win = open_centered_float(buf, { width = opts.width, height = opts.height, title = opts.win_title })
+
+	local function submit()
+		local title, body = parse_title_body(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+		if title == "" then
+			vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
+			return
 		end
+		on_submit(title, vim.trim(body))
+		pcall(vim.api.nvim_win_close, win, true)
 	end
+
+	vim.keymap.set("n", "q", function()
+		pcall(vim.api.nvim_win_close, win, true)
+	end, { buffer = buf, silent = true })
+	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
+	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
+	return buf, win
+end
+
+-- Runs `bb <args>` changing `pr`, then refetches the PR of the current tab, stores it
+-- (keeping the comments), re-renders the PR Info buffer `info_buf` if it still exists
+-- and notifies `done_msg`. Failures notify "bb_pr: <fail_msg>: <stderr>".
+local function run_pr_info_mutation(args, fail_msg, pr, info_buf, done_msg)
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	run_bb(args, { fail_msg = fail_msg }, function()
+		refresh_current_pr(function(fresh_pr)
+			local updated = fresh_pr or pr
+			set_tab_pr(source_tab, updated, { preserve_comments = true })
+			if info_buf and vim.api.nvim_buf_is_valid(info_buf) then
+				apply_pr_info_content(info_buf, updated)
+			end
+			vim.notify(done_msg, vim.log.levels.INFO)
+		end, source_tab)
+	end)
 end
 
 local function open_edit_pr_description(pr, info_buf)
@@ -2865,56 +2700,16 @@ local function open_edit_pr_description(pr, info_buf)
 		return
 	end
 
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].filetype = "markdown"
-	vim.diagnostic.enable(false, { bufnr = buf })
-
-	local initial_lines = {
-		"Title: " .. (pr.title or ""),
-		"",
-		"Body:",
-	}
-	local body_text = pr.description or ""
-	if body_text ~= "" then
-		for _, line in ipairs(vim.split(body_text, "\n", { plain = true })) do
-			table.insert(initial_lines, line)
-		end
-	end
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
-
-	local width = math.max(90, math.floor(vim.o.columns * 0.7))
-	local height = math.max(14, math.floor(vim.o.lines * 0.4))
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
-		title = "Edit PR #" .. tostring(pr_id) .. " (<C-s>/<CR> submit, q cancel)",
-		title_pos = "center",
-	})
-
-	local function submit()
-		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-		local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
-		local body_lines = {}
-		for i = 4, #lines do
-			table.insert(body_lines, lines[i])
-		end
-		local body = vim.trim(table.concat(body_lines, "\n"))
-		if title == "" then
-			vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
-			return
-		end
-		pcall(vim.api.nvim_win_close, win, true)
-
+	local description = pr.description or ""
+	open_title_body_editor({
+		win_title = "Edit PR #" .. tostring(pr_id) .. " (<C-s>/<CR> submit, q cancel)",
+		width = math.max(90, math.floor(vim.o.columns * 0.7)),
+		height = math.max(14, math.floor(vim.o.lines * 0.4)),
+		title = pr.title or "",
+		body_lines = description ~= "" and vim.split(description, "\n", { plain = true }) or {},
+	}, function(title, body)
 		local version = tonumber(pr.version or -1) or -1
-		local cmd = bb_cmd({
+		run_pr_info_mutation({
 			"-json",
 			"-pr-update",
 			tostring(pr_id),
@@ -2924,33 +2719,8 @@ local function open_edit_pr_description(pr, info_buf)
 			title,
 			"-pr-body",
 			body,
-		})
-		local source_tab = vim.api.nvim_get_current_tabpage()
-		vim.system(cmd, { text = true }, function(res)
-			vim.schedule(function()
-				if res.code ~= 0 then
-					vim.notify("bb_pr: PR update failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-					return
-				end
-				refresh_current_pr(function(fresh_pr)
-					vim.schedule(function()
-						local updated = fresh_pr or pr
-						set_tab_pr(source_tab, updated, { preserve_comments = true })
-						if info_buf and vim.api.nvim_buf_is_valid(info_buf) then
-							apply_pr_info_content(info_buf, updated)
-						end
-						vim.notify("bb_pr: PR #" .. tostring(pr_id) .. " updated", vim.log.levels.INFO)
-					end)
-				end, source_tab)
-			end)
-		end)
-	end
-
-	vim.keymap.set("n", "q", function()
-		pcall(vim.api.nvim_win_close, win, true)
-	end, { buffer = buf, silent = true })
-	vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
-	vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
+		}, "PR update failed", pr, info_buf, "bb_pr: PR #" .. tostring(pr_id) .. " updated")
+	end)
 end
 
 local function open_pr_info(pr)
@@ -2961,174 +2731,88 @@ local function open_pr_info(pr)
 	if pr_id > 0 then
 		local source_tab = vim.api.nvim_get_current_tabpage()
 		run_builds_provider(pr_id, function(builds)
-			vim.schedule(function()
-				set_tab_builds(source_tab, builds)
-				if vim.api.nvim_buf_is_valid(buf) then
-					local current_pr = vim.b[buf].bb_pr_info_pr or pr
-					apply_pr_info_content(buf, current_pr)
-				end
-			end)
+			set_tab_builds(source_tab, builds)
+			if vim.api.nvim_buf_is_valid(buf) then
+				apply_pr_info_content(buf, pr_info_buffer_pr(buf) or pr)
+			end
 		end)
 	end
 
-	local width = math.floor(vim.o.columns * 0.8)
-	local height = math.floor(vim.o.lines * 0.8)
-
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
-		title = "PR Info",
-		title_pos = "center",
-		footer = " ? help ",
-		footer_pos = "right",
-	})
-
-	set_wrapped_window_options(win)
-	enable_markview(buf, win)
-
-	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
+	local win = open_comment_view_float(buf, "PR Info")
 
 	local function apply_review_action(action)
-		local pr_id = tonumber(pr.id or 0) or 0
 		if pr_id <= 0 then
 			vim.notify("bb_pr: invalid PR id", vim.log.levels.ERROR)
 			return
 		end
-
-		local cmd = bb_cmd({ "-pr-review", tostring(pr_id), "-review-action", action, "-json" })
-		local source_tab = vim.api.nvim_get_current_tabpage()
-		vim.system(cmd, { text = true }, function(res)
-			if res.code ~= 0 then
-				vim.schedule(function()
-					vim.notify("bb_pr: review action failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
-				return
-			end
-
-			refresh_current_pr(function(fresh_pr)
-				vim.schedule(function()
-					local updated = fresh_pr or pr
-					set_tab_pr(source_tab, updated, { preserve_comments = true })
-					apply_pr_info_content(buf, updated)
-					local msg = string.format("bb_pr: %s sent for PR #%s", action, tostring(pr_id))
-					vim.notify(msg, vim.log.levels.INFO)
-				end)
-			end, source_tab)
-		end)
+		run_pr_info_mutation(
+			{ "-pr-review", tostring(pr_id), "-review-action", action, "-json" },
+			"review action failed",
+			pr,
+			buf,
+			string.format("bb_pr: %s sent for PR #%s", action, tostring(pr_id))
+		)
 	end
 
-	local cfg = M.config
-	local function map(key, cmd, desc)
-		if key and key ~= "" then
-			vim.keymap.set("n", key, cmd, { buffer = buf, silent = true, desc = desc })
+	local function open_file_of_comment()
+		local cid = resolve_reply_target_comment_id()
+		if not cid then
+			vim.notify("bb_pr: move cursor to a file comment line", vim.log.levels.WARN)
+			return
 		end
+		local target = find_comment_by_id(cid)
+		if type(target) ~= "table" or not target.is_file_comment or not target.path then
+			vim.notify("bb_pr: not a file comment", vim.log.levels.WARN)
+			return
+		end
+		pcall(vim.api.nvim_win_close, win, true)
+		navigate_to_file_comment_in_diffview(target, { open_float = false })
 	end
 
-	-- PR-level actions
-	if cfg.overview.approve_map and cfg.overview.approve_map ~= "" then
-		vim.keymap.set("n", cfg.overview.approve_map, function()
+	local function open_ticket_under_cursor()
+		local ticket = ticket_under_cursor()
+		if not ticket then
+			vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
+			return
+		end
+		open_jira_ticket(ticket)
+	end
+
+	local ov = M.config.overview
+	local specs = {
+		{ ov.approve_map, function()
 			apply_review_action("approve")
-		end, { buffer = buf, silent = true, desc = "Approve PR" })
-	end
-	if cfg.overview.disapprove_map and cfg.overview.disapprove_map ~= "" then
-		vim.keymap.set("n", cfg.overview.disapprove_map, function()
+		end, desc = "Approve PR" },
+		{ ov.disapprove_map, function()
 			apply_review_action("disapprove")
-		end, { buffer = buf, silent = true, desc = "Disapprove PR" })
-	end
-	if cfg.overview.needs_work_map and cfg.overview.needs_work_map ~= "" then
-		vim.keymap.set("n", cfg.overview.needs_work_map, function()
+		end, desc = "Disapprove PR" },
+		{ ov.needs_work_map, function()
 			apply_review_action("needs-work")
-		end, { buffer = buf, silent = true, desc = "Mark PR needs work" })
-	end
-	if cfg.overview.edit_description_map and cfg.overview.edit_description_map ~= "" then
-		vim.keymap.set("n", cfg.overview.edit_description_map, function()
-			local current_pr = vim.b[buf].bb_pr_info_pr or pr
-			open_edit_pr_description(current_pr, buf)
-		end, { buffer = buf, silent = true, desc = "Edit PR title and description" })
-	end
-	if cfg.overview.open_file_map and cfg.overview.open_file_map ~= "" then
-		vim.keymap.set("n", cfg.overview.open_file_map, function()
-			local cid = resolve_reply_target_comment_id()
-			if not cid then
-				vim.notify("bb_pr: move cursor to a file comment line", vim.log.levels.WARN)
-				return
-			end
-			local target = find_comment_by_id(cid)
-			if type(target) ~= "table" or not target.is_file_comment or not target.path then
-				vim.notify("bb_pr: not a file comment", vim.log.levels.WARN)
-				return
-			end
-			pcall(vim.api.nvim_win_close, win, true)
-			navigate_to_file_comment_in_diffview(target, { open_float = false })
-		end, { buffer = buf, silent = true, desc = "Open file from overview comment in diff" })
-	end
-	if cfg.jira.open_map and cfg.jira.open_map ~= "" then
-		vim.keymap.set("n", cfg.jira.open_map, function()
-			local ticket = ticket_under_cursor()
-			if not ticket then
-				vim.notify("bb_pr: no Jira ticket under cursor", vim.log.levels.WARN)
-				return
-			end
-			open_jira_ticket(ticket)
-		end, { buffer = buf, silent = true, desc = "Open Jira ticket" })
-	end
-	if cfg.overview.open_image_map and cfg.overview.open_image_map ~= "" then
-		vim.keymap.set("n", cfg.overview.open_image_map, function()
-			open_attachment_at_cursor()
-		end, { buffer = buf, silent = true, desc = "Download and open attachment under cursor" })
-	end
-
-	-- Comment actions: same keys as file comment float
-	map(cfg.comments.reply_map, "<cmd>BBPRReplyComment<CR>", "Reply to comment")
-	map(cfg.comments.react_map, "<cmd>BBPRReactComment<CR>", "React / emoji")
-	map(cfg.comments.reaction_users_map, "<cmd>BBPRReactionUsers<CR>", "Who reacted")
-	map(cfg.comments.delete_map, "<cmd>BBPRDeleteComment<CR>", "Delete comment")
-	map(cfg.comments.edit_map, "<cmd>BBPREditComment<CR>", "Edit comment")
-	map(cfg.comments.toggle_task_map, "<cmd>BBPRToggleTask<CR>", "Toggle task done/open")
-	map(cfg.comments.convert_task_map, "<cmd>BBPRConvertTask<CR>", "Convert comment <-> task")
-	map(cfg.comments.resolve_map, "<cmd>BBPRResolveComment<CR>", "Resolve / unresolve thread")
-	map(cfg.comments.create_map, "<cmd>BBPRCreateComment<CR>", "Create overview comment")
-
-	vim.keymap.set("n", "?", function()
-		local c = M.config
-		local function e(key, desc)
-			return (key and key ~= "") and { key, desc } or nil
-		end
-		local entries = {}
-		for _, v in ipairs({
-			e(c.overview.approve_map, "Approve PR"),
-			e(c.overview.disapprove_map, "Disapprove PR"),
-			e(c.overview.needs_work_map, "Needs work"),
-			e(c.overview.edit_description_map, "Edit title & description"),
-			e(c.overview.open_file_map, "Open file from comment in diff"),
-			e(c.jira.open_map, "Open Jira ticket"),
-			e(c.overview.open_image_map, "Open attachment"),
-			{ "─", "── Comment actions ──────────────" },
-			e(c.comments.reply_map, "Reply to comment"),
-			e(c.comments.react_map, "React / emoji"),
-			e(c.comments.reaction_users_map, "Who reacted (cursor on a reaction)"),
-			e(c.comments.delete_map, "Delete comment"),
-			e(c.comments.edit_map, "Edit comment"),
-			e(c.comments.resolve_map, "Resolve / unresolve thread"),
-			e(c.comments.toggle_task_map, "Toggle task done/open"),
-			e(c.comments.convert_task_map, "Convert comment <-> task"),
-			e(c.comments.create_map, "Create overview comment"),
-			{ "q", "Close" },
-		}) do
-			if v then
-				table.insert(entries, v)
-			end
-		end
-		open_help_float(entries, "PR Info — Keymaps")
-	end, { buffer = buf, desc = "Show keymap help", silent = true })
+		end, desc = "Mark PR needs work", help = "Needs work" },
+		{ ov.edit_description_map, function()
+			open_edit_pr_description(pr_info_buffer_pr(buf) or pr, buf)
+		end, desc = "Edit PR title and description", help = "Edit title & description" },
+		{
+			ov.open_file_map,
+			open_file_of_comment,
+			desc = "Open file from overview comment in diff",
+			help = "Open file from comment in diff",
+		},
+		{ M.config.jira.open_map, open_ticket_under_cursor, desc = "Open Jira ticket" },
+		{
+			ov.open_image_map,
+			open_attachment_at_cursor,
+			desc = "Download and open attachment under cursor",
+			help = "Open attachment",
+		},
+		{ "─", nil, help = "── Comment actions ──────────────" },
+	}
+	-- comment actions: same keys as the line comments float
+	vim.list_extend(specs, comment_action_specs(true))
+	bind_keymaps(buf, specs, "PR Info — Keymaps")
 end
 
-local function open_pr_info_with_comments(pr)
+open_pr_info_with_comments = function(pr)
 	local payload = get_current_tab_comments()
 	if payload then
 		open_pr_info(pr)
@@ -3136,13 +2820,11 @@ local function open_pr_info_with_comments(pr)
 	end
 
 	run_comments_provider(pr.id, function(fetched)
-		vim.schedule(function()
-			set_current_tab_comments(fetched)
-			open_pr_info(pr)
-		end)
+		set_current_tab_comments(fetched)
+		open_pr_info(pr)
 	end, { notify_errors = true })
 end
-open_pr_info_with_comments_fwd = open_pr_info_with_comments
+
 local function open_telescope_picker(prs)
 	local ok_pickers, pickers = pcall(require, "telescope.pickers")
 	local ok_finders, finders = pcall(require, "telescope.finders")
@@ -3201,25 +2883,15 @@ function M.open_pr(pr_id, opts)
 	end
 	local comment_id = tonumber(opts.comment_id or 0) or 0
 
-	run_provider(function(prs)
-		local found = nil
-		for _, p in ipairs(prs or {}) do
-			if tonumber(p.id or 0) == pr_id then
-				found = p
-				break
-			end
+	fetch_pr_by_id(pr_id, function(found)
+		if not found then
+			vim.notify("bb_pr: PR #" .. pr_id .. " not found in current repo", vim.log.levels.ERROR)
+			return
 		end
-
-		vim.schedule(function()
-			if not found then
-				vim.notify("bb_pr: PR #" .. pr_id .. " not found in current repo", vim.log.levels.ERROR)
-				return
-			end
-			if comment_id > 0 then
-				state.pending_nav_by_pr_id[pr_id] = { comment_id = comment_id }
-			end
-			open_diffview(found)
-		end)
+		if comment_id > 0 then
+			state.pending_nav_by_pr_id[pr_id] = { comment_id = comment_id }
+		end
+		open_diffview(found)
 	end)
 end
 
@@ -3228,37 +2900,36 @@ function M.open_list()
 		local sorted_prs = prs or {}
 		state.prs = sorted_prs
 
-		vim.schedule(function()
-			if open_telescope_picker(sorted_prs) then
-				return
+		if open_telescope_picker(sorted_prs) then
+			return
+		end
+
+		local buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_buf_set_name(buf, "bb_pr://pull_requests")
+		vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+		vim.api.nvim_set_option_value("filetype", "bb_pr", { buf = buf })
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs))
+
+		-- the PR on the cursor line, below the two header lines of build_lines
+		local function pr_at_cursor()
+			return state.prs[vim.api.nvim_win_get_cursor(0)[1] - 2]
+		end
+
+		vim.keymap.set("n", "<CR>", function()
+			local pr = pr_at_cursor()
+			if pr then
+				open_diffview(pr)
 			end
+		end, { buffer = buf, silent = true })
 
-			local buf = vim.api.nvim_create_buf(false, true)
-			vim.api.nvim_buf_set_name(buf, "bb_pr://pull_requests")
-			vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-			vim.api.nvim_set_option_value("filetype", "bb_pr", { buf = buf })
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs))
+		vim.keymap.set("n", "i", function()
+			local pr = pr_at_cursor()
+			if pr then
+				open_pr_info_with_comments(pr)
+			end
+		end, { buffer = buf, silent = true })
 
-			vim.keymap.set("n", "<CR>", function()
-				local line = vim.api.nvim_win_get_cursor(0)[1]
-				local idx = line - 2
-				local pr = state.prs[idx]
-				if pr then
-					open_diffview(pr)
-				end
-			end, { buffer = buf, silent = true })
-
-			vim.keymap.set("n", "i", function()
-				local line = vim.api.nvim_win_get_cursor(0)[1]
-				local idx = line - 2
-				local pr = state.prs[idx]
-				if pr then
-					open_pr_info_with_comments(pr)
-				end
-			end, { buffer = buf, silent = true })
-
-			vim.api.nvim_set_current_buf(buf)
-		end)
+		vim.api.nvim_set_current_buf(buf)
 	end)
 end
 
@@ -3309,14 +2980,15 @@ local function resolve_file_comment_context(win, line)
 	return ctx
 end
 
-local function resolve_comment_context(mode)
+-- Where a new comment created at the cursor goes: { mode = "new_overview" } in PR Info,
+-- otherwise the file anchor (see resolve_file_comment_context). Returns nil, reason
+-- when the cursor has no such place.
+local function resolve_comment_context()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local line = vim.api.nvim_win_get_cursor(0)[1]
-	if mode == "reply" then
-		return nil
-	end
 
-	if vim.bo[bufnr].filetype == "markdown" and type(vim.b[bufnr].bb_pr_overview_comment_lines) == "table" then
+	local view = comment_view(bufnr)
+	if vim.bo[bufnr].filetype == "markdown" and view and view.kind == "overview" then
 		log("resolve_comment_context: new_overview", "bufnr=", bufnr, "line=", line)
 		return { mode = "new_overview" }
 	end
@@ -3339,38 +3011,26 @@ local function open_multiline_comment_input(opts, on_submit)
 	local title = (opts.title or "Comment") .. (opts.title_suffix or "")
 	local prompt = opts.prompt or "Write text. <C-s> submit, q cancel"
 	local draft_key = opts.draft_key
+	-- the prompt header above the text; get_typed_text skips it
+	local header = { "<!-- " .. prompt .. " -->", "" }
 
 	local fresh_text = opts.initial_text
-	local existing_draft = draft_key and get_draft(draft_key)
-	local conflict = existing_draft and existing_draft.base ~= nil and existing_draft.base ~= (fresh_text or "")
-	local initial_text = (existing_draft and not conflict) and existing_draft.text or fresh_text
+	local draft, conflict = load_draft(draft_key, fresh_text or "")
+	local initial_text = (draft and not conflict) and draft.text or fresh_text
 
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].filetype = "markdown"
-	vim.diagnostic.enable(false, { bufnr = buf })
+	local buf = create_scratch_buf("markdown")
 	local initial_lines = { "", "", "", "" }
 	if type(initial_text) == "string" and initial_text ~= "" then
 		initial_lines = vim.split(initial_text, "\n", { plain = true })
 	end
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
 
-	local width = math.max(80, math.floor(vim.o.columns * 0.7))
-	local height = math.max(12, math.floor(vim.o.lines * 0.35))
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
+	local win = open_centered_float(buf, {
+		width = math.max(80, math.floor(vim.o.columns * 0.7)),
+		height = math.max(12, math.floor(vim.o.lines * 0.35)),
 		title = title,
-		title_pos = "center",
 	})
-	vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "<!-- " .. prompt .. " -->", "" })
+	vim.api.nvim_buf_set_lines(buf, 0, 0, false, header)
 	vim.api.nvim_win_set_cursor(win, { 3, 0 })
 	local sep_ns = vim.api.nvim_create_namespace("bb_pr_merge_sep")
 	local function apply_separator()
@@ -3386,10 +3046,6 @@ local function open_multiline_comment_input(opts, on_submit)
 	end
 	apply_separator()
 
-	if existing_draft and not conflict then
-		vim.notify("bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")", vim.log.levels.INFO)
-	end
-
 	local function get_typed_text()
 		if not vim.api.nvim_buf_is_valid(buf) then
 			return ""
@@ -3401,25 +3057,11 @@ local function open_multiline_comment_input(opts, on_submit)
 		return vim.trim(table.concat(lines, "\n"))
 	end
 
-	if conflict then
-		vim.notify(
-			string.format(
-				"bb_pr: draft from %s conflicts with updated template — <C-r> to restore draft",
-				draft_age_label(existing_draft.saved_at)
-			),
-			vim.log.levels.WARN
-		)
-		vim.keymap.set({ "n", "i" }, "<C-r>", function()
-			if not vim.api.nvim_buf_is_valid(buf) then
-				return
-			end
-			local draft_lines = vim.split(existing_draft.text, "\n", { plain = true })
-			local prompt_prefix = { "<!-- " .. prompt .. " -->", "" }
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend(prompt_prefix, draft_lines))
-			apply_separator()
-			vim.notify("bb_pr: draft loaded", vim.log.levels.INFO)
-		end, { buffer = buf, silent = true })
-	end
+	announce_draft(buf, draft, conflict, function()
+		local draft_lines = vim.split(draft.text, "\n", { plain = true })
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend(vim.list_slice(header), draft_lines))
+		apply_separator()
+	end)
 
 	local autosave = attach_draft_autosave({
 		buf = buf,
@@ -3485,8 +3127,9 @@ local function ensure_branch_synced_with_origin(branch)
 		return false, "bb_pr: failed to fetch origin/" .. branch .. ": " .. vim.trim(fetch or "")
 	end
 
+	-- --verify prints the commit the ref points to
 	local remote_ref = "refs/remotes/origin/" .. branch
-	local remote_check = vim.fn.system({ "git", "rev-parse", "--verify", remote_ref })
+	local remote_sha = vim.trim(vim.fn.system({ "git", "rev-parse", "--verify", remote_ref }) or "")
 	if vim.v.shell_error ~= 0 then
 		return false, "bb_pr: branch does not exist in origin: " .. branch
 	end
@@ -3496,8 +3139,7 @@ local function ensure_branch_synced_with_origin(branch)
 		return false, "bb_pr: failed to resolve local HEAD"
 	end
 
-	local remote_sha = vim.trim(vim.fn.system({ "git", "rev-parse", remote_ref }) or "")
-	if vim.v.shell_error ~= 0 or remote_sha == "" then
+	if remote_sha == "" then
 		return false, "bb_pr: failed to resolve origin branch commit"
 	end
 
@@ -3546,112 +3188,81 @@ local function open_create_pr_editor(source_branch, target_branch)
 
 	local function do_open(default_title)
 		local pr_draft_key = "create_pr:" .. source_branch .. ":" .. target_branch
-		local fresh_base = vim.json.encode({
-			title = default_title,
-			body = table.concat(resolve_pr_body_template_lines(), "\n"),
-		})
-		local existing_draft = get_draft(pr_draft_key)
-		local pr_conflict = existing_draft and existing_draft.base ~= nil and existing_draft.base ~= fresh_base
-		local draft_title = default_title
-		local draft_body_lines = resolve_pr_body_template_lines()
-		if existing_draft and not pr_conflict then
-			local ok, d = pcall(vim.json.decode, existing_draft.text)
-			if ok and type(d) == "table" then
-				if type(d.title) == "string" and d.title ~= "" then
-					draft_title = d.title
-				end
-				if type(d.body) == "string" then
-					draft_body_lines = vim.split(d.body, "\n", { plain = true })
-				end
+		local template_lines = resolve_pr_body_template_lines()
+		local fresh_base = vim.json.encode({ title = default_title, body = table.concat(template_lines, "\n") })
+		local draft, conflict = load_draft(pr_draft_key, fresh_base)
+		-- the draft's { title, body }; nil when there is none or it does not decode
+		local saved = nil
+		if draft then
+			local ok, decoded = pcall(vim.json.decode, draft.text)
+			saved = (ok and type(decoded) == "table") and decoded or nil
+		end
+		local saved_body_lines = saved
+			and type(saved.body) == "string"
+			and vim.split(saved.body, "\n", { plain = true })
+
+		local title, body_lines = default_title, template_lines
+		if saved and not conflict then
+			if type(saved.title) == "string" and saved.title ~= "" then
+				title = saved.title
 			end
+			body_lines = saved_body_lines or body_lines
 		end
 
-		local buf = vim.api.nvim_create_buf(false, true)
-		vim.bo[buf].buftype = "nofile"
-		vim.bo[buf].bufhidden = "wipe"
-		vim.bo[buf].swapfile = false
-		vim.bo[buf].filetype = "markdown"
-		vim.diagnostic.enable(false, { bufnr = buf })
-		local initial_lines = {
-			"Title: " .. draft_title,
-			"",
-			"Body:",
-		}
-		vim.list_extend(initial_lines, draft_body_lines)
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, initial_lines)
-
+		local toggle_map = M.config.pr.create_toggle_draft_map
 		local hints = { "<C-s> submit" }
-		if M.config.pr.create_toggle_draft_map and M.config.pr.create_toggle_draft_map ~= "" then
-			table.insert(hints, M.config.pr.create_toggle_draft_map .. " toggle [DRAFT]")
+		if toggle_map and toggle_map ~= "" then
+			table.insert(hints, toggle_map .. " toggle [DRAFT]")
 		end
 		table.insert(hints, "q cancel")
 
-		local width = math.floor(vim.o.columns * 0.8)
-		local height = math.floor(vim.o.lines * 0.8)
-		local win = vim.api.nvim_open_win(buf, true, {
-			relative = "editor",
-			width = width,
-			height = height,
-			row = math.floor((vim.o.lines - height) / 2),
-			col = math.floor((vim.o.columns - width) / 2),
-			style = "minimal",
-			border = "rounded",
-			title = "Create PR (" .. table.concat(hints, ", ") .. ")",
-			title_pos = "center",
-		})
+		local autosave
+		local buf, win = open_title_body_editor({
+			win_title = "Create PR (" .. table.concat(hints, ", ") .. ")",
+			width = math.floor(vim.o.columns * 0.8),
+			height = math.floor(vim.o.lines * 0.8),
+			title = title,
+			body_lines = body_lines,
+		}, function(pr_title, body)
+			autosave.cancel()
+			delete_draft(pr_draft_key)
+			run_bb({
+				"-json",
+				"-pr-create",
+				"-pr-title",
+				pr_title,
+				"-pr-body",
+				body,
+				"-pr-source",
+				source_branch,
+				"-pr-target",
+				target_branch,
+			}, { fail_msg = "create PR failed" }, function()
+				vim.notify("bb_pr: pull request created", vim.log.levels.INFO)
+			end)
+		end)
 
-		if existing_draft and not pr_conflict then
-			vim.notify(
-				"bb_pr: draft restored (" .. draft_age_label(existing_draft.saved_at) .. ")",
-				vim.log.levels.INFO
-			)
-		end
+		announce_draft(buf, draft, conflict, function()
+			if not saved then
+				return false
+			end
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, title_body_lines(saved.title or "", saved_body_lines))
+		end)
 
 		local function get_pr_draft_text()
 			if not vim.api.nvim_buf_is_valid(buf) then
 				return nil
 			end
-			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
-			local body_parts = {}
-			for i = 4, #lines do
-				table.insert(body_parts, lines[i])
-			end
-			local body = table.concat(body_parts, "\n")
+			local typed_title, body = parse_title_body(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
 			-- On exit the buffer can already be emptied; never overwrite a good
 			-- draft with a blank one.
-			if title == "" and vim.trim(body) == "" then
+			if typed_title == "" and vim.trim(body) == "" then
 				return nil
 			end
-			return vim.json.encode({ title = title, body = body })
+			return vim.json.encode({ title = typed_title, body = body })
 		end
 
-		if pr_conflict then
-			vim.notify(
-				string.format(
-					"bb_pr: draft from %s conflicts with updated template — <C-r> to restore draft",
-					draft_age_label(existing_draft.saved_at)
-				),
-				vim.log.levels.WARN
-			)
-			vim.keymap.set({ "n", "i" }, "<C-r>", function()
-				if not vim.api.nvim_buf_is_valid(buf) then
-					return
-				end
-				local ok, d = pcall(vim.json.decode, existing_draft.text)
-				if not ok or type(d) ~= "table" then
-					return
-				end
-				local restored_lines = { "Title: " .. (d.title or ""), "", "Body:" }
-				if type(d.body) == "string" then
-					vim.list_extend(restored_lines, vim.split(d.body, "\n", { plain = true }))
-				end
-				vim.api.nvim_buf_set_lines(buf, 0, -1, false, restored_lines)
-				vim.notify("bb_pr: draft loaded", vim.log.levels.INFO)
-			end, { buffer = buf, silent = true })
-		end
-
-		local autosave = attach_draft_autosave({
+		autosave = attach_draft_autosave({
 			buf = buf,
 			win = win,
 			key = pr_draft_key,
@@ -3659,66 +3270,12 @@ local function open_create_pr_editor(source_branch, target_branch)
 			get_text = get_pr_draft_text,
 		})
 
-		local function submit()
-			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-			local title = vim.trim((lines[1] or ""):gsub("^Title:%s*", "", 1))
-			local body_lines = {}
-			for i = 4, #lines do
-				table.insert(body_lines, lines[i])
-			end
-			local body = vim.trim(table.concat(body_lines, "\n"))
-			if title == "" then
-				vim.notify("bb_pr: PR title is required", vim.log.levels.WARN)
-				return
-			end
-			autosave.cancel()
-			delete_draft(pr_draft_key)
-			pcall(vim.api.nvim_win_close, win, true)
-			local cmd = bb_cmd({
-				"-json",
-				"-pr-create",
-				"-pr-title",
-				title,
-				"-pr-body",
-				body,
-				"-pr-source",
-				source_branch,
-				"-pr-target",
-				target_branch,
-			})
-			vim.system(cmd, { text = true }, function(res)
-				if res.code ~= 0 then
-					vim.schedule(function()
-						vim.notify("bb_pr: create PR failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-					end)
-					return
-				end
-				vim.schedule(function()
-					vim.notify("bb_pr: pull request created", vim.log.levels.INFO)
-				end)
-			end)
-		end
-
 		local function toggle_draft()
-			local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "Title: "
-			local prefix = "Title: "
+			local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or TITLE_PREFIX
 			local raw = line:gsub("^Title:%s*", "", 1)
-			vim.api.nvim_buf_set_lines(buf, 0, 1, false, { prefix .. toggle_draft_in_title_line(raw) })
+			vim.api.nvim_buf_set_lines(buf, 0, 1, false, { TITLE_PREFIX .. toggle_draft_in_title_line(raw) })
 		end
-
-		vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true })
-		vim.keymap.set("n", "<CR>", submit, { buffer = buf, silent = true })
-		vim.keymap.set("n", "q", function()
-			pcall(vim.api.nvim_win_close, win, true)
-		end, { buffer = buf, silent = true })
-		if M.config.pr.create_toggle_draft_map and M.config.pr.create_toggle_draft_map ~= "" then
-			vim.keymap.set(
-				"n",
-				M.config.pr.create_toggle_draft_map,
-				toggle_draft,
-				{ buffer = buf, silent = true, desc = "Toggle [DRAFT]" }
-			)
-		end
+		bind_keymaps(buf, { { toggle_map, toggle_draft, desc = "Toggle [DRAFT]" } })
 		vim.cmd("startinsert")
 	end
 
@@ -3769,20 +3326,11 @@ local function create_pr()
 		vim.notify(sync_err, vim.log.levels.ERROR)
 		return
 	end
-	vim.system(bb_cmd({ "-json", "-target-branches" }), { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: failed to load target branches: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		local ok, decoded = pcall(vim.json.decode, res.stdout)
-		if not ok or type(decoded) ~= "table" then
-			vim.schedule(function()
-				vim.notify("bb_pr: invalid target branches JSON", vim.log.levels.ERROR)
-			end)
-			return
-		end
+	run_bb({ "-json", "-target-branches" }, {
+		json = true,
+		fail_msg = "failed to load target branches",
+		invalid_msg = "invalid target branches JSON",
+	}, function(decoded)
 		local options = {}
 		for _, b in ipairs(decoded) do
 			local name = tostring(b.displayId or "")
@@ -3798,33 +3346,23 @@ local function create_pr()
 			end
 			return a < b
 		end)
-		vim.schedule(function()
-			if #options == 0 then
-				vim.ui.input({ prompt = "Target branch: " }, function(input)
-					local target = vim.trim(input or "")
-					if target == "" then
-						return
-					end
-					open_create_pr_editor(source_branch, target)
-				end)
-				return
-			end
-			vim.ui.select(options, { prompt = "Select target branch" }, function(choice)
-				if not choice then
+		if #options == 0 then
+			vim.ui.input({ prompt = "Target branch: " }, function(input)
+				local target = vim.trim(input or "")
+				if target == "" then
 					return
 				end
-				open_create_pr_editor(source_branch, choice)
+				open_create_pr_editor(source_branch, target)
 			end)
+			return
+		end
+		vim.ui.select(options, { prompt = "Select target branch" }, function(choice)
+			if not choice then
+				return
+			end
+			open_create_pr_editor(source_branch, choice)
 		end)
 	end)
-end
-
-local function get_last_commit_title(commits)
-	if type(commits) ~= "table" or #commits == 0 then
-		return ""
-	end
-	local msg = tostring((commits[1] or {}).message or "")
-	return vim.split(msg, "\n", { plain = true })[1] or ""
 end
 
 local function merge_current_pr()
@@ -3833,24 +3371,14 @@ local function merge_current_pr()
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
 		return
 	end
-	vim.system(bb_cmd({ "-json", "-pr-commits", tostring(pr.id) }), { text = true }, function(commits_res)
-		if commits_res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: failed to load PR commits: " .. (commits_res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		local ok, commits = pcall(vim.json.decode, commits_res.stdout)
-		if not ok or type(commits) ~= "table" then
-			vim.schedule(function()
-				vim.notify("bb_pr: invalid PR commits JSON", vim.log.levels.ERROR)
-			end)
-			return
-		end
+	local template_fn = M.config.pr.merge_body_template_fn
+
+	-- `commits` (the PR commits) is only fetched for template_fn
+	local function open_merge_editor(commits)
 		local title = string.format("PR #%s: %s", tostring(pr.id or ""), tostring(pr.title or ""))
 		local body_lines = { "" }
-		if type(M.config.pr.merge_body_template_fn) == "function" then
-			local ok_tpl, tpl = pcall(M.config.pr.merge_body_template_fn, commits)
+		if type(template_fn) == "function" then
+			local ok_tpl, tpl = pcall(template_fn, commits)
 			if ok_tpl then
 				if type(tpl) == "string" then
 					body_lines = vim.split(tpl, "\n", { plain = true })
@@ -3867,46 +3395,48 @@ local function merge_current_pr()
 				body_lines = { "Fixes " .. table.concat(tickets, " ") }
 			end
 		end
-		vim.schedule(function()
-			local initial_text = title
-			if type(body_lines) == "table" and #body_lines > 0 then
-				initial_text = table.concat(vim.list_extend({ title, "" }, body_lines), "\n")
+		local initial_text = title
+		if type(body_lines) == "table" and #body_lines > 0 then
+			initial_text = table.concat(vim.list_extend({ title, "" }, body_lines), "\n")
+		end
+		open_multiline_comment_input({
+			title = "Merge PR #" .. tostring(pr.id),
+			prompt = "Line 1: merge commit title. Next lines: commit body. <C-s> submit, q cancel",
+			initial_text = initial_text,
+			title_separator = true,
+			draft_key = "merge:" .. tostring(pr.id),
+		}, function(text)
+			local body = ""
+			if text:find("\n", 1, true) then
+				local lines = vim.split(text, "\n", { plain = true })
+				title = vim.trim(lines[1] or "")
+				body = vim.trim(table.concat(vim.list_slice(lines, 2), "\n"))
+			else
+				title = vim.trim(text)
 			end
-			open_multiline_comment_input({
-				title = "Merge PR #" .. tostring(pr.id),
-				prompt = "Line 1: merge commit title. Next lines: commit body. <C-s> submit, q cancel",
-				initial_text = initial_text,
-				title_separator = true,
-				draft_key = "merge:" .. tostring(pr.id),
-			}, function(text)
-				local body = ""
-				if text:find("\n", 1, true) then
-					local lines = vim.split(text, "\n", { plain = true })
-					title = vim.trim(lines[1] or "")
-					body = vim.trim(table.concat(vim.list_slice(lines, 2), "\n"))
-				else
-					title = vim.trim(text)
+			if title == "" then
+				vim.notify("bb_pr: merge commit title is required", vim.log.levels.WARN)
+				return
+			end
+			run_bb(
+				{ "-json", "-pr-merge", tostring(pr.id), "-merge-title", title, "-merge-body", body },
+				{ fail_msg = "merge failed" },
+				function()
+					vim.notify("bb_pr: pull request merged", vim.log.levels.INFO)
 				end
-				if title == "" then
-					vim.notify("bb_pr: merge commit title is required", vim.log.levels.WARN)
-					return
-				end
-				local cmd =
-					bb_cmd({ "-json", "-pr-merge", tostring(pr.id), "-merge-title", title, "-merge-body", body })
-				vim.system(cmd, { text = true }, function(res)
-					if res.code ~= 0 then
-						vim.schedule(function()
-							vim.notify("bb_pr: merge failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-						end)
-						return
-					end
-					vim.schedule(function()
-						vim.notify("bb_pr: pull request merged", vim.log.levels.INFO)
-					end)
-				end)
-			end)
+			)
 		end)
-	end)
+	end
+
+	if type(template_fn) ~= "function" then
+		open_merge_editor(nil)
+		return
+	end
+	run_bb({ "-json", "-pr-commits", tostring(pr.id) }, {
+		json = true,
+		fail_msg = "failed to load PR commits",
+		invalid_msg = "invalid PR commits JSON",
+	}, open_merge_editor)
 end
 
 -- Leave the PR: close its tabs and, if the checkout left an unresolved merge behind,
@@ -3934,30 +3464,18 @@ local function close_current_pr()
 	end)
 end
 
+-- Id of the comment the cursor line acts on in a comment view (float or PR Info)
 resolve_reply_target_comment_id = function()
-	local bufnr = vim.api.nvim_get_current_buf()
-	local line = vim.api.nvim_win_get_cursor(0)[1]
-
-	local float_ids = vim.b[bufnr].bb_pr_float_comment_ids_by_line
-	if type(float_ids) == "table" then
-		local cid = tonumber(float_ids[line] or 0) or 0
-		if cid > 0 then
-			return cid
-		end
-	end
-
-	local overview_ids = vim.b[bufnr].bb_pr_overview_comment_ids_by_line
-	if type(overview_ids) == "table" then
-		local cid = tonumber(overview_ids[line] or 0) or 0
-		if cid > 0 then
-			return cid
-		end
-	end
-
-	return nil
+	local view = comment_view(vim.api.nvim_get_current_buf())
+	return view and view.ids_by_line[vim.api.nvim_win_get_cursor(0)[1]] or nil
 end
 
+-- Re-opens the line comments float `win` showing `buf` with the comments now on its
+-- source line, keeping the cursor on the same comment.
 local function refresh_float_window_if_needed(win, buf)
+	if not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
 	local was_current = vim.api.nvim_get_current_win() == win
 	local source_win = vim.b[buf].bb_pr_float_source_win
 	local source_bufnr = vim.b[buf].bb_pr_float_source_bufnr
@@ -3969,20 +3487,9 @@ local function refresh_float_window_if_needed(win, buf)
 		return
 	end
 
-	local saved_comment_id = nil
-	local saved_line = nil
-	local saved_col = nil
+	local saved = nil
 	if vim.api.nvim_win_is_valid(win) then
-		local cur = vim.api.nvim_win_get_cursor(win)
-		saved_line = cur[1]
-		saved_col = cur[2]
-		local ids_by_line = vim.b[buf].bb_pr_float_comment_ids_by_line
-		if type(ids_by_line) == "table" then
-			local cid = tonumber(ids_by_line[saved_line] or 0)
-			if cid and cid > 0 then
-				saved_comment_id = cid
-			end
-		end
+		saved = save_comment_cursor(win, buf)
 		pcall(vim.api.nvim_win_close, win, true)
 	end
 	local reopened_win = nil
@@ -3996,61 +3503,106 @@ local function refresh_float_window_if_needed(win, buf)
 		if was_current then
 			pcall(vim.api.nvim_set_current_win, reopened_win)
 		end
-		local new_buf = vim.api.nvim_win_get_buf(reopened_win)
-		local new_line = saved_line
-		if saved_comment_id then
-			local new_ids = vim.b[new_buf].bb_pr_float_comment_ids_by_line
-			if type(new_ids) == "table" then
-				for ln, cid in pairs(new_ids) do
-					if tonumber(cid) == saved_comment_id then
-						new_line = tonumber(ln) or new_line
-						break
-					end
-				end
-			end
-		end
-		if new_line then
-			local line_count = vim.api.nvim_buf_line_count(new_buf)
-			if new_line > line_count then
-				new_line = line_count
-			end
-			if new_line < 1 then
-				new_line = 1
-			end
-			pcall(vim.api.nvim_win_set_cursor, reopened_win, { new_line, saved_col or 0 })
+		if saved then
+			restore_comment_cursor(reopened_win, vim.api.nvim_win_get_buf(reopened_win), saved)
 		end
 	end
 end
 
-local function toggle_task_status()
-	local pr = get_current_tab_pr()
+-- Refetches the comments of the PR of `tabpage` and re-renders them: the diff windows,
+-- the line comments float in opts.win / opts.buf (default: the current window when the
+-- comments arrive) and a PR Info buffer there, or with opts.refresh_info every PR Info
+-- window of the tab. opts.notify_errors = false keeps fetch errors silent.
+local function reload_tab_comments(tabpage, opts)
+	opts = opts or {}
+	if not vim.api.nvim_tabpage_is_valid(tabpage) then
+		return
+	end
+	local pr = get_tab_pr(tabpage)
 	if not pr or not pr.id then
 		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
 		return
 	end
+
+	run_comments_provider(pr.id, function(payload)
+		set_tab_comments(tabpage, payload)
+		apply_comments_when_diffview_ready(tabpage, payload, opts.refresh_info)
+		local win = opts.win or vim.api.nvim_get_current_win()
+		local buf = opts.buf or vim.api.nvim_get_current_buf()
+		vim.defer_fn(function()
+			refresh_float_window_if_needed(win, buf)
+		end, 150)
+		local info_pr = not opts.refresh_info and vim.api.nvim_buf_is_valid(buf) and pr_info_buffer_pr(buf)
+		if info_pr and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
+			apply_pr_info_content(buf, info_pr)
+		end
+	end, { notify_errors = opts.notify_errors })
+end
+
+-- PR of the current tab, or nil after a warning
+local function tab_pr_or_warn()
+	local pr = get_current_tab_pr()
+	if not pr or not pr.id then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return nil
+	end
+	return pr
+end
+
+local COMMENT_LINE_HINT = "bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info"
+local COMMENT_NOT_LOADED = "bb_pr: could not find selected comment in loaded payload"
+
+-- The comment the cursor line acts on: cid, comment, version — or nil after a warning.
+--   opts.no_target_msg / opts.missing_msg: replace the default warnings
+--   opts.allow_missing: return the cid even when the payload lacks the comment
+--   opts.version_for = "<verb>": also require a valid version (warns "... for <verb>")
+local function cursor_comment_or_warn(opts)
+	opts = opts or {}
 	local cid = resolve_reply_target_comment_id()
 	if not cid then
-		vim.notify("bb_pr: move cursor to a task line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
-		return
+		vim.notify(opts.no_target_msg or COMMENT_LINE_HINT, vim.log.levels.WARN)
+		return nil
 	end
+	local comment = find_comment_by_id(cid)
+	if not comment then
+		if opts.allow_missing then
+			return cid
+		end
+		vim.notify(opts.missing_msg or COMMENT_NOT_LOADED, vim.log.levels.WARN)
+		return nil
+	end
+	if not opts.version_for then
+		return cid, comment
+	end
+	local version = tonumber(comment.version or -1) or -1
+	if version < 0 then
+		vim.notify("bb_pr: selected comment has invalid version for " .. opts.version_for, vim.log.levels.WARN)
+		return nil
+	end
+	return cid, comment, version
+end
 
-	local payload = get_current_tab_comments() or {}
-	local all_comments = {}
-	for _, c in ipairs(as_array(payload.overview_comments)) do
-		all_comments[tonumber(c.id or 0) or 0] = c
-	end
-	for _, c in ipairs(as_array(payload.file_comments)) do
-		all_comments[tonumber(c.id or 0) or 0] = c
-	end
-	local target = all_comments[cid]
-	if type(target) ~= "table" or not target.is_task then
-		vim.notify("bb_pr: selected comment is not a task", vim.log.levels.WARN)
+local function toggle_task_status()
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local status = type(target.task_status) == "string" and string.upper(target.task_status) or "OPEN"
-	local next_state = (status == "DONE" or status == "RESOLVED") and "open" or "done"
+	local not_task = "bb_pr: selected comment is not a task"
+	local cid, target = cursor_comment_or_warn({
+		no_target_msg = "bb_pr: move cursor to a task line in BBPROpenLineComments or PR Info",
+		missing_msg = not_task,
+	})
+	if not cid then
+		return
+	end
+	if not target.is_task then
+		vim.notify(not_task, vim.log.levels.WARN)
+		return
+	end
+	local next_state = is_task_done(target) and "open" or "done"
 	local version = tonumber(target.version or 0) or 0
-	local cmd = bb_cmd({
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	run_bb({
 		"-json",
 		"-pr-task-status",
 		tostring(pr.id),
@@ -4060,49 +3612,25 @@ local function toggle_task_status()
 		next_state,
 		"-task-version",
 		tostring(version),
-	})
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: toggle task failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		vim.schedule(function()
-			vim.notify("bb_pr: task marked " .. next_state, vim.log.levels.INFO)
-			vim.cmd("BBPRLoadComments")
-		end)
+	}, { fail_msg = "toggle task failed" }, function()
+		vim.notify("bb_pr: task marked " .. next_state, vim.log.levels.INFO)
+		reload_tab_comments(source_tab)
 	end)
 end
 
 local function resolve_comment()
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local cid = resolve_reply_target_comment_id()
+	local cid, target = cursor_comment_or_warn()
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
-		return
-	end
-
-	local payload = get_current_tab_comments() or {}
-	local all_comments = {}
-	for _, c in ipairs(as_array(payload.overview_comments)) do
-		all_comments[tonumber(c.id or 0) or 0] = c
-	end
-	for _, c in ipairs(as_array(payload.file_comments)) do
-		all_comments[tonumber(c.id or 0) or 0] = c
-	end
-	local target = all_comments[cid]
-	if type(target) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
 		return
 	end
 	local version = tonumber(target.version or 0) or 0
 	local action = target.is_resolved and "unresolve" or "resolve"
-	local cmd = bb_cmd({
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	run_bb({
 		"-json",
 		"-pr-resolve-comment",
 		tostring(pr.id),
@@ -4112,19 +3640,10 @@ local function resolve_comment()
 		tostring(version),
 		"-resolve-action",
 		action,
-	})
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: resolve comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		vim.schedule(function()
-			local verb = action == "resolve" and "resolved" or "unresolved"
-			vim.notify("bb_pr: comment thread " .. verb, vim.log.levels.INFO)
-			vim.cmd("BBPRLoadComments")
-		end)
+	}, { fail_msg = "resolve comment failed" }, function()
+		local verb = action == "resolve" and "resolved" or "unresolved"
+		vim.notify("bb_pr: comment thread " .. verb, vim.log.levels.INFO)
+		reload_tab_comments(source_tab)
 	end)
 end
 
@@ -4144,25 +3663,12 @@ find_comment_by_id = function(cid)
 end
 
 local function extract_first_suggestion_block(text)
-	if type(text) ~= "string" or text == "" then
-		return nil
-	end
-	local block = text:match("```suggestion%s*\n(.-)\n```")
-	if type(block) ~= "string" then
-		return nil
-	end
-	return block
+	return type(text) == "string" and text:match("```suggestion%s*\n(.-)\n```") or nil
 end
 
 local function accept_suggestion()
-	local cid = resolve_reply_target_comment_id()
+	local cid, comment = cursor_comment_or_warn()
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
-		return
-	end
-	local comment = find_comment_by_id(cid)
-	if type(comment) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
 		return
 	end
 	if not comment.is_file_comment then
@@ -4249,36 +3755,36 @@ local function sort_reactions_by_recent_use(choices)
 	return choices
 end
 
-local function resolve_reaction_line_entry()
-	local bufnr = vim.api.nvim_get_current_buf()
-	local cursor = vim.api.nvim_win_get_cursor(0)
-	local line = cursor[1]
-	local col = cursor[2]
-
-	for _, key in ipairs({ "bb_pr_float_reaction_segments", "bb_pr_overview_reaction_segments" }) do
-		local by_line = vim.b[bufnr][key]
-		if type(by_line) == "table" then
-			local entry = by_line[line]
-			if type(entry) == "table" and type(entry.segments) == "table" and #entry.segments > 0 then
-				return entry, col
-			end
+-- Upper-cased, trimmed, non-empty reaction choices of the config (the default reaction
+-- when none remain); run once by setup.
+local function normalize_reaction_choices()
+	local normalized = {}
+	for _, item in ipairs(as_array(M.config.reactions.choices)) do
+		local v = vim.trim(tostring(item or ""))
+		if v ~= "" then
+			table.insert(normalized, string.upper(v))
 		end
 	end
-
-	return nil
+	if #normalized == 0 then
+		normalized = { string.upper(tostring(M.config.reactions.default or "THUMBS_UP")) }
+	end
+	M.config.reactions.choices = normalized
 end
 
 local function show_reaction_users()
-	local entry, col = resolve_reaction_line_entry()
+	local view = comment_view(vim.api.nvim_get_current_buf())
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local entry = view and view.reaction_segments[cursor[1]]
 	if not entry then
 		vim.notify("bb_pr: move cursor to a reaction line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
+	local col = cursor[2]
 
 	local cid = tonumber(entry.comment_id or 0) or 0
 	local comment = cid > 0 and find_comment_by_id(cid) or nil
 	if type(comment) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
+		vim.notify(COMMENT_NOT_LOADED, vim.log.levels.WARN)
 		return
 	end
 	if type(comment.reaction_users) ~= "table" then
@@ -4323,29 +3829,18 @@ local function show_reaction_users()
 end
 
 local function react_to_comment()
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local cid = resolve_reply_target_comment_id()
+	-- a comment missing from the payload gets the reaction added
+	local cid = cursor_comment_or_warn({ allow_missing = true })
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
-	local choices = as_array(M.config.reactions.choices)
-	local normalized = {}
-	for _, item in ipairs(choices) do
-		local v = tostring(item or ""):gsub("^%s+", ""):gsub("%s+$", "")
-		if v ~= "" then
-			table.insert(normalized, string.upper(v))
-		end
-	end
-	if #normalized == 0 then
-		normalized = { string.upper(tostring(M.config.reactions.default or "THUMBS_UP")) }
-	end
-	sort_reactions_by_recent_use(normalized)
-	vim.ui.select(normalized, {
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	local choices = sort_reactions_by_recent_use(vim.list_slice(M.config.reactions.choices))
+	vim.ui.select(choices, {
 		prompt = "Pick reaction",
 		format_item = function(item)
 			return reactions.render_choice(item)
@@ -4354,27 +3849,12 @@ local function react_to_comment()
 		if not choice or choice == "" then
 			return
 		end
-		local payload = get_current_tab_comments() or {}
-		local existing = nil
-		for _, c in ipairs(as_array(payload.overview_comments)) do
-			if tonumber(c.id or 0) == cid then
-				existing = c
-				break
-			end
-		end
-		if not existing then
-			for _, c in ipairs(as_array(payload.file_comments)) do
-				if tonumber(c.id or 0) == cid then
-					existing = c
-					break
-				end
-			end
-		end
+		local existing = find_comment_by_id(cid)
 		local action = "add"
-		if type(existing) == "table" and type(existing.my_reactions) == "table" and existing.my_reactions[choice] then
+		if existing and type(existing.my_reactions) == "table" and existing.my_reactions[choice] then
 			action = "remove"
 		end
-		local cmd = bb_cmd({
+		run_bb({
 			"-json",
 			"-pr-reaction",
 			tostring(pr.id),
@@ -4384,47 +3864,27 @@ local function react_to_comment()
 			choice,
 			"-reaction-action",
 			action,
-		})
-		vim.system(cmd, { text = true }, function(res)
-			if res.code ~= 0 then
-				vim.schedule(function()
-					vim.notify("bb_pr: add reaction failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
-				return
-			end
-			vim.schedule(function()
-				state.reaction_usage_seq = (tonumber(state.reaction_usage_seq or 0) or 0) + 1
-				state.reaction_usage_by_key[choice] = state.reaction_usage_seq
-				persist_reaction_recency_state()
-				vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
-				vim.cmd("BBPRLoadComments")
-			end)
+		}, { fail_msg = "add reaction failed" }, function()
+			state.reaction_usage_seq = state.reaction_usage_seq + 1
+			state.reaction_usage_by_key[choice] = state.reaction_usage_seq
+			persist_reaction_recency_state()
+			vim.notify("bb_pr: reaction " .. (action == "remove" and "removed" or "added"), vim.log.levels.INFO)
+			reload_tab_comments(source_tab)
 		end)
 	end)
 end
 
 local function delete_comment()
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local cid = resolve_reply_target_comment_id()
+	local cid, _, version = cursor_comment_or_warn({ version_for = "delete" })
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
-	local target = find_comment_by_id(cid)
-	if type(target) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
-		return
-	end
-	local version = tonumber(target.version or -1) or -1
-	if version < 0 then
-		vim.notify("bb_pr: selected comment has invalid version for delete", vim.log.levels.WARN)
-		return
-	end
-	local cmd = bb_cmd({
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	run_bb({
 		"-json",
 		"-pr-delete-comment",
 		tostring(pr.id),
@@ -4432,49 +3892,29 @@ local function delete_comment()
 		tostring(cid),
 		"-delete-comment-version",
 		tostring(version),
-	})
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: delete comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		vim.schedule(function()
-			vim.notify("bb_pr: comment deleted", vim.log.levels.INFO)
-			vim.cmd("BBPRLoadComments")
-		end)
+	}, { fail_msg = "delete comment failed" }, function()
+		vim.notify("bb_pr: comment deleted", vim.log.levels.INFO)
+		reload_tab_comments(source_tab)
 	end)
 end
 
 local function edit_comment()
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local cid = resolve_reply_target_comment_id()
+	local cid, target, version = cursor_comment_or_warn({ version_for = "edit" })
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
 		return
 	end
-	local target = find_comment_by_id(cid)
-	if type(target) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
-		return
-	end
-	local version = tonumber(target.version or -1) or -1
-	if version < 0 then
-		vim.notify("bb_pr: selected comment has invalid version for edit", vim.log.levels.WARN)
-		return
-	end
+	local source_tab = vim.api.nvim_get_current_tabpage()
 
 	open_multiline_comment_input({
 		title = "Edit Comment #" .. tostring(cid),
 		prompt = "Edit text. <C-s>/<CR> submit, q cancel",
 		initial_text = target.text or "",
 	}, function(text)
-		local cmd = bb_cmd({
+		run_bb({
 			"-json",
 			"-pr-update-comment",
 			tostring(pr.id),
@@ -4484,45 +3924,25 @@ local function edit_comment()
 			tostring(version),
 			"-text",
 			text,
-		})
-		vim.system(cmd, { text = true }, function(res)
-			if res.code ~= 0 then
-				vim.schedule(function()
-					vim.notify("bb_pr: edit comment failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				end)
-				return
-			end
-			vim.schedule(function()
-				vim.notify("bb_pr: comment #" .. tostring(cid) .. " updated", vim.log.levels.INFO)
-				vim.cmd("BBPRLoadComments")
-			end)
+		}, { fail_msg = "edit comment failed" }, function()
+			vim.notify("bb_pr: comment #" .. tostring(cid) .. " updated", vim.log.levels.INFO)
+			reload_tab_comments(source_tab)
 		end)
 	end)
 end
 
 local function convert_comment_task()
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local cid = resolve_reply_target_comment_id()
+	local cid, target, version = cursor_comment_or_warn({ version_for = "convert" })
 	if not cid then
-		vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
-		return
-	end
-	local target = find_comment_by_id(cid)
-	if type(target) ~= "table" then
-		vim.notify("bb_pr: could not find selected comment in loaded payload", vim.log.levels.WARN)
-		return
-	end
-	local version = tonumber(target.version or -1) or -1
-	if version < 0 then
-		vim.notify("bb_pr: selected comment has invalid version for convert", vim.log.levels.WARN)
 		return
 	end
 	local convert_to = target.is_task and "comment" or "task"
-	local cmd = bb_cmd({
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	run_bb({
 		"-json",
 		"-pr-convert-comment",
 		tostring(pr.id),
@@ -4532,124 +3952,106 @@ local function convert_comment_task()
 		tostring(version),
 		"-convert-to",
 		convert_to,
-	})
-	vim.system(cmd, { text = true }, function(res)
-		if res.code ~= 0 then
-			vim.schedule(function()
-				vim.notify("bb_pr: convert failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-			end)
-			return
-		end
-		vim.schedule(function()
-			vim.notify("bb_pr: converted to " .. convert_to, vim.log.levels.INFO)
-			vim.cmd("BBPRLoadComments")
-		end)
+	}, { fail_msg = "convert failed" }, function()
+		vim.notify("bb_pr: converted to " .. convert_to, vim.log.levels.INFO)
+		reload_tab_comments(source_tab)
 	end)
 end
 
+-- Opens the comment input and posts the text. force_reply replies to the comment under
+-- the cursor, otherwise the comment goes where resolve_comment_context puts it.
+-- opts.initial_text prefills the input; opts.ctx / opts.reply_to pass an already
+-- resolved context / reply target.
 local function post_comment_or_task(is_task, force_reply, opts)
 	opts = opts or {}
-	local pr = get_current_tab_pr()
-	if not pr or not pr.id then
-		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+	local pr = tab_pr_or_warn()
+	if not pr then
 		return
 	end
-	local ctx, ctx_err = resolve_comment_context(force_reply and "reply" or "auto")
-	if not ctx and not force_reply then
-		vim.notify("bb_pr: cannot create comment here: " .. (ctx_err or "unknown context"), vim.log.levels.WARN)
-		return
-	end
-
-	local function send_comment(reply_to)
-		local source_tab = vim.api.nvim_get_current_tabpage()
-		local comment_win = vim.api.nvim_get_current_win()
-		local comment_bufnr = vim.api.nvim_get_current_buf()
-		local comment_draft_key
-		if reply_to and reply_to > 0 then
-			comment_draft_key = "comment:reply:" .. tostring(reply_to)
-		elseif ctx and ctx.mode == "new_file" then
-			comment_draft_key = "comment:file:"
-				.. tostring(pr.id)
-				.. ":"
-				.. tostring(ctx.path or "")
-				.. ":"
-				.. tostring(ctx.line or 0)
-		else
-			comment_draft_key = "comment:overview:" .. tostring(pr.id)
-		end
-		local cmaps = M.config.comments
-		local submit_comment_map = cmaps.submit_comment_map or "<C-s>"
-		local submit_task_map = cmaps.submit_task_map or "<C-t>"
-		open_multiline_comment_input({
-			title = is_task and "BB PR Task" or "BB PR Comment",
-			prompt = string.format(
-				"Write multiline text. %s submit comment, %s submit task, <CR> submit %s, q cancel",
-				submit_comment_map,
-				submit_task_map,
-				is_task and "task" or "comment"
-			),
-			title_suffix = string.format(" (%s comment, %s task)", submit_comment_map, submit_task_map),
-			initial_text = opts.initial_text,
-			draft_key = comment_draft_key,
-			submit_map = submit_comment_map,
-			submit_variant = false,
-			alt_submit_map = submit_task_map,
-			alt_submit_variant = true,
-			default_submit_variant = is_task,
-		}, function(text, as_task)
-			local cmd = bb_cmd({ "-json", "-pr-comment", tostring(pr.id), "-text", text })
-			if as_task then
-				table.insert(cmd, "-task")
-			end
-			if reply_to and reply_to > 0 then
-				table.insert(cmd, "-reply-to")
-				table.insert(cmd, tostring(reply_to))
-			elseif ctx.mode == "new_file" then
-				table.insert(cmd, "-path")
-				table.insert(cmd, tostring(ctx.path or ""))
-				table.insert(cmd, "-line")
-				table.insert(cmd, tostring(ctx.line or 0))
-				table.insert(cmd, "-line-type")
-				table.insert(cmd, tostring(ctx.line_type or "CONTEXT"))
-				table.insert(cmd, "-file-type")
-				table.insert(cmd, tostring(ctx.file_type or "TO"))
-			end
-			local kind = as_task and "task" or "comment"
-			log("send_comment cmd:", cmd, "ctx=", ctx, "reply_to=", reply_to, "as_task=", as_task)
-			vim.system(cmd, { text = true }, function(res)
-				if res.code ~= 0 then
-					log("send_comment FAILED code=", res.code, "stderr=", res.stderr or "")
-					vim.schedule(function()
-						vim.notify("bb_pr: create " .. kind .. " failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-					end)
-					return
-				end
-				log("send_comment OK stdout=", res.stdout or "")
-				vim.schedule(function()
-					vim.notify("bb_pr: " .. kind .. " sent", vim.log.levels.INFO)
-					run_comments_provider(pr.id, function(payload)
-						vim.schedule(function()
-							set_tab_comments(source_tab, payload)
-							apply_comments_to_specific_tab_when_ready(source_tab, payload)
-							refresh_float_window_if_needed(comment_win, comment_bufnr)
-						end)
-					end, { notify_errors = false })
-				end)
-			end)
-		end)
-	end
-
+	local ctx, reply_to = opts.ctx, opts.reply_to
 	if force_reply then
-		local cid = resolve_reply_target_comment_id()
-		if not cid then
-			vim.notify("bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info", vim.log.levels.WARN)
+		reply_to = reply_to or resolve_reply_target_comment_id()
+		if not reply_to then
+			vim.notify(COMMENT_LINE_HINT, vim.log.levels.WARN)
 			return
 		end
-		send_comment(cid)
-		return
+	elseif not ctx then
+		local ctx_err
+		ctx, ctx_err = resolve_comment_context()
+		if not ctx then
+			vim.notify("bb_pr: cannot create comment here: " .. (ctx_err or "unknown context"), vim.log.levels.WARN)
+			return
+		end
 	end
 
-	send_comment(nil)
+	local source_tab = vim.api.nvim_get_current_tabpage()
+	local comment_win = vim.api.nvim_get_current_win()
+	local comment_bufnr = vim.api.nvim_get_current_buf()
+	local comment_draft_key
+	if reply_to then
+		comment_draft_key = "comment:reply:" .. tostring(reply_to)
+	elseif ctx.mode == "new_file" then
+		comment_draft_key = "comment:file:"
+			.. tostring(pr.id)
+			.. ":"
+			.. tostring(ctx.path or "")
+			.. ":"
+			.. tostring(ctx.line or 0)
+	else
+		comment_draft_key = "comment:overview:" .. tostring(pr.id)
+	end
+	local cmaps = M.config.comments
+	local submit_comment_map = cmaps.submit_comment_map or "<C-s>"
+	local submit_task_map = cmaps.submit_task_map or "<C-t>"
+	open_multiline_comment_input({
+		title = is_task and "BB PR Task" or "BB PR Comment",
+		prompt = string.format(
+			"Write multiline text. %s submit comment, %s submit task, <CR> submit %s, q cancel",
+			submit_comment_map,
+			submit_task_map,
+			is_task and "task" or "comment"
+		),
+		title_suffix = string.format(" (%s comment, %s task)", submit_comment_map, submit_task_map),
+		initial_text = opts.initial_text,
+		draft_key = comment_draft_key,
+		submit_map = submit_comment_map,
+		submit_variant = false,
+		alt_submit_map = submit_task_map,
+		alt_submit_variant = true,
+		default_submit_variant = is_task,
+	}, function(text, as_task)
+		local cmd = bb_cmd({ "-json", "-pr-comment", tostring(pr.id), "-text", text })
+		if as_task then
+			table.insert(cmd, "-task")
+		end
+		if reply_to then
+			vim.list_extend(cmd, { "-reply-to", tostring(reply_to) })
+		elseif ctx.mode == "new_file" then
+			vim.list_extend(cmd, {
+				"-path",
+				tostring(ctx.path or ""),
+				"-line",
+				tostring(ctx.line or 0),
+				"-line-type",
+				tostring(ctx.line_type or "CONTEXT"),
+				"-file-type",
+				tostring(ctx.file_type or "TO"),
+			})
+		end
+		local kind = as_task and "task" or "comment"
+		log("send_comment cmd:", cmd, "ctx=", ctx, "reply_to=", reply_to, "as_task=", as_task)
+		-- a failure is logged by run_bb_cmd with the exit code and stderr
+		run_bb_cmd(cmd, { fail_msg = "create " .. kind .. " failed" }, function(res)
+			log("send_comment OK stdout=", res.stdout or "")
+			vim.notify("bb_pr: " .. kind .. " sent", vim.log.levels.INFO)
+			reload_tab_comments(source_tab, {
+				win = comment_win,
+				buf = comment_bufnr,
+				refresh_info = true,
+				notify_errors = false,
+			})
+		end)
+	end)
 end
 
 local function suggestion_prefill_for_context(ctx, suggestion_line)
@@ -4660,7 +4062,7 @@ local function suggestion_prefill_for_context(ctx, suggestion_line)
 end
 
 local function create_suggestion_comment()
-	local ctx, ctx_err = resolve_comment_context("auto")
+	local ctx, ctx_err = resolve_comment_context()
 	if not ctx then
 		vim.notify("bb_pr: cannot create comment here: " .. (ctx_err or "unknown context"), vim.log.levels.WARN)
 		return
@@ -4674,138 +4076,115 @@ local function create_suggestion_comment()
 		end
 	end
 
-	local target_comment_id = resolve_reply_target_comment_id()
-	if target_comment_id then
-		post_comment_or_task(false, true, {
-			initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
-		})
-		return
-	end
-
-	post_comment_or_task(false, false, {
+	-- on a comment line of a float or PR Info the suggestion is a reply to that comment
+	local reply_to = resolve_reply_target_comment_id()
+	post_comment_or_task(false, reply_to ~= nil, {
+		ctx = ctx,
+		reply_to = reply_to,
 		initial_text = suggestion_prefill_for_context(ctx, suggestion_line),
 	})
 end
 
-local function ticket_under_cursor()
+ticket_under_cursor = function()
 	local word = vim.fn.expand("<cWORD>")
 	return word:match("[A-Z][A-Z0-9]+%-%d+")
 end
 
-local function open_jira_ticket(ticket)
-	local cmd = bb_cmd({ "-jira-ticket", ticket })
-	vim.system(cmd, { text = true }, function(res)
-		vim.schedule(function()
-			if res.code ~= 0 then
-				vim.notify("bb_pr: jira fetch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
-				return
-			end
-			local ok, issue = pcall(vim.json.decode, res.stdout)
-			if not ok or type(issue) ~= "table" then
-				vim.notify("bb_pr: invalid jira response", vim.log.levels.ERROR)
-				return
-			end
+open_jira_ticket = function(ticket)
+	run_bb({ "-jira-ticket", ticket }, {
+		json = true,
+		fail_msg = "jira fetch failed",
+		invalid_msg = "invalid jira response",
+	}, function(issue)
+		local lines = {}
+		local function push(s)
+			table.insert(lines, ((s or ""):gsub("\r", "")))
+		end
+		local function split_field(s)
+			return vim.split((s or ""):gsub("\r\n", "\n"):gsub("\r", "\n"), "\n", { plain = true })
+		end
 
-			local lines = {}
-			local function push(s)
-				table.insert(lines, ((s or ""):gsub("\r", "")))
+		push(string.format("[%s] %s", issue.key or "", issue.summary or ""))
+		push(string.rep("─", 60))
+		local function meta(label, val)
+			if type(val) == "string" and val ~= "" then
+				push(string.format("%-14s %s", label .. ":", val))
 			end
-			local function split_field(s)
-				return vim.split((s or ""):gsub("\r\n", "\n"):gsub("\r", "\n"), "\n", { plain = true })
+		end
+		meta("Type", issue.type)
+		meta("Status", issue.status)
+		meta("Priority", issue.priority)
+		meta("Assignee", issue.assignee)
+		meta("Reporter", issue.reporter)
+		meta("Epic", issue.epic_link)
+		if type(issue.fix_versions) == "table" and #issue.fix_versions > 0 then
+			meta("Fix Versions", table.concat(issue.fix_versions, ", "))
+		end
+		push(string.rep("─", 60))
+		if type(issue.description) == "string" and issue.description ~= "" then
+			for _, l in ipairs(split_field(issue.description)) do
+				push(l)
 			end
+		else
+			push("(no description)")
+		end
 
-			push(string.format("[%s] %s", issue.key or "", issue.summary or ""))
+		local comments = type(issue.comments) == "table" and issue.comments or {}
+		if #comments > 0 then
+			push("")
 			push(string.rep("─", 60))
-			local function meta(label, val)
-				if type(val) == "string" and val ~= "" then
-					push(string.format("%-14s %s", label .. ":", val))
-				end
-			end
-			meta("Type", issue.type)
-			meta("Status", issue.status)
-			meta("Priority", issue.priority)
-			meta("Assignee", issue.assignee)
-			meta("Reporter", issue.reporter)
-			meta("Epic", issue.epic_link)
-			if type(issue.fix_versions) == "table" and #issue.fix_versions > 0 then
-				meta("Fix Versions", table.concat(issue.fix_versions, ", "))
-			end
-			push(string.rep("─", 60))
-			if type(issue.description) == "string" and issue.description ~= "" then
-				for _, l in ipairs(split_field(issue.description)) do
-					push(l)
-				end
-			else
-				push("(no description)")
-			end
-
-			local comments = type(issue.comments) == "table" and issue.comments or {}
-			if #comments > 0 then
+			push(string.format("Comments (%d):", #comments))
+			for _, c in ipairs(comments) do
 				push("")
-				push(string.rep("─", 60))
-				push(string.format("Comments (%d):", #comments))
-				for _, c in ipairs(comments) do
-					push("")
-					push(string.format("  %s  •  %s", c.author or "", (c.created or ""):sub(1, 10)))
-					for _, l in ipairs(split_field(c.body or "")) do
-						push("  " .. l)
-					end
+				push(string.format("  %s  •  %s", c.author or "", (c.created or ""):sub(1, 10)))
+				for _, l in ipairs(split_field(c.body or "")) do
+					push("  " .. l)
 				end
 			end
+		end
 
-			local buf = vim.api.nvim_create_buf(false, true)
-			vim.bo[buf].buftype = "nofile"
-			vim.bo[buf].bufhidden = "wipe"
-			vim.bo[buf].swapfile = false
-			vim.bo[buf].filetype = "markdown"
-			vim.diagnostic.enable(false, { bufnr = buf })
-			vim.api.nvim_buf_set_option(buf, "modifiable", true)
-			vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-			vim.api.nvim_buf_set_option(buf, "modifiable", false)
+		local buf = create_scratch_buf("markdown")
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+		vim.bo[buf].modifiable = false
 
-			local width = math.max(70, math.floor(vim.o.columns * 0.65))
-			local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.7))
-			local win = vim.api.nvim_open_win(buf, true, {
-				relative = "editor",
-				width = width,
-				height = height,
-				row = math.floor((vim.o.lines - height) / 2),
-				col = math.floor((vim.o.columns - width) / 2),
-				style = "minimal",
-				border = "rounded",
-				title = " " .. (issue.key or ticket) .. " ",
-				title_pos = "center",
-				footer = " ? help ",
-				footer_pos = "right",
-			})
-			vim.wo[win].wrap = true
-			vim.wo[win].linebreak = true
+		local win = open_centered_float(buf, {
+			width = math.max(70, math.floor(vim.o.columns * 0.65)),
+			height = math.min(#lines + 2, math.floor(vim.o.lines * 0.7)),
+			title = " " .. (issue.key or ticket) .. " ",
+			footer = " ? help ",
+		})
+		vim.wo[win].wrap = true
+		vim.wo[win].linebreak = true
 
-			local url = issue.url or ""
-			for _, key in ipairs({ "q", "<Esc>" }) do
-				vim.keymap.set("n", key, function()
-					pcall(vim.api.nvim_win_close, win, true)
-				end, { buffer = buf, silent = true })
-			end
-			if M.config.jira.open_url_map and M.config.jira.open_url_map ~= "" and url ~= "" then
-				vim.keymap.set("n", M.config.jira.open_url_map, function()
+		local function close()
+			pcall(vim.api.nvim_win_close, win, true)
+		end
+		local url = issue.url or ""
+		bind_keymaps(buf, {
+			{ "q", close, help = false },
+			{ "<Esc>", close, help = false },
+			{
+				url ~= "" and M.config.jira.open_url_map or nil,
+				function()
 					vim.fn.jobstart({ "xdg-open", url }, { detach = true })
-				end, { buffer = buf, silent = true, desc = "Open Jira ticket in browser" })
-			end
-
-			vim.keymap.set("n", "?", function()
-				local entries = {}
-				if M.config.jira.open_url_map and M.config.jira.open_url_map ~= "" and url ~= "" then
-					table.insert(entries, { M.config.jira.open_url_map, "Open in browser" })
-				end
-				table.insert(entries, { "q / <Esc>", "Close" })
-				open_help_float(entries, "Jira — Keymaps")
-			end, { buffer = buf, desc = "Show keymap help", silent = true })
-		end)
+				end,
+				desc = "Open Jira ticket in browser",
+				help = "Open in browser",
+			},
+			{ "q / <Esc>", nil, help = "Close" },
+		}, "Jira — Keymaps")
 	end)
 end
 
-local function open_attachment_at_cursor()
+-- Repository slug and project key of `pr`, each from its target ref, else its source ref
+local function pr_repo_context(pr)
+	local slug = vim.tbl_get(pr, "toRef", "repository", "slug") or vim.tbl_get(pr, "fromRef", "repository", "slug")
+	local project = vim.tbl_get(pr, "toRef", "repository", "project", "key")
+		or vim.tbl_get(pr, "fromRef", "repository", "project", "key")
+	return slug, project
+end
+
+open_attachment_at_cursor = function()
 	local line = vim.api.nvim_get_current_line()
 	local _, attach_y = line:match("!%[.-%]%(attachment:(%d+)/(%d+)%)")
 	if not attach_y then
@@ -4828,15 +4207,10 @@ local function open_attachment_at_cursor()
 		return
 	end
 
-	local self_href = (pr.links and pr.links.self and pr.links.self[1] and pr.links.self[1].href) or ""
+	local self_href = vim.tbl_get(pr, "links", "self", 1, "href") or ""
 	local base_url = self_href:match("^(https?://[^/]+)") or ""
-	local project = (
-		pr.toRef
-		and pr.toRef.repository
-		and pr.toRef.repository.project
-		and pr.toRef.repository.project.key
-	) or ""
-	local repo = (pr.toRef and pr.toRef.repository and pr.toRef.repository.slug) or ""
+	local repo, project = pr_repo_context(pr)
+	repo, project = repo or "", project or ""
 	if base_url == "" or project == "" or repo == "" then
 		vim.notify("bb_pr: cannot determine PR context", vim.log.levels.WARN)
 		return
@@ -4872,10 +4246,7 @@ local function stats_detect_context()
 	-- Try current tab PR first (most reliable — already fetched from Bitbucket).
 	local pr = get_current_tab_pr()
 	if pr then
-		local repo_slug = vim.tbl_get(pr, "toRef", "repository", "slug")
-			or vim.tbl_get(pr, "fromRef", "repository", "slug")
-		local proj_key = vim.tbl_get(pr, "toRef", "repository", "project", "key")
-			or vim.tbl_get(pr, "fromRef", "repository", "project", "key")
+		local repo_slug, proj_key = pr_repo_context(pr)
 		if repo_slug then
 			return repo_slug, proj_key or ""
 		end
@@ -4904,12 +4275,13 @@ end
 
 function M.show_stats(opts)
 	opts = opts or {}
-	local repos = opts.repos or M.config.stats.repos or ""
-	local project = opts.project or M.config.stats.project or ""
-	local since_days = opts.since_days or M.config.stats.since_days or 30
-	local concurrency = opts.concurrency or M.config.stats.concurrency or 10
-	local top = opts.top or M.config.stats.top or 20
-	local ignore_users = opts.ignore_users or M.config.stats.ignore_users or ""
+	local cfg = M.config.stats
+	local repos = opts.repos or cfg.repos
+	local project = opts.project or cfg.project
+	local since_days = opts.since_days or cfg.since_days
+	local concurrency = opts.concurrency or cfg.concurrency
+	local top = opts.top or cfg.top
+	local ignore_users = opts.ignore_users or cfg.ignore_users
 
 	-- Auto-detect repo/project from current context when not explicitly configured.
 	if repos == "" or project == "" then
@@ -4933,18 +4305,15 @@ function M.show_stats(opts)
 	end
 
 	if not opts._period_selected then
-		local default_days = tostring(M.config.stats.since_days or 30)
+		local default_days = tostring(cfg.since_days)
 		local period_choices = { "7", "14", "30", "60", "90", "180", "365", "0" }
-		-- Bubble the configured default to the top so pickers pre-select it.
-		table.sort(period_choices, function(a, b)
-			if a == default_days then
-				return true
+		-- Move the configured default to the top so pickers pre-select it.
+		for i, choice in ipairs(period_choices) do
+			if choice == default_days then
+				table.insert(period_choices, 1, table.remove(period_choices, i))
+				break
 			end
-			if b == default_days then
-				return false
-			end
-			return false
-		end)
+		end
 		vim.ui.select(period_choices, {
 			prompt = "Period:",
 			format_item = function(item)
@@ -4984,8 +4353,7 @@ function M.show_stats(opts)
 		vim.list_extend(cmd, { "-ignore-users", ignore_users })
 	end
 
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].buftype = "nofile"
+	local buf = create_scratch_buf()
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
 		"",
 		"  Fetching PR stats…",
@@ -4995,23 +4363,12 @@ function M.show_stats(opts)
 		string.format("  cmd:     %s", table.concat(cmd, " ")),
 	})
 
-	local width = math.min(vim.o.columns - 4, 120)
-	local height = math.min(vim.o.lines - 4, 50)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
+	open_centered_float(buf, {
+		width = math.min(vim.o.columns - 4, 120),
+		height = math.min(vim.o.lines - 4, 50),
 		title = " BB PR Stats ",
-		title_pos = "center",
 	})
-	_ = win
-
-	vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
-	vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { buffer = buf, silent = true })
+	bind_keymaps(buf, { { "q", "<cmd>close<CR>" }, { "<Esc>", "<cmd>close<CR>" } })
 
 	vim.system(cmd, { text = true }, function(res)
 		vim.schedule(function()
@@ -5051,7 +4408,12 @@ function M.show_stats(opts)
 
 			local ns = vim.api.nvim_create_namespace("bb_pr_stats")
 			for _, h in ipairs(highlights) do
-				pcall(vim.api.nvim_buf_add_highlight, buf, ns, h.group, h.line, h.col_start, h.col_end)
+				-- strict = false: a highlight may end past its (multibyte) line
+				pcall(vim.api.nvim_buf_set_extmark, buf, ns, h.line, h.col_start, {
+					end_col = h.col_end,
+					hl_group = h.group,
+					strict = false,
+				})
 			end
 
 			vim.bo[buf].modifiable = false
@@ -5074,29 +4436,18 @@ open_help_float = function(entries, title)
 		content_width = math.max(content_width, vim.fn.strdisplaywidth(line))
 		table.insert(lines, line)
 	end
-	local width = math.max(50, math.min(content_width + 2, math.floor(vim.o.columns * 0.8)))
-	local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.8))
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
+	local buf = create_scratch_buf()
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = math.floor((vim.o.lines - height) / 2),
-		col = math.floor((vim.o.columns - width) / 2),
-		style = "minimal",
-		border = "rounded",
+	local win = open_centered_float(buf, {
+		width = math.max(50, math.min(content_width + 2, math.floor(vim.o.columns * 0.8))),
+		height = math.min(#lines + 2, math.floor(vim.o.lines * 0.8)),
 		title = " " .. title .. " ",
-		title_pos = "center",
 	})
-	for _, key in ipairs({ "q", "<Esc>", "?" }) do
-		vim.keymap.set("n", key, function()
-			pcall(vim.api.nvim_win_close, win, true)
-		end, { buffer = buf, silent = true })
+	local function close()
+		pcall(vim.api.nvim_win_close, win, true)
 	end
+	bind_keymaps(buf, { { "q", close }, { "<Esc>", close }, { "?", close } })
 end
 
 set_diff_buffer_keymaps = function(bufnr)
@@ -5105,88 +4456,102 @@ set_diff_buffer_keymaps = function(bufnr)
 	end
 	vim.b[bufnr].bb_pr_diff_keymaps_set = true
 
-	local cfg = M.config
+	local cmaps = M.config.comments
 	local buf = bufnr
 
-	local function gmap(base, cmd, desc)
-		if base and base ~= "" then
-			vim.keymap.set("n", "g" .. base, cmd, { buffer = buf, desc = desc, silent = true })
-		end
+	-- "g" .. key, nil when the key is unset
+	local function g(key)
+		return (key and key ~= "") and ("g" .. key) or nil
 	end
 
-	-- gc: open the comments float, or start a new comment when the line has none
-	vim.keymap.set("n", "gc", function()
-		local line = vim.api.nvim_win_get_cursor(0)[1]
-		local comments = get_buf_line_comments(buf)[line]
-		if comments and #comments > 0 then
-			open_comment_float(comments, line)
-		else
-			post_comment_or_task(false, false)
-		end
-	end, { buffer = buf, desc = "Open PR comments for current line or create one", silent = true })
-
-	-- comment creation keys: diff buffer prefixes base key with "g"
-	-- (reply/react/delete/edit/resolve/toggle_task/accept_suggestion require cursor on
-	-- a comment line — only work in float/overview, not in the diff buffer)
-	gmap(cfg.comments.create_task_map, "<cmd>BBPRCreateTask<CR>", "Create task")
-	gmap(cfg.comments.create_suggestion_map, "<cmd>BBPRCreateSuggestion<CR>", "Create suggestion")
-
-	-- diff-only utility keys: used as-is, no g prefix
-	if cfg.comments.next_map and cfg.comments.next_map ~= "" then
-		vim.keymap.set("n", cfg.comments.next_map, function()
-			jump_comment(1)
-		end, { buffer = buf, desc = "Jump to next PR comment", silent = true })
-	end
-	if cfg.comments.prev_map and cfg.comments.prev_map ~= "" then
-		vim.keymap.set("n", cfg.comments.prev_map, function()
+	bind_keymaps(buf, {
+		-- open the comments float, or start a new comment when the line has none
+		{
+			"gc",
+			function()
+				local line = vim.api.nvim_win_get_cursor(0)[1]
+				local comments = get_buf_line_comments(buf)[line]
+				if comments and #comments > 0 then
+					open_comment_float(comments, line)
+				else
+					post_comment_or_task(false, false)
+				end
+			end,
+			desc = "Open PR comments for current line or create one",
+			help = "Open line comments / create comment",
+		},
+		-- diff-only utility keys: used as-is, no g prefix
+		{ cmaps.prev_map, function()
 			jump_comment(-1)
-		end, { buffer = buf, desc = "Jump to previous PR comment", silent = true })
-	end
-	if cfg.comments.refresh_map and cfg.comments.refresh_map ~= "" then
-		vim.keymap.set(
-			"n",
-			cfg.comments.refresh_map,
+		end, desc = "Jump to previous PR comment", help = "Previous comment" },
+		{ cmaps.next_map, function()
+			jump_comment(1)
+		end, desc = "Jump to next PR comment", help = "Next comment" },
+		-- comment creation keys: the diff buffer prefixes the float key with "g"
+		-- (reply/react/delete/edit/resolve/toggle_task/accept_suggestion need the cursor
+		-- on a comment line, so they only work in the float / PR Info)
+		{ g(cmaps.create_task_map), "<cmd>BBPRCreateTask<CR>", desc = "Create task" },
+		{ g(cmaps.create_suggestion_map), "<cmd>BBPRCreateSuggestion<CR>", desc = "Create suggestion" },
+		{
+			cmaps.refresh_map,
 			"<cmd>BBPRRefreshComments<CR>",
-			{ buffer = buf, desc = "Force refresh PR comments", silent = true }
-		)
-	end
-
-	vim.keymap.set("n", "?", function()
-		local c = M.config
-		local function e(base, desc)
-			return (base and base ~= "") and { "g" .. base, desc } or nil
-		end
-		local function ed(key, desc)
-			return (key and key ~= "") and { key, desc } or nil
-		end
-		local entries = {}
-		for _, v in ipairs({
-			{ "gc", "Open line comments / create comment" },
-			ed(c.comments.prev_map, "Previous comment"),
-			ed(c.comments.next_map, "Next comment"),
-			e(c.comments.create_task_map, "Create task"),
-			e(c.comments.create_suggestion_map, "Create suggestion"),
-			ed(c.comments.refresh_map, "Refresh comments"),
-		}) do
-			if v then
-				table.insert(entries, v)
-			end
-		end
-		open_help_float(entries, "PR Diff — Keymaps")
-	end, { buffer = buf, desc = "Show keymap help", silent = true })
+			desc = "Force refresh PR comments",
+			help = "Refresh comments",
+		},
+	}, "PR Diff — Keymaps")
 end
 
 function M.setup(opts)
 	merge_config(opts)
+	normalize_reaction_choices()
 	load_reaction_recency_state()
 	load_drafts()
 
 	vim.api.nvim_set_hl(0, "BbPrResolvedThread", { default = true, underline = true, sp = "Gray" })
 	vim.api.nvim_set_hl(0, "BbPrResolvedVirtText", { default = true, link = "Comment" })
 
-	vim.api.nvim_create_user_command("BBPRList", function()
-		M.open_list()
-	end, { desc = "List active Bitbucket PRs" })
+	-- commands that just run a function; the wrapper keeps the command opts away from it
+	local commands = {
+		{ "BBPRList", function()
+			M.open_list()
+		end, "List active Bitbucket PRs" },
+		{ "BBPRLoadComments", function()
+			reload_tab_comments(vim.api.nvim_get_current_tabpage())
+		end, "Load PR comments and render virtual text in current buffer" },
+		{ "BBPRCreateComment", function()
+			post_comment_or_task(false, false)
+		end, "Create or reply PR comment from cursor context" },
+		{ "BBPRCreateTask", function()
+			post_comment_or_task(true, false)
+		end, "Create or reply PR task from cursor context" },
+		{ "BBPRCreateSuggestion", create_suggestion_comment, "Create PR comment with prefilled suggestion block" },
+		{ "BBPRAcceptSuggestion", accept_suggestion, "Apply suggestion from comment under cursor to current file" },
+		{ "BBPRReplyComment", function()
+			post_comment_or_task(false, true)
+		end, "Reply to current PR comment" },
+		{ "BBPRRefreshComments", function()
+			reload_tab_comments(vim.api.nvim_get_current_tabpage())
+		end, "Force refresh PR comments from server" },
+		{ "BBPRToggleTask", toggle_task_status, "Toggle PR task done/open for comment under cursor" },
+		{ "BBPRResolveComment", resolve_comment, "Resolve/unresolve PR comment thread under cursor" },
+		{ "BBPRConvertTask", convert_comment_task, "Convert PR comment to task or back under cursor" },
+		{ "BBPRReactComment", react_to_comment, "Add reaction to comment under cursor" },
+		{ "BBPRReactionUsers", show_reaction_users, "Show who reacted with the reaction under cursor" },
+		{ "BBPRDeleteComment", delete_comment, "Delete PR comment under cursor" },
+		{ "BBPREditComment", edit_comment, "Edit PR comment under cursor" },
+		{ "BBPRCreatePR", create_pr, "Create pull request from current branch" },
+		{ "BBPRMerge", merge_current_pr, "Merge pull request opened in current tab" },
+		{ "BBPRClose", close_current_pr, "Close open PR tabs and roll back a conflicted merge" },
+		{ "BBPRStats", function()
+			M.show_stats()
+		end, "Show PR statistics in a floating window" },
+	}
+	for _, command in ipairs(commands) do
+		local fn = command[2]
+		vim.api.nvim_create_user_command(command[1], function()
+			fn()
+		end, { desc = command[3] })
+	end
 
 	vim.api.nvim_create_user_command("BBPRInfo", function()
 		local pr = get_current_tab_pr()
@@ -5197,31 +4562,6 @@ function M.setup(opts)
 
 		open_pr_info_with_comments(pr)
 	end, { desc = "Show info for PR opened in current tab" })
-
-	vim.api.nvim_create_user_command("BBPRLoadComments", function()
-		local pr = get_current_tab_pr()
-		if not pr or not pr.id then
-			vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
-			return
-		end
-
-		run_comments_provider(pr.id, function(payload)
-			vim.schedule(function()
-				set_current_tab_comments(payload)
-				apply_comments_when_diffview_ready(payload)
-				local cur_win = vim.api.nvim_get_current_win()
-				local cur_buf = vim.api.nvim_get_current_buf()
-				vim.defer_fn(function()
-					refresh_float_window_if_needed(cur_win, cur_buf)
-				end, 150)
-				local bufnr = vim.api.nvim_get_current_buf()
-				local info_pr = vim.b[bufnr].bb_pr_info_pr
-				if type(info_pr) == "table" and tonumber(info_pr.id or 0) == tonumber(pr.id or 0) then
-					apply_pr_info_content(bufnr, info_pr)
-				end
-			end)
-		end)
-	end, { desc = "Load PR comments and render virtual text in current buffer" })
 
 	vim.api.nvim_create_user_command("BBPROpenLineComments", function()
 		local bufnr = vim.api.nvim_get_current_buf()
@@ -5234,95 +4574,29 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
-	vim.api.nvim_create_user_command("BBPRCreateComment", function()
-		post_comment_or_task(false, false)
-	end, { desc = "Create or reply PR comment from cursor context" })
-
-	vim.api.nvim_create_user_command("BBPRCreateTask", function()
-		post_comment_or_task(true, false)
-	end, { desc = "Create or reply PR task from cursor context" })
-
-	vim.api.nvim_create_user_command("BBPRCreateSuggestion", function()
-		create_suggestion_comment()
-	end, { desc = "Create PR comment with prefilled suggestion block" })
-
-	vim.api.nvim_create_user_command("BBPRAcceptSuggestion", function()
-		accept_suggestion()
-	end, { desc = "Apply suggestion from comment under cursor to current file" })
-
-	vim.api.nvim_create_user_command("BBPRReplyComment", function()
-		post_comment_or_task(false, true)
-	end, { desc = "Reply to current PR comment" })
-
-	vim.api.nvim_create_user_command("BBPRRefreshComments", function()
-		vim.cmd("BBPRLoadComments")
-	end, { desc = "Force refresh PR comments from server" })
-
-	vim.api.nvim_create_user_command("BBPRToggleTask", function()
-		toggle_task_status()
-	end, { desc = "Toggle PR task done/open for comment under cursor" })
-
-	vim.api.nvim_create_user_command("BBPRResolveComment", function()
-		resolve_comment()
-	end, { desc = "Resolve/unresolve PR comment thread under cursor" })
-
-	vim.api.nvim_create_user_command("BBPRConvertTask", function()
-		convert_comment_task()
-	end, { desc = "Convert PR comment to task or back under cursor" })
-
-	vim.api.nvim_create_user_command("BBPRReactComment", function()
-		react_to_comment()
-	end, { desc = "Add reaction to comment under cursor" })
-	vim.api.nvim_create_user_command("BBPRReactionUsers", function()
-		show_reaction_users()
-	end, { desc = "Show who reacted with the reaction under cursor" })
-	vim.api.nvim_create_user_command("BBPRDeleteComment", function()
-		delete_comment()
-	end, { desc = "Delete PR comment under cursor" })
-	vim.api.nvim_create_user_command("BBPREditComment", function()
-		edit_comment()
-	end, { desc = "Edit PR comment under cursor" })
-
-	vim.api.nvim_create_user_command("BBPRCreatePR", function()
-		create_pr()
-	end, { desc = "Create pull request from current branch" })
-	vim.api.nvim_create_user_command("BBPRMerge", function()
-		merge_current_pr()
-	end, { desc = "Merge pull request opened in current tab" })
-	vim.api.nvim_create_user_command("BBPRClose", function()
-		close_current_pr()
-	end, { desc = "Close open PR tabs and roll back a conflicted merge" })
-
-	if M.config.pr.create_map and M.config.pr.create_map ~= "" then
-		vim.keymap.set("n", M.config.pr.create_map, "<cmd>BBPRCreatePR<CR>", { desc = "Create PR", silent = true })
-	end
-	if M.config.pr.merge_map and M.config.pr.merge_map ~= "" then
-		vim.keymap.set("n", M.config.pr.merge_map, "<cmd>BBPRMerge<CR>", { desc = "Merge PR", silent = true })
-	end
-	if M.config.pr.close_map and M.config.pr.close_map ~= "" then
-		vim.keymap.set("n", M.config.pr.close_map, "<cmd>BBPRClose<CR>", { desc = "Close PR", silent = true })
-	end
-	vim.api.nvim_create_user_command("BBPRStats", function()
-		M.show_stats()
-	end, { desc = "Show PR statistics in a floating window" })
-
-	if M.config.stats.map and M.config.stats.map ~= "" then
-		vim.keymap.set("n", M.config.stats.map, "<cmd>BBPRStats<CR>", { desc = "BB PR Stats", silent = true })
-	end
+	bind_keymaps(nil, {
+		{ M.config.pr.create_map, "<cmd>BBPRCreatePR<CR>", desc = "Create PR" },
+		{ M.config.pr.merge_map, "<cmd>BBPRMerge<CR>", desc = "Merge PR" },
+		{ M.config.pr.close_map, "<cmd>BBPRClose<CR>", desc = "Close PR" },
+		{ M.config.stats.map, "<cmd>BBPRStats<CR>", desc = "BB PR Stats" },
+	})
 
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
 		group = aug,
 		callback = function()
+			local tabpage = vim.api.nvim_get_current_tabpage()
 			local pending_payload = consume_pending_tab_comments()
 			if pending_payload then
-				apply_comments_when_diffview_ready(pending_payload)
+				apply_comments_when_diffview_ready(tabpage, pending_payload)
 				return
 			end
 
 			local payload = get_current_tab_comments()
 			if payload then
-				apply_comments_to_tab_windows(payload)
+				-- cheap when nothing changed: apply_comments_to_current_buffer and the
+				-- panel indicators skip buffers whose render inputs are unchanged
+				apply_comments_to_tab(tabpage, payload)
 			end
 		end,
 	})
@@ -5330,6 +4604,10 @@ function M.setup(opts)
 		group = aug,
 		callback = function(ev)
 			state.line_comments_by_buf[ev.buf] = nil
+			state.buf_hunks_cache[ev.buf] = nil
+			state.rendered_by_buf[ev.buf] = nil
+			state.panel_rendered_by_buf[ev.buf] = nil
+			state.comment_view_by_buf[ev.buf] = nil
 		end,
 	})
 end

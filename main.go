@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -16,12 +18,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -64,13 +66,14 @@ type Client struct {
 	cfg        RuntimeConfig
 }
 
-type PRPage struct {
-	Size          int           `json:"size"`
-	Limit         int           `json:"limit"`
-	IsLastPage    bool          `json:"isLastPage"`
-	Start         int           `json:"start"`
-	NextPageStart int           `json:"nextPageStart"`
-	Values        []PullRequest `json:"values"`
+// Page is one page of a Bitbucket paged collection.
+type Page[T any] struct {
+	Size          int  `json:"size"`
+	Limit         int  `json:"limit"`
+	IsLastPage    bool `json:"isLastPage"`
+	Start         int  `json:"start"`
+	NextPageStart int  `json:"nextPageStart"`
+	Values        []T  `json:"values"`
 }
 
 type PullRequest struct {
@@ -126,12 +129,6 @@ type BuildStatus struct {
 	DateAdded   int64  `json:"dateAdded"`
 }
 
-type BuildStatusPage struct {
-	Size       int           `json:"size"`
-	IsLastPage bool          `json:"isLastPage"`
-	Values     []BuildStatus `json:"values"`
-}
-
 // BuildSummary is the aggregated build status of a PR's latest commit.
 type BuildSummary struct {
 	Commit  string         `json:"commit"`
@@ -166,15 +163,6 @@ type Reaction struct {
 	Users    []User   `json:"users"`
 }
 
-type CommentPage struct {
-	Size          int         `json:"size"`
-	Limit         int         `json:"limit"`
-	IsLastPage    bool        `json:"isLastPage"`
-	Start         int         `json:"start"`
-	NextPageStart int         `json:"nextPageStart"`
-	Values        []PRComment `json:"values"`
-}
-
 type PRComment struct {
 	ID             int64       `json:"id"`
 	Text           string      `json:"text"`
@@ -205,6 +193,11 @@ func (a *Anchor) UnmarshalJSON(data []byte) error {
 	var direct alias
 	if err := json.Unmarshal(data, &direct); err == nil {
 		*a = Anchor(direct)
+		// Every field is set, so none of the fallbacks below could apply (and
+		// data is a valid object, so the raw decode could not fail either).
+		if a.Path != "" && a.Line != 0 && a.LineType != "" && a.FileType != "" && a.DiffType != "" {
+			return nil
+		}
 	}
 
 	var raw map[string]any
@@ -213,78 +206,43 @@ func (a *Anchor) UnmarshalJSON(data []byte) error {
 	}
 
 	if a.Path == "" {
-		a.Path = pickString(raw, "path", "srcPath", "file", "filePath")
-		if a.Path == "" {
-			if p := pickNestedString(raw, "path", "toString"); p != "" {
-				a.Path = p
-			}
-		}
+		a.Path = cmp.Or(
+			pickString(raw, "path", "srcPath", "file", "filePath"),
+			pickNestedString(raw, "path", "toString"),
+		)
 	}
 	if a.Line == 0 {
 		a.Line = pickInt(raw, "line", "lineNumber", "line_num", "fromLine", "toLine")
 	}
-	if a.LineType == "" {
-		a.LineType = pickString(raw, "lineType")
-	}
-	if a.FileType == "" {
-		a.FileType = pickString(raw, "fileType")
-	}
-	if a.DiffType == "" {
-		a.DiffType = pickString(raw, "diffType")
-	}
+	a.LineType = cmp.Or(a.LineType, pickString(raw, "lineType"))
+	a.FileType = cmp.Or(a.FileType, pickString(raw, "fileType"))
+	a.DiffType = cmp.Or(a.DiffType, pickString(raw, "diffType"))
 
 	return nil
 }
 
 func pickString(raw map[string]any, keys ...string) string {
 	for _, k := range keys {
-		if v, ok := raw[k]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s
-			}
+		if s, ok := raw[k].(string); ok && s != "" {
+			return s
 		}
 	}
 	return ""
 }
 
 func pickNestedString(raw map[string]any, k1, k2 string) string {
-	v, ok := raw[k1]
-	if !ok {
-		return ""
-	}
-	m, ok := v.(map[string]any)
-	if !ok {
-		return ""
-	}
+	m, _ := raw[k1].(map[string]any)
 	s, _ := m[k2].(string)
 	return s
 }
 
 func pickInt(raw map[string]any, keys ...string) int {
 	for _, k := range keys {
-		if v, ok := raw[k]; ok {
-			switch n := v.(type) {
-			case float64:
-				if int(n) != 0 {
-					return int(n)
-				}
-			case int:
-				if n != 0 {
-					return n
-				}
-			}
+		if n, ok := raw[k].(float64); ok && int(n) != 0 {
+			return int(n)
 		}
 	}
 	return 0
-}
-
-type ActivityPage struct {
-	Size          int        `json:"size"`
-	Limit         int        `json:"limit"`
-	IsLastPage    bool       `json:"isLastPage"`
-	Start         int        `json:"start"`
-	NextPageStart int        `json:"nextPageStart"`
-	Values        []Activity `json:"values"`
 }
 
 type Properties struct {
@@ -305,7 +263,8 @@ type reviewStatusUpdateRequest struct {
 }
 
 type taskStateUpdateRequest struct {
-	State string `json:"state"`
+	State   string `json:"state"`
+	Version int    `json:"version"`
 }
 
 type selfUser struct {
@@ -369,13 +328,6 @@ type BranchRef struct {
 	DisplayID string `json:"displayId"`
 }
 
-type BranchPage struct {
-	Values        []BranchRef `json:"values"`
-	IsLastPage    bool        `json:"isLastPage"`
-	NextPageStart int         `json:"nextPageStart"`
-	Size          int         `json:"size"`
-}
-
 type CreatePullRequestRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
@@ -404,19 +356,6 @@ type PRCommit struct {
 	Message    string `json:"message"`
 	Author     User   `json:"author"`
 	AuthorTime int64  `json:"authorTimestamp"`
-}
-
-type PRCommitPage struct {
-	Values        []PRCommit `json:"values"`
-	IsLastPage    bool       `json:"isLastPage"`
-	NextPageStart int        `json:"nextPageStart"`
-}
-
-type CommitPage struct {
-	Values        []PRCommit `json:"values"`
-	IsLastPage    bool       `json:"isLastPage"`
-	NextPageStart int        `json:"nextPageStart"`
-	Size          int        `json:"size"`
 }
 
 type PullRequestMergeability struct {
@@ -451,11 +390,7 @@ type JiraComment struct {
 // padRight pads s with spaces to the given display width, measured in runes so
 // multi-byte names (e.g. Cyrillic) align correctly.
 func padRight(s string, width int) string {
-	n := len([]rune(s))
-	if n >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-n)
+	return s + strings.Repeat(" ", max(0, width-utf8.RuneCountInString(s)))
 }
 
 // buildMarker renders an aggregated build state as a single short glyph.
@@ -499,15 +434,9 @@ func runDashboardCommand(args []string) error {
 	path := fmt.Sprintf("/rest/api/latest/dashboard/pull-requests?role=REVIEWER&state=%s&limit=%d",
 		url.QueryEscape(*stateFilter), *limitFlag)
 	b, err := client.doJSON(ctx, http.MethodGet, path, nil)
+	page, err := decodeJSON[Page[PullRequest]](b, err, "dashboard response")
 	if err != nil {
 		return fmt.Errorf("fetch dashboard PRs: %w", err)
-	}
-
-	var page struct {
-		Values []PullRequest `json:"values"`
-	}
-	if err := json.Unmarshal(b, &page); err != nil {
-		return fmt.Errorf("decode dashboard response: %w", err)
 	}
 	if len(page.Values) == 0 {
 		fmt.Fprintln(os.Stderr, "no reviewer PRs found")
@@ -531,54 +460,30 @@ func runDashboardCommand(args []string) error {
 			prURL = pr.Links.Self[0].Href
 		}
 		repo := pr.ToRef.Repository
-		repoLabel := repo.Project.Key + "/" + repo.Slug
-
-		ageStr := "-"
-		if t := msToTime(pr.CreatedDate); !t.IsZero() {
-			ageStr = humanAge(now.Sub(t))
-		}
-		lcomStr := "-"
-		if t := msToTime(pr.UpdatedDate); !t.IsZero() {
-			lcomStr = humanAge(now.Sub(t))
-		}
-
-		rows = append(rows, dashRow{
-			url: prURL,
-			cells: []string{
-				buildMarker(pr.BuildStatus),
-				ageStr,
-				lcomStr,
-				strconv.Itoa(pr.CommentCount),
-				needsWorkStatus(pr.Reviewers),
-				strconv.Itoa(countApprovals(pr.Reviewers)),
-				myApprovalMarker(pr, cfg),
-				repoLabel,
-				displayUser(pr.Author.User),
-				sanitizeCell(pr.Title),
-			},
-		})
+		cells := []string{buildMarker(pr.BuildStatus)}
+		cells = append(cells, prStatusCells(pr, now)...)
+		cells = append(cells, repo.Project.Key+"/"+repo.Slug, displayUser(pr.Author.User), sanitizeCell(pr.Title))
+		rows = append(rows, dashRow{url: prURL, cells: cells})
 	}
 
 	// column widths (rune-aware); the last column (TITLE) is never padded
 	widths := make([]int, len(headers))
 	for i, h := range headers {
-		widths[i] = len([]rune(h))
+		widths[i] = utf8.RuneCountInString(h)
 	}
 	for _, r := range rows {
 		for i, c := range r.cells {
-			if w := len([]rune(c)); w > widths[i] {
-				widths[i] = w
-			}
+			widths[i] = max(widths[i], utf8.RuneCountInString(c))
 		}
 	}
 
 	formatCells := func(cells []string) string {
-		var parts []string
+		parts := make([]string, len(cells))
 		for i, c := range cells {
 			if i == len(cells)-1 {
-				parts = append(parts, c)
+				parts[i] = c
 			} else {
-				parts = append(parts, padRight(c, widths[i]))
+				parts[i] = padRight(c, widths[i])
 			}
 		}
 		return strings.Join(parts, "  ")
@@ -612,25 +517,12 @@ func runDashboardCommand(args []string) error {
 	if selected == "" {
 		return nil
 	}
-	parts := strings.SplitN(selected, "\t", 2)
-	prURL := strings.TrimSpace(parts[0])
+	prURL, _, _ := strings.Cut(selected, "\t")
+	prURL = strings.TrimSpace(prURL)
 	if prURL == "" {
 		return fmt.Errorf("could not extract PR URL from selection")
 	}
-
-	self, err := os.Executable()
-	if err != nil {
-		self = "bb"
-	}
-	openArgs := []string{"open", prURL}
-	if *configPath != defaultConfigPath() {
-		openArgs = append(openArgs, "-config", *configPath)
-	}
-	openCmd := exec.Command(self, openArgs...)
-	openCmd.Stdin = os.Stdin
-	openCmd.Stdout = os.Stdout
-	openCmd.Stderr = os.Stderr
-	return openCmd.Run()
+	return openPRURL(cfg, prURL)
 }
 
 func main() {
@@ -653,7 +545,9 @@ func main() {
 		return
 	}
 
-	reviewersEnabled := flag.Bool("reviewers", false, "enable reviewer-derived columns (NW/APPR)")
+	// Reviewer columns are always shown; -reviewers is still accepted because
+	// the Neovim plugin passes it.
+	_ = flag.Bool("reviewers", false, "no-op, kept for compatibility (reviewer columns are always shown)")
 	buildsEnabled := flag.Bool("builds", false, "enrich PR list with aggregated build status (Jenkins)")
 	jsonEnabled := flag.Bool("json", false, "print pull requests as JSON")
 	noDraft := flag.Bool("no-draft", false, "hide draft pull requests (title contains [DRAFT])")
@@ -751,15 +645,7 @@ func main() {
 	}
 
 	if *jiraTicket != "" {
-		issue, err := GetJiraIssue(ctx, cfg, strings.TrimSpace(*jiraTicket))
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(issue); err != nil {
-			fatal(err)
-		}
+		printJSON(GetJiraIssue(ctx, cfg, strings.TrimSpace(*jiraTicket)))
 		return
 	}
 
@@ -786,16 +672,7 @@ func main() {
 			}
 		}
 
-		created, err := client.CreatePullRequestComment(ctx, *prCommentID, req)
-		if err != nil {
-			fatal(err)
-		}
-
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(created); err != nil {
-			fatal(err)
-		}
+		printJSON(client.CreatePullRequestComment(ctx, *prCommentID, req))
 		return
 	}
 
@@ -822,15 +699,7 @@ func main() {
 		if *updateCommentVersion < 0 {
 			fatal(errors.New("-update-comment-version is required with -pr-update-comment"))
 		}
-		updated, err := client.UpdatePullRequestComment(ctx, *prUpdateCommentID, commentID, *updateCommentVersion, *commentText)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(updated); err != nil {
-			fatal(err)
-		}
+		printJSON(client.UpdatePullRequestComment(ctx, *prUpdateCommentID, commentID, *updateCommentVersion, *commentText))
 		return
 	}
 
@@ -846,28 +715,12 @@ func main() {
 		if to == "" {
 			fatal(errors.New("-convert-to is required with -pr-convert-comment (task|comment)"))
 		}
-		updated, err := client.SetPullRequestCommentSeverity(ctx, *prConvertCommentID, commentID, *convertCommentVersion, to)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(updated); err != nil {
-			fatal(err)
-		}
+		printJSON(client.SetPullRequestCommentSeverity(ctx, *prConvertCommentID, commentID, *convertCommentVersion, to))
 		return
 	}
 
 	if *targetBranches {
-		branches, err := client.GetRepoBranches(ctx)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(branches); err != nil {
-			fatal(err)
-		}
+		printJSON(client.GetRepoBranches(ctx))
 		return
 	}
 
@@ -878,15 +731,7 @@ func main() {
 		if title == "" || source == "" || target == "" {
 			fatal(errors.New("-pr-title, -pr-source and -pr-target are required with -pr-create"))
 		}
-		created, err := client.CreatePullRequest(ctx, title, strings.TrimSpace(*prBody), source, target)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(created); err != nil {
-			fatal(err)
-		}
+		printJSON(client.CreatePullRequest(ctx, title, strings.TrimSpace(*prBody), source, target))
 		return
 	}
 
@@ -899,40 +744,17 @@ func main() {
 			}
 			version = cur.Version
 		}
-		updated, err := client.UpdatePullRequest(ctx, *prUpdateID, version, strings.TrimSpace(*prTitle), strings.TrimSpace(*prBody))
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(updated); err != nil {
-			fatal(err)
-		}
+		printJSON(client.UpdatePullRequest(ctx, *prUpdateID, version, strings.TrimSpace(*prTitle), strings.TrimSpace(*prBody)))
 		return
 	}
+
 	if *prCommitsID > 0 {
-		commits, err := client.GetPullRequestCommits(ctx, *prCommitsID)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(commits); err != nil {
-			fatal(err)
-		}
+		printJSON(client.GetPullRequestCommits(ctx, *prCommitsID))
 		return
 	}
 
 	if *prBuildsID > 0 {
-		summary, err := client.GetPullRequestBuildSummary(ctx, *prBuildsID)
-		if err != nil {
-			fatal(err)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(summary); err != nil {
-			fatal(err)
-		}
+		printJSON(client.GetPullRequestBuildSummary(ctx, *prBuildsID))
 		return
 	}
 
@@ -988,10 +810,7 @@ func main() {
 		if *resolveCommentVersion < 0 {
 			fatal(errors.New("-resolve-comment-version is required with -pr-resolve-comment"))
 		}
-		action := strings.ToLower(strings.TrimSpace(*resolveAction))
-		if action == "" {
-			action = "resolve"
-		}
+		action := cmp.Or(strings.ToLower(strings.TrimSpace(*resolveAction)), "resolve")
 		if err := client.ResolveComment(ctx, *prResolveCommentID, commentID, *resolveCommentVersion, action); err != nil {
 			fatal(err)
 		}
@@ -1012,18 +831,7 @@ func main() {
 	}
 
 	if *prCommentsID > 0 {
-		comments, err := client.GetPullRequestComments(ctx, *prCommentsID)
-		if err != nil {
-			fatal(err)
-		}
-
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(comments); err != nil {
-			fatal(err)
-		}
-
+		printJSON(client.GetPullRequestComments(ctx, *prCommentsID))
 		return
 	}
 
@@ -1045,22 +853,20 @@ func main() {
 		// Keep the bucket-based ordering for JSON consumers: the Neovim plugin's
 		// PR picker and selection rely on this order.
 		sortPullRequests(prs, cfg)
-
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(prs); err != nil {
-			fatal(err)
-		}
-
+		printJSON(prs, nil)
 		return
 	}
 
 	// Plain `bb` table: list every PR ordered purely by how long it has been
 	// open ("hanging time", longest first), independent of author/review buckets.
 	sortPullRequestsByOpenAge(prs)
-	printTable(prs, cfg, *reviewersEnabled)
+	printTable(prs)
 }
+
+var (
+	prURLPathRe = regexp.MustCompile(`/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)`)
+	gitRemoteRe = regexp.MustCompile(`(?:/|:)(?:scm/)?([^/]+)/([^/]+)$`)
+)
 
 type openTarget struct {
 	Project   string
@@ -1079,13 +885,16 @@ func runOpenCommand(args []string) error {
 	if len(rest) < 1 {
 		return errors.New("usage: bb open <url> [-config path]")
 	}
-	rawURL := rest[0]
-
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		return err
 	}
+	return openPRURL(cfg, rest[0])
+}
 
+// openPRURL opens the PR behind a Bitbucket URL in the nvim instance already
+// running in the repo's folder, or in a new terminal when there is none.
+func openPRURL(cfg RuntimeConfig, rawURL string) error {
 	target, err := parseBitbucketPRURL(rawURL)
 	if err != nil {
 		return err
@@ -1135,8 +944,7 @@ func parseBitbucketPRURL(raw string) (*openTarget, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
-	re := regexp.MustCompile(`/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)`)
-	m := re.FindStringSubmatch(u.Path)
+	m := prURLPathRe.FindStringSubmatch(u.Path)
 	if m == nil {
 		return nil, fmt.Errorf("not a Bitbucket PR URL: %s", raw)
 	}
@@ -1236,44 +1044,44 @@ func findNvimSocketForFolder(folder string) string {
 		}
 	}
 
-	for _, sock := range sockets {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, err := exec.CommandContext(ctx, "nvim", "--server", sock, "--remote-expr", "getcwd()").Output()
-		cancel()
-		if err != nil {
-			continue
-		}
-		cwd := strings.TrimSpace(string(out))
-		if cwd == "" {
-			continue
-		}
-		if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
-			cwd = resolved
-		}
-		if filepath.Clean(cwd) == target {
-			return sock
-		}
+	// Probe all sockets at once (each probe may take up to its timeout) but
+	// still prefer the first matching socket in discovery order.
+	matches := make([]bool, len(sockets))
+	var wg sync.WaitGroup
+	for i, sock := range sockets {
+		wg.Go(func() { matches[i] = nvimCwdIs(sock, target) })
+	}
+	wg.Wait()
+	if i := slices.Index(matches, true); i >= 0 {
+		return sockets[i]
 	}
 	return ""
 }
 
+// nvimCwdIs reports whether the nvim listening on sock has dir as its cwd.
+func nvimCwdIs(sock, dir string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nvim", "--server", sock, "--remote-expr", "getcwd()").Output()
+	if err != nil {
+		return false
+	}
+	cwd := strings.TrimSpace(string(out))
+	if cwd == "" {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = resolved
+	}
+	return filepath.Clean(cwd) == dir
+}
+
 func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string, forceAutodetect bool) RuntimeConfig {
-	if projectOverride != "" {
-		cfg.Project = projectOverride
-	}
-	if repoOverride != "" {
-		cfg.Repo = repoOverride
-	}
 	if forceAutodetect {
-		cfg.Project = ""
-		cfg.Repo = ""
-		if projectOverride != "" {
-			cfg.Project = projectOverride
-		}
-		if repoOverride != "" {
-			cfg.Repo = repoOverride
-		}
+		cfg.Project, cfg.Repo = "", ""
 	}
+	cfg.Project = cmp.Or(projectOverride, cfg.Project)
+	cfg.Repo = cmp.Or(repoOverride, cfg.Repo)
 	if cfg.Project != "" && cfg.Repo != "" {
 		return cfg
 	}
@@ -1281,12 +1089,8 @@ func applyRepoSelection(cfg RuntimeConfig, projectOverride, repoOverride string,
 	if err != nil {
 		return cfg
 	}
-	if cfg.Project == "" {
-		cfg.Project = project
-	}
-	if cfg.Repo == "" {
-		cfg.Repo = repo
-	}
+	cfg.Project = cmp.Or(cfg.Project, project)
+	cfg.Repo = cmp.Or(cfg.Repo, repo)
 	return cfg
 }
 
@@ -1313,8 +1117,7 @@ func detectProjectRepoFromGitRemote() (project, repo string, err error) {
 }
 
 func gitRemoteURL() (string, error) {
-	candidates := []string{"origin", "upstream"}
-	for _, name := range candidates {
+	for _, name := range []string{"origin", "upstream"} {
 		out, err := exec.Command("git", "remote", "get-url", name).Output()
 		if err != nil {
 			continue
@@ -1331,8 +1134,7 @@ func parseProjectRepoFromRemote(remote string) (string, string) {
 	clean := strings.TrimSpace(remote)
 	clean = strings.TrimSuffix(clean, ".git")
 	clean = strings.ReplaceAll(clean, "\\", "/")
-	re := regexp.MustCompile(`(?:/|:)(?:scm/)?([^/]+)/([^/]+)$`)
-	match := re.FindStringSubmatch(clean)
+	match := gitRemoteRe.FindStringSubmatch(clean)
 	if len(match) != 3 {
 		return "", ""
 	}
@@ -1399,21 +1201,10 @@ func (cfg *Config) normalize() {
 }
 
 func (cfg *Config) applyDefaults() {
-	if cfg.Auth == "" {
-		cfg.Auth = "none"
-	}
-
-	if cfg.State == "" {
-		cfg.State = "OPEN"
-	}
-
-	if cfg.Limit == 0 {
-		cfg.Limit = 100
-	}
-
-	if cfg.Timeout == "" {
-		cfg.Timeout = "60s"
-	}
+	cfg.Auth = cmp.Or(cfg.Auth, "none")
+	cfg.State = cmp.Or(cfg.State, "OPEN")
+	cfg.Limit = cmp.Or(cfg.Limit, 100)
+	cfg.Timeout = cmp.Or(cfg.Timeout, "60s")
 }
 
 func validateConfig(cfg RuntimeConfig) error {
@@ -1483,128 +1274,148 @@ func NewClient(cfg RuntimeConfig) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error) {
-	var all []PullRequest
+const (
+	restAPIPrefix      = "/rest/api/latest"
+	commentLikesPrefix = "/rest/comment-likes/1.0"
+)
+
+// projectRepoPath returns prefix + "/projects/{project}/repos/{repo}" with
+// both keys path-escaped, followed by the formatted suffix.
+func projectRepoPath(prefix, project, repo, format string, args ...any) string {
+	return prefix + "/projects/" + url.PathEscape(project) + "/repos/" + url.PathEscape(repo) + fmt.Sprintf(format, args...)
+}
+
+// repoPath returns a REST API path under the configured project/repo.
+func (c *Client) repoPath(format string, args ...any) string {
+	return projectRepoPath(restAPIPrefix, c.cfg.Project, c.cfg.Repo, format, args...)
+}
+
+// likesPath returns a comment-likes plugin path under the configured project/repo.
+func (c *Client) likesPath(format string, args ...any) string {
+	return projectRepoPath(commentLikesPrefix, c.cfg.Project, c.cfg.Repo, format, args...)
+}
+
+// decodeJSON decodes a doJSON response body; it passes a request error through.
+func decodeJSON[T any](b []byte, err error, what string) (*T, error) {
+	if err != nil {
+		return nil, err
+	}
+	var out T
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", what, err)
+	}
+	return &out, nil
+}
+
+var errPaginationStuck = errors.New("pagination stuck")
+
+// paginate GETs every page of the paged collection at path (query holds the
+// fixed parameters; start is managed here) and calls visit for each value in
+// order until visit returns false or the last page is reached. It fails with
+// errPaginationStuck when the server reports no way to advance.
+func paginate[T any](ctx context.Context, c *Client, path string, query url.Values, visit func(T) bool) error {
 	start := 0
-
 	for {
-		page, err := c.fetchRepoPRPage(ctx, start)
+		query.Set("start", strconv.Itoa(start))
+		b, err := c.doJSON(ctx, http.MethodGet, path+"?"+query.Encode(), nil)
+		page, err := decodeJSON[Page[T]](b, err, path+" page")
 		if err != nil {
-			return nil, err
+			return err
 		}
-
-		all = append(all, page.Values...)
-
-		if page.IsLastPage {
-			break
-		}
-
-		next := page.NextPageStart
-		if next <= start {
-			if page.Size > 0 {
-				next = start + page.Size
-			} else {
-				return nil, fmt.Errorf(
-					"pagination stuck: start=%d nextPageStart=%d size=%d",
-					start,
-					page.NextPageStart,
-					page.Size,
-				)
+		for _, v := range page.Values {
+			if !visit(v) {
+				return nil
 			}
 		}
-
+		if page.IsLastPage {
+			return nil
+		}
+		next := page.NextPageStart
+		if next <= start {
+			if page.Size <= 0 {
+				return fmt.Errorf("%w: %s start=%d nextPageStart=%d size=%d", errPaginationStuck, path, start, page.NextPageStart, page.Size)
+			}
+			next = start + page.Size
+		}
 		start = next
 	}
+}
 
+// collectPages returns every value of a paged collection (see paginate).
+func collectPages[T any](ctx context.Context, c *Client, path string, query url.Values) ([]T, error) {
+	var all []T
+	err := paginate(ctx, c, path, query, func(v T) bool {
+		all = append(all, v)
+		return true
+	})
+	return all, err
+}
+
+func (c *Client) GetRepoPullRequests(ctx context.Context) ([]PullRequest, error) {
+	query := url.Values{
+		"state": {c.cfg.State},
+		"order": {"NEWEST"},
+		"limit": {strconv.Itoa(c.cfg.Limit)},
+	}
+	if c.cfg.At != "" {
+		query.Set("at", c.cfg.At)
+	}
+	all, err := collectPages[PullRequest](ctx, c, c.repoPath("/pull-requests"), query)
+	if err != nil {
+		return nil, err
+	}
 	return all, nil
 }
 
 func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullRequestComments, error) {
+	// Resolve the current user (for my_reactions) while the activities page in.
+	// Buffered so the goroutine never blocks if we return early on error.
+	selfCh := make(chan selfUser, 1)
+	go func() {
+		self, _ := c.getCurrentUser(ctx)
+		selfCh <- self
+	}()
+
+	// The same comment can appear in several activities (COMMENTED, RESOLVED,
+	// UNRESOLVED). Keep one entry per id, in first-seen order, holding the most
+	// recently updated copy so threadResolved reflects the current state.
 	var all []FlatComment
-	var activities []Activity
-	start := 0
-	self, _ := c.getCurrentUser(ctx)
-
-	for {
-		page, err := c.fetchPullRequestActivityPage(ctx, prID, start)
-		if err != nil {
-			return nil, err
+	indexByID := map[int64]int{}
+	query := url.Values{"limit": {strconv.Itoa(c.cfg.Limit)}}
+	err := paginate(ctx, c, c.repoPath("/pull-requests/%d/activities", prID), query, func(activity Activity) bool {
+		root := activity.Comment
+		if root == nil {
+			return true
 		}
-
-		activities = append(activities, page.Values...)
-		for _, activity := range page.Values {
-			root := extractActivityComment(activity)
-			if root != nil {
-				if root.Anchor == nil {
-					root.Anchor = root.CommentAnchor
-				}
-				if root.Anchor == nil {
-					root.Anchor = activity.Anchor
-				}
-				if root.Anchor == nil {
-					root.Anchor = activity.CommentAnchor
-				}
-				outdated := false
-				if root.Anchor != nil && root.Anchor.DiffType != "" && root.Anchor.DiffType != "EFFECTIVE" {
-					outdated = true
-				}
-				flat := flattenCommentTree(*root, 0, 0)
-				if outdated {
-					for i := range flat {
-						flat[i].IsOutdated = true
-					}
-				}
-				all = append(all, flat...)
+		root.Anchor = cmp.Or(root.Anchor, root.CommentAnchor, activity.Anchor, activity.CommentAnchor)
+		outdated := root.Anchor != nil && root.Anchor.DiffType != "" && root.Anchor.DiffType != "EFFECTIVE"
+		for _, item := range flattenCommentTree(*root, 0, 0) {
+			item.IsOutdated = outdated
+			cid := item.Comment.ID
+			if cid <= 0 {
+				all = append(all, item)
+				continue
 			}
-		}
-
-		if page.IsLastPage {
-			break
-		}
-
-		next := page.NextPageStart
-		if next <= start {
-			if page.Size > 0 {
-				next = start + page.Size
-			} else {
-				return nil, fmt.Errorf("comment pagination stuck: pr=%d start=%d next=%d size=%d", prID, start, page.NextPageStart, page.Size)
+			if idx, ok := indexByID[cid]; ok {
+				if item.Comment.UpdatedDate > all[idx].Comment.UpdatedDate {
+					all[idx] = item
+				}
+				continue
 			}
+			indexByID[cid] = len(all)
+			all = append(all, item)
 		}
-		start = next
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Deduplicate: same comment can appear in multiple activities (COMMENTED, RESOLVED, UNRESOLVED).
-	// Keep the most recently updated version so threadResolved reflects actual current state.
-	seenByID := map[int64]int{}
-	var deduped []FlatComment
-	for _, item := range all {
-		cid := item.Comment.ID
-		if cid <= 0 {
-			deduped = append(deduped, item)
-			continue
-		}
-		if idx, ok := seenByID[cid]; ok {
-			if item.Comment.UpdatedDate > deduped[idx].Comment.UpdatedDate {
-				deduped[idx] = item
-			}
-		} else {
-			seenByID[cid] = len(deduped)
-			deduped = append(deduped, item)
-		}
-	}
-	all = deduped
+	self := <-selfCh
 
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, item := range all {
 		cmt := item.Comment
-		anchor := cmt.Anchor
-		if anchor == nil {
-			anchor = cmt.CommentAnchor
-		}
-
-		commentReactions := extractReactionCounts(cmt.Properties.Reactions)
-		myReactions := extractMyReactions(cmt.Properties.Reactions, self)
-		reactionUsers := extractReactionUsers(cmt.Properties.Reactions)
+		reactions, reactionUsers, myReactions := summarizeReactions(cmt.Properties.Reactions, self)
 
 		view := PRCommentView{
 			ID:            cmt.ID,
@@ -1616,28 +1427,22 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			CreatedAt:     msToTime(cmt.CreatedDate).Format(time.RFC3339),
 			UpdatedDate:   cmt.UpdatedDate,
 			UpdatedAt:     msToTime(cmt.UpdatedDate).Format(time.RFC3339),
-			Reactions:     commentReactions,
+			Reactions:     reactions,
 			MyReactions:   myReactions,
 			ReactionUsers: reactionUsers,
+			IsResolved:    cmt.ThreadResolved,
+			IsOutdated:    item.IsOutdated,
 			Version:       cmt.Version,
 		}
-		severity := strings.ToUpper(strings.TrimSpace(cmt.Severity))
-		if severity == "BLOCKER" {
+		if strings.ToUpper(strings.TrimSpace(cmt.Severity)) == "BLOCKER" {
 			view.IsTask = true
+			view.TaskStatus = "OPEN"
 			if strings.EqualFold(strings.TrimSpace(cmt.State), "RESOLVED") {
 				view.TaskStatus = "DONE"
-			} else {
-				view.TaskStatus = "OPEN"
 			}
 		}
-		if cmt.ThreadResolved {
-			view.IsResolved = true
-		}
-		if item.IsOutdated {
-			view.IsOutdated = true
-		}
 
-		if anchor != nil {
+		if anchor := cmp.Or(cmt.Anchor, cmt.CommentAnchor); anchor != nil {
 			view.IsFileComment = true
 			view.Path = anchor.Path
 			view.Line = anchor.Line
@@ -1654,49 +1459,11 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 	return out, nil
 }
 
-func extractReactionCounts(reactions []Reaction) map[string]int {
-	result := map[string]int{}
-	for _, reaction := range reactions {
-		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
-		if key == "" {
-			continue
-		}
-		count := len(reaction.Users)
-		result[key] += count
-	}
-
-	return result
-}
-
-func extractReactionUsers(reactions []Reaction) map[string][]string {
-	result := map[string][]string{}
-	for _, reaction := range reactions {
-		key := strings.ToUpper(strings.TrimSpace(reaction.Emoticon.Shortcut))
-		if key == "" {
-			continue
-		}
-		seen := map[string]bool{}
-		for _, name := range result[key] {
-			seen[name] = true
-		}
-		for _, u := range reaction.Users {
-			name := displayUser(u)
-			if name == "" || seen[name] {
-				continue
-			}
-			seen[name] = true
-			result[key] = append(result[key], name)
-		}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-
-	return result
-}
-
-func extractMyReactions(reactions []Reaction, self selfUser) map[string]bool {
-	result := map[string]bool{}
+// summarizeReactions groups reactions by upper-cased shortcut: the number of
+// users per reaction, the de-duplicated display names that reacted, and which
+// reactions are self's. The name and self maps are nil when empty.
+func summarizeReactions(reactions []Reaction, self selfUser) (counts map[string]int, users map[string][]string, mine map[string]bool) {
+	counts = map[string]int{}
 	selfName := strings.TrimSpace(self.Name)
 	selfSlug := strings.TrimSpace(self.Slug)
 	for _, reaction := range reactions {
@@ -1704,43 +1471,24 @@ func extractMyReactions(reactions []Reaction, self selfUser) map[string]bool {
 		if key == "" {
 			continue
 		}
+		counts[key] += len(reaction.Users)
 		for _, u := range reaction.Users {
-			if (selfName != "" && strings.EqualFold(strings.TrimSpace(u.Name), selfName)) || (selfSlug != "" && strings.EqualFold(strings.TrimSpace(u.Slug), selfSlug)) {
-				result[key] = true
-				break
+			if (selfName != "" && strings.EqualFold(strings.TrimSpace(u.Name), selfName)) ||
+				(selfSlug != "" && strings.EqualFold(strings.TrimSpace(u.Slug), selfSlug)) {
+				if mine == nil {
+					mine = map[string]bool{}
+				}
+				mine[key] = true
+			}
+			if name := displayUser(u); name != "" && !slices.Contains(users[key], name) {
+				if users == nil {
+					users = map[string][]string{}
+				}
+				users[key] = append(users[key], name)
 			}
 		}
 	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
-
-func mergeReactionCounts(dst map[string]int, src map[string]int) map[string]int {
-	if dst == nil {
-		dst = map[string]int{}
-	}
-	for k, v := range src {
-		if v > 0 {
-			dst[k] += v
-		}
-	}
-	if len(dst) == 0 {
-		return nil
-	}
-	return dst
-}
-
-func extractActivityReaction(activity Activity) (int64, string) {
-	if activity.Comment == nil || activity.Comment.ID <= 0 {
-		return 0, ""
-	}
-	reactions := extractReactionCounts(activity.Comment.Properties.Reactions)
-	for key := range reactions {
-		return activity.Comment.ID, key
-	}
-	return 0, ""
+	return counts, users, mine
 }
 
 func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment {
@@ -1755,200 +1503,22 @@ func flattenCommentTree(root PRComment, parentID int64, depth int) []FlatComment
 	return out
 }
 
-func extractActivityComment(activity Activity) *PRComment {
-	if activity.Comment != nil {
-		return activity.Comment
-	}
-	return nil
-}
-
 func (c *Client) CreatePullRequestComment(ctx context.Context, prID int64, payload CreateCommentRequest) (*PRComment, error) {
-	u := *c.baseURL
-	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
-		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments",
-		url.PathEscape(c.cfg.Project),
-		url.PathEscape(c.cfg.Repo),
-		prID,
-	))
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal create comment payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(string(body)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	c.setAuth(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", u.Redacted(), err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
-		return nil, fmt.Errorf("BitBucket returned %s: %s", resp.Status, strings.TrimSpace(string(rb)))
-	}
-
-	var out PRComment
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode Bitbucket create comment response: %w", err)
-	}
-	return &out, nil
+	b, err := c.doJSON(ctx, http.MethodPost, c.repoPath("/pull-requests/%d/comments", prID), payload)
+	return decodeJSON[PRComment](b, err, "create comment response")
 }
 
 func (c *Client) DeletePullRequestComment(ctx context.Context, prID int64, commentID int64, version int) error {
-	u := *c.baseURL
-	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
-		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
-		url.PathEscape(c.cfg.Project),
-		url.PathEscape(c.cfg.Repo),
-		prID,
-		commentID,
-	))
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	q := req.URL.Query()
-	q.Set("version", strconv.Itoa(version))
-	req.URL.RawQuery = q.Encode()
-	c.setAuth(req)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("DELETE %s: %w", u.Redacted(), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
-		return fmt.Errorf("BitBucket returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	return nil
-}
-
-func (c *Client) fetchPullRequestActivityPage(ctx context.Context, prID int64, start int) (*ActivityPage, error) {
-	u := *c.baseURL
-	u.Path = joinURLPath(c.baseURL.Path, fmt.Sprintf(
-		"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/activities",
-		url.PathEscape(c.cfg.Project),
-		url.PathEscape(c.cfg.Repo),
-		prID,
-	))
-
-	q := u.Query()
-	q.Set("limit", fmt.Sprintf("%d", c.cfg.Limit))
-	q.Set("start", fmt.Sprintf("%d", start))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Accept", "application/json")
-	c.setAuth(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", u.Redacted(), err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
-
-		return nil, fmt.Errorf(
-			"BitBucket returned %s: %s",
-			resp.Status,
-			strings.TrimSpace(string(body)),
-		)
-	}
-
-	var page ActivityPage
-	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-		return nil, fmt.Errorf("decode Bitbucket activities response: %w", err)
-	}
-
-	return &page, nil
-}
-
-func (c *Client) fetchRepoPRPage(ctx context.Context, start int) (*PRPage, error) {
-	u := *c.baseURL
-
-	u.Path = joinURLPath(
-		c.baseURL.Path,
-		fmt.Sprintf(
-			"/rest/api/latest/projects/%s/repos/%s/pull-requests",
-			url.PathEscape(c.cfg.Project),
-			url.PathEscape(c.cfg.Repo),
-		),
-	)
-
-	q := u.Query()
-	q.Set("state", c.cfg.State)
-	q.Set("order", "NEWEST")
-	q.Set("limit", fmt.Sprintf("%d", c.cfg.Limit))
-	q.Set("start", fmt.Sprintf("%d", start))
-
-	if c.cfg.At != "" {
-		q.Set("at", c.cfg.At)
-	}
-
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Accept", "application/json")
-	c.setAuth(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", u.Redacted(), err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
-
-		return nil, fmt.Errorf(
-			"BitBucket returned %s: %s",
-			resp.Status,
-			strings.TrimSpace(string(body)),
-		)
-	}
-
-	var page PRPage
-	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-		return nil, fmt.Errorf("decode Bitbucket response: %w", err)
-	}
-
-	return &page, nil
+	_, err := c.doJSON(ctx, http.MethodDelete, c.repoPath("/pull-requests/%d/comments/%d?version=%d", prID, commentID, version), nil)
+	return err
 }
 
 func (c *Client) setAuth(req *http.Request) {
 	switch c.cfg.Auth {
 	case "bearer":
 		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
-
 	case "basic":
-		secret := c.cfg.Password
-		if secret == "" {
-			secret = c.cfg.Token
-		}
-
-		req.SetBasicAuth(c.cfg.User, secret)
-
-	case "none":
-		return
+		req.SetBasicAuth(c.cfg.User, cmp.Or(c.cfg.Password, c.cfg.Token))
 	}
 }
 
@@ -1960,46 +1530,32 @@ func (c *Client) SetPullRequestCommentReaction(ctx context.Context, prID int64, 
 	if shortcut == "+1" {
 		shortcut = "THUMBS_UP"
 	}
-	reactionPath := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/reactions/%s",
-		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID, url.PathEscape(shortcut))
-	likesPath := fmt.Sprintf("/rest/comment-likes/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d/likes",
-		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
 
-	try := func(method, path string) error {
-		_, err := c.doJSON(ctx, method, path, nil)
-		return err
-	}
+	var method, likesMethod string
 	switch action {
 	case "", "add":
-		if err := try(http.MethodPut, reactionPath); err == nil {
-			return nil
-		}
-		if shortcut == "THUMBS_UP" || shortcut == "LIKE" {
-			return try(http.MethodPost, likesPath)
-		}
-		return try(http.MethodPut, reactionPath)
+		method, likesMethod = http.MethodPut, http.MethodPost
 	case "remove", "delete":
-		if err := try(http.MethodDelete, reactionPath); err == nil {
-			return nil
-		}
-		if shortcut == "THUMBS_UP" || shortcut == "LIKE" {
-			return try(http.MethodDelete, likesPath)
-		}
-		return try(http.MethodDelete, reactionPath)
+		method, likesMethod = http.MethodDelete, http.MethodDelete
 	default:
 		return fmt.Errorf("bad -reaction-action %q; expected add|remove", action)
 	}
+
+	_, err := c.doJSON(ctx, method, c.likesPath("/pull-requests/%d/comments/%d/reactions/%s", prID, commentID, url.PathEscape(shortcut)), nil)
+	// Older servers only know likes; fall back for the thumbs-up shortcut.
+	// (shortcut is lower-cased above, so only "+1" can reach THUMBS_UP here.)
+	if err == nil || (shortcut != "THUMBS_UP" && shortcut != "LIKE") {
+		return err
+	}
+	_, err = c.doJSON(ctx, likesMethod, c.likesPath("/pull-requests/%d/comments/%d/likes", prID, commentID), nil)
+	return err
 }
 
 func (c *Client) GetRepoBranches(ctx context.Context) ([]BranchRef, error) {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/branches?limit=1000", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo))
-	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	b, err := c.doJSON(ctx, http.MethodGet, c.repoPath("/branches?limit=1000"), nil)
+	page, err := decodeJSON[Page[BranchRef]](b, err, "branches response")
 	if err != nil {
 		return nil, err
-	}
-	var page BranchPage
-	if err := json.Unmarshal(b, &page); err != nil {
-		return nil, fmt.Errorf("decode branches response: %w", err)
 	}
 	return page.Values, nil
 }
@@ -2010,16 +1566,8 @@ func (c *Client) UpdatePullRequest(ctx context.Context, prID int64, version int,
 		Title       string `json:"title,omitempty"`
 		Description string `json:"description"`
 	}{Version: version, Title: title, Description: description}
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
-	b, err := c.doJSON(ctx, http.MethodPut, path, req)
-	if err != nil {
-		return nil, err
-	}
-	var out PullRequest
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode update PR response: %w", err)
-	}
-	return &out, nil
+	b, err := c.doJSON(ctx, http.MethodPut, c.repoPath("/pull-requests/%d", prID), req)
+	return decodeJSON[PullRequest](b, err, "update PR response")
 }
 
 func (c *Client) CreatePullRequest(ctx context.Context, title, description, sourceBranch, targetBranch string) (*PullRequest, error) {
@@ -2028,55 +1576,31 @@ func (c *Client) CreatePullRequest(ctx context.Context, title, description, sour
 	req.Description = description
 	req.FromRef.ID = "refs/heads/" + strings.TrimPrefix(sourceBranch, "refs/heads/")
 	req.ToRef.ID = "refs/heads/" + strings.TrimPrefix(targetBranch, "refs/heads/")
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo))
-	b, err := c.doJSON(ctx, http.MethodPost, path, req)
-	if err != nil {
-		return nil, err
-	}
-	var out PullRequest
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode create PR response: %w", err)
-	}
-	return &out, nil
+	b, err := c.doJSON(ctx, http.MethodPost, c.repoPath("/pull-requests"), req)
+	return decodeJSON[PullRequest](b, err, "create PR response")
 }
 
 func (c *Client) GetPullRequestCommits(ctx context.Context, prID int64) ([]PRCommit, error) {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/commits?limit=1000", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
-	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	b, err := c.doJSON(ctx, http.MethodGet, c.repoPath("/pull-requests/%d/commits?limit=1000", prID), nil)
+	page, err := decodeJSON[Page[PRCommit]](b, err, "PR commits response")
 	if err != nil {
 		return nil, err
-	}
-	var page PRCommitPage
-	if err := json.Unmarshal(b, &page); err != nil {
-		return nil, fmt.Errorf("decode PR commits response: %w", err)
 	}
 	return page.Values, nil
 }
 
 func (c *Client) GetPullRequest(ctx context.Context, prID int64) (*PullRequest, error) {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
-	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	var out PullRequest
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode PR response: %w", err)
-	}
-	return &out, nil
+	b, err := c.doJSON(ctx, http.MethodGet, c.repoPath("/pull-requests/%d", prID), nil)
+	return decodeJSON[PullRequest](b, err, "PR response")
 }
 
 // GetCommitBuildStatuses returns the build statuses (e.g. Jenkins) attached to a
 // commit via Bitbucket's build-status API.
 func (c *Client) GetCommitBuildStatuses(ctx context.Context, commitID string) ([]BuildStatus, error) {
-	path := fmt.Sprintf("/rest/build-status/1.0/commits/%s", url.PathEscape(commitID))
-	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	b, err := c.doJSON(ctx, http.MethodGet, "/rest/build-status/1.0/commits/"+url.PathEscape(commitID), nil)
+	page, err := decodeJSON[Page[BuildStatus]](b, err, "build statuses")
 	if err != nil {
 		return nil, err
-	}
-	var page BuildStatusPage
-	if err := json.Unmarshal(b, &page); err != nil {
-		return nil, fmt.Errorf("decode build statuses: %w", err)
 	}
 	return page.Values, nil
 }
@@ -2140,22 +1664,34 @@ func aggregateBuildState(builds []BuildStatus) string {
 	}
 }
 
+// isPermissionErr reports whether a Bitbucket error looks like missing rights.
+func isPermissionErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "401") || strings.Contains(msg, "not permitted")
+}
+
 func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body string) error {
-	mergeability, err := c.GetPullRequestMergeability(ctx, prID)
-	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "401") || strings.Contains(strings.ToLower(err.Error()), "not permitted") {
-			return fmt.Errorf("merge precheck failed: no permission to merge this PR in Bitbucket (need REPO_WRITE and merge rights): %w", err)
+	var (
+		mergeability *PullRequestMergeability
+		pr           *PullRequest
+		mergeErr     error
+		prErr        error
+		wg           sync.WaitGroup
+	)
+	wg.Go(func() { mergeability, mergeErr = c.GetPullRequestMergeability(ctx, prID) })
+	wg.Go(func() { pr, prErr = c.GetPullRequest(ctx, prID) })
+	wg.Wait()
+
+	if mergeErr != nil {
+		if isPermissionErr(mergeErr) {
+			return fmt.Errorf("merge precheck failed: no permission to merge this PR in Bitbucket (need REPO_WRITE and merge rights): %w", mergeErr)
 		}
-		return err
+		return mergeErr
 	}
 	if !mergeability.CanMerge {
 		var reasons []string
 		for _, veto := range mergeability.Vetoes {
-			msg := strings.TrimSpace(veto.Summary)
-			if msg == "" {
-				msg = strings.TrimSpace(veto.Detailed)
-			}
-			if msg != "" {
+			if msg := cmp.Or(strings.TrimSpace(veto.Summary), strings.TrimSpace(veto.Detailed)); msg != "" {
 				reasons = append(reasons, msg)
 			}
 		}
@@ -2164,14 +1700,12 @@ func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body s
 		}
 		return fmt.Errorf("pull request is not mergeable: %s", strings.Join(reasons, "; "))
 	}
-
-	pr, err := c.GetPullRequest(ctx, prID)
-	if err != nil {
-		return err
+	if prErr != nil {
+		return prErr
 	}
+
 	message := strings.TrimSpace(title)
-	body = strings.TrimSpace(body)
-	if body != "" {
+	if body = strings.TrimSpace(body); body != "" {
 		message += "\n\n" + body
 	}
 	req := MergePullRequestRequest{
@@ -2183,25 +1717,21 @@ func (c *Client) MergePullRequest(ctx context.Context, prID int64, title, body s
 		AutoMergeBranch:    false,
 		TransitionToMerged: true,
 	}
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/merge", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
-	_, err = c.doJSON(ctx, http.MethodPost, path, req)
-	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "401") || strings.Contains(strings.ToLower(err.Error()), "not permitted")) {
+	_, err := c.doJSON(ctx, http.MethodPost, c.repoPath("/pull-requests/%d/merge", prID), req)
+	if err != nil && isPermissionErr(err) {
 		return fmt.Errorf("merge denied by Bitbucket permissions (need REPO_WRITE + merge rights for target branch): %w", err)
 	}
 	return err
 }
 
 func (c *Client) GetPullRequestMergeability(ctx context.Context, prID int64) (*PullRequestMergeability, error) {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/merge", url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID)
-	b, err := c.doJSON(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	var out PullRequestMergeability
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode mergeability response: %w", err)
-	}
-	return &out, nil
+	b, err := c.doJSON(ctx, http.MethodGet, c.repoPath("/pull-requests/%d/merge", prID), nil)
+	return decodeJSON[PullRequestMergeability](b, err, "mergeability response")
+}
+
+// putComment PUTs a partial comment update (body must carry the version).
+func (c *Client) putComment(ctx context.Context, prID, commentID int64, body any) ([]byte, error) {
+	return c.doJSON(ctx, http.MethodPut, c.repoPath("/pull-requests/%d/comments/%d", prID, commentID), body)
 }
 
 func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID int64, state string, version int) error {
@@ -2214,13 +1744,7 @@ func (c *Client) SetPullRequestTaskState(ctx context.Context, prID int64, taskID
 	default:
 		return fmt.Errorf("bad -task-state %q; expected open|done", state)
 	}
-
-	path := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d", c.cfg.Project, c.cfg.Repo, prID, taskID)
-	body := struct {
-		State   string `json:"state"`
-		Version int    `json:"version"`
-	}{State: normalized, Version: version}
-	_, err := c.doJSON(ctx, http.MethodPut, path, body)
+	_, err := c.putComment(ctx, prID, taskID, taskStateUpdateRequest{State: normalized, Version: version})
 	return err
 }
 
@@ -2236,39 +1760,21 @@ func (c *Client) SetPullRequestCommentSeverity(ctx context.Context, prID int64, 
 	default:
 		return nil, fmt.Errorf("bad -convert-to %q; expected task|comment", target)
 	}
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
-		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
 	body := struct {
 		Version  int    `json:"version"`
 		Severity string `json:"severity"`
 	}{Version: version, Severity: severity}
-	b, err := c.doJSON(ctx, http.MethodPut, path, body)
-	if err != nil {
-		return nil, err
-	}
-	var out PRComment
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode convert comment response: %w", err)
-	}
-	return &out, nil
+	b, err := c.putComment(ctx, prID, commentID, body)
+	return decodeJSON[PRComment](b, err, "convert comment response")
 }
 
 func (c *Client) UpdatePullRequestComment(ctx context.Context, prID int64, commentID int64, version int, text string) (*PRComment, error) {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
-		url.PathEscape(c.cfg.Project), url.PathEscape(c.cfg.Repo), prID, commentID)
 	body := struct {
 		Version int    `json:"version"`
 		Text    string `json:"text"`
 	}{Version: version, Text: text}
-	b, err := c.doJSON(ctx, http.MethodPut, path, body)
-	if err != nil {
-		return nil, err
-	}
-	var out PRComment
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("decode update comment response: %w", err)
-	}
-	return &out, nil
+	b, err := c.putComment(ctx, prID, commentID, body)
+	return decodeJSON[PRComment](b, err, "update comment response")
 }
 
 func (c *Client) ResolveComment(ctx context.Context, prID int64, commentID int64, version int, action string) error {
@@ -2281,13 +1787,11 @@ func (c *Client) ResolveComment(ctx context.Context, prID int64, commentID int64
 	default:
 		return fmt.Errorf("bad -resolve-action %q; expected resolve|unresolve", action)
 	}
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/comments/%d",
-		c.cfg.Project, c.cfg.Repo, prID, commentID)
 	body := struct {
 		ThreadResolved bool `json:"threadResolved"`
 		Version        int  `json:"version"`
 	}{ThreadResolved: threadResolved, Version: version}
-	_, err := c.doJSON(ctx, http.MethodPut, path, body)
+	_, err := c.putComment(ctx, prID, commentID, body)
 	return err
 }
 
@@ -2305,14 +1809,12 @@ func (c *Client) SetPullRequestReview(ctx context.Context, prID int64, action st
 }
 
 func (c *Client) approvePullRequest(ctx context.Context, prID int64) error {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/approve", c.cfg.Project, c.cfg.Repo, prID)
-	_, err := c.doJSON(ctx, http.MethodPost, path, nil)
+	_, err := c.doJSON(ctx, http.MethodPost, c.repoPath("/pull-requests/%d/approve", prID), nil)
 	return err
 }
 
 func (c *Client) disapprovePullRequest(ctx context.Context, prID int64) error {
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/approve", c.cfg.Project, c.cfg.Repo, prID)
-	_, err := c.doJSON(ctx, http.MethodDelete, path, nil)
+	_, err := c.doJSON(ctx, http.MethodDelete, c.repoPath("/pull-requests/%d/approve", prID), nil)
 	return err
 }
 
@@ -2324,9 +1826,8 @@ func (c *Client) setNeedsWork(ctx context.Context, prID int64) error {
 	if user.Slug == "" {
 		return errors.New("failed to detect current user slug for needs-work")
 	}
-	path := fmt.Sprintf("/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/participants/%s", c.cfg.Project, c.cfg.Repo, prID, url.PathEscape(user.Slug))
-	body := reviewStatusUpdateRequest{Status: "NEEDS_WORK"}
-	_, err = c.doJSON(ctx, http.MethodPut, path, body)
+	path := c.repoPath("/pull-requests/%d/participants/%s", prID, url.PathEscape(user.Slug))
+	_, err = c.doJSON(ctx, http.MethodPut, path, reviewStatusUpdateRequest{Status: "NEEDS_WORK"})
 	return err
 }
 
@@ -2336,7 +1837,7 @@ func (c *Client) getCurrentUser(ctx context.Context) (selfUser, error) {
 	// Bitbucket Server/Data Center instances may not support /users/~self.
 	// Resolve current user via configured username when available.
 	if strings.TrimSpace(c.cfg.User) != "" {
-		path := "/rest/api/latest/users/" + url.PathEscape(strings.TrimSpace(c.cfg.User))
+		path := restAPIPrefix + "/users/" + url.PathEscape(strings.TrimSpace(c.cfg.User))
 		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
 		if err != nil {
 			return out, err
@@ -2344,20 +1845,25 @@ func (c *Client) getCurrentUser(ctx context.Context) (selfUser, error) {
 		if err := json.Unmarshal(b, &out); err != nil {
 			return out, fmt.Errorf("decode user %q: %w", c.cfg.User, err)
 		}
-		if out.Slug == "" {
-			out.Slug = out.Name
-		}
+		out.Slug = cmp.Or(out.Slug, out.Name)
 		return out, nil
 	}
 
 	return out, errors.New("cannot resolve current user: set config.user for needs-work action")
 }
 
+// doJSON sends a request to path (relative to base_url, keeping any path
+// prefix base_url has) and returns the body of a 2xx response.
 func (c *Client) doJSON(ctx context.Context, method, path string, payload any) ([]byte, error) {
-	endpoint, err := c.baseURL.Parse(path)
+	rel, err := url.Parse(path)
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint %q: %w", path, err)
 	}
+	endpoint := *c.baseURL
+	endpoint.Path = joinURLPath(c.baseURL.Path, rel.Path)
+	endpoint.RawPath = joinURLPath(c.baseURL.EscapedPath(), rel.EscapedPath())
+	endpoint.RawQuery = rel.RawQuery
+	endpoint.Fragment, endpoint.RawFragment = "", ""
 
 	var body io.Reader
 	if payload != nil {
@@ -2365,12 +1871,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload any) (
 		if err != nil {
 			return nil, fmt.Errorf("encode request JSON: %w", err)
 		}
-		body = strings.NewReader(string(data))
+		body = bytes.NewReader(data)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
 	if err != nil {
-		return nil, fmt.Errorf("new request %s %s: %w", method, endpoint.String(), err)
+		return nil, fmt.Errorf("new request %s %s: %w", method, endpoint.Redacted(), err)
 	}
 	c.setAuth(req)
 	req.Header.Set("Accept", "application/json")
@@ -2381,61 +1887,59 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload any) (
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, endpoint.String(), err)
+		return nil, fmt.Errorf("%s %s: %w", method, endpoint.Redacted(), err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read %s response: %w", endpoint.String(), err)
+		return nil, fmt.Errorf("read %s response: %w", endpoint.Redacted(), err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: %s: %s", method, endpoint.String(), resp.Status, strings.TrimSpace(string(respBody)))
+		return nil, fmt.Errorf("%s %s: %s: %s", method, endpoint.Redacted(), resp.Status, strings.TrimSpace(string(respBody)))
 	}
 
 	return respBody, nil
 }
 
-func printTable(prs []PullRequest, cfg RuntimeConfig, reviewersEnabled bool) {
+// printTable writes the plain `bb` PR table. PRs must be enriched first
+// (enrichPullRequests) so the MINE column is filled.
+func printTable(prs []PullRequest) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
 	_, _ = fmt.Fprintln(w, "AGE\tLCOM\tCMTS\tNW\tAPPR\tMINE\tAUTHOR\tTITLE")
 
 	now := time.Now()
-
 	for _, pr := range prs {
-		opened := msToTime(pr.CreatedDate)
-		ageStr := "-"
-		lastCommentStr := "-"
-
-		if !opened.IsZero() {
-			ageStr = humanAge(now.Sub(opened))
-		}
-		updated := msToTime(pr.UpdatedDate)
-		if !updated.IsZero() {
-			lastCommentStr = humanAge(now.Sub(updated))
-		}
-
-		needsWork := needsWorkStatus(pr.Reviewers)
-		approvals := countApprovals(pr.Reviewers)
-		mine := myApprovalMarker(pr, cfg)
-
-		_, _ = fmt.Fprintf(
-			w,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n",
-			ageStr,
-			lastCommentStr,
-			pr.CommentCount,
-			needsWork,
-			approvals,
-			mine,
-			displayUser(pr.Author.User),
-			sanitizeCell(pr.Title),
-		)
+		cells := append(prStatusCells(pr, now), displayUser(pr.Author.User), sanitizeCell(pr.Title))
+		_, _ = fmt.Fprintln(w, strings.Join(cells, "\t"))
 	}
 
 	_ = w.Flush()
+}
+
+// prStatusCells returns the AGE, LCOM, CMTS, NW, APPR and MINE cells shared by
+// the table and dashboard views.
+func prStatusCells(pr PullRequest, now time.Time) []string {
+	return []string{
+		ageSince(pr.CreatedDate, now),
+		ageSince(pr.UpdatedDate, now),
+		strconv.Itoa(pr.CommentCount),
+		needsWorkStatus(pr.Reviewers),
+		strconv.Itoa(countApprovals(pr.Reviewers)),
+		myApprovalMarker(pr),
+	}
+}
+
+// ageSince renders the time elapsed since a Bitbucket millisecond timestamp,
+// or "-" when it is unset.
+func ageSince(ms int64, now time.Time) string {
+	t := msToTime(ms)
+	if t.IsZero() {
+		return "-"
+	}
+	return humanAge(now.Sub(t))
 }
 
 func countApprovals(reviewers []Reviewer) int {
@@ -2465,7 +1969,7 @@ func msToTime(ms int64) time.Time {
 		return time.Time{}
 	}
 
-	return time.Unix(0, ms*int64(time.Millisecond)).Local()
+	return time.UnixMilli(ms).Local()
 }
 
 func humanAge(d time.Duration) string {
@@ -2493,52 +1997,29 @@ func humanAge(d time.Duration) string {
 }
 
 func displayUser(u User) string {
-	if u.DisplayName != "" {
-		return u.DisplayName
-	}
-
-	if u.Name != "" {
-		return u.Name
-	}
-
-	if u.Slug != "" {
-		return u.Slug
-	}
-
-	return u.EmailAddress
+	return cmp.Or(u.DisplayName, u.Name, u.Slug, u.EmailAddress)
 }
 
 func normalizeIdentity(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// userCandidates returns the normalized, de-duplicated identities that denote
+// the current user (config.current_user, then config.user).
 func userCandidates(cfg RuntimeConfig) []string {
-	candidates := []string{}
-	seen := map[string]struct{}{}
+	var candidates []string
 	for _, raw := range []string{cfg.CurrentUser, cfg.User} {
-		norm := normalizeIdentity(raw)
-		if norm == "" {
-			continue
+		if norm := normalizeIdentity(raw); norm != "" && !slices.Contains(candidates, norm) {
+			candidates = append(candidates, norm)
 		}
-		if _, ok := seen[norm]; ok {
-			continue
-		}
-		seen[norm] = struct{}{}
-		candidates = append(candidates, norm)
 	}
 	return candidates
 }
 
 func isCurrentUser(u User, candidates []string) bool {
-	if len(candidates) == 0 {
-		return false
-	}
-	targets := []string{normalizeIdentity(u.Slug), normalizeIdentity(u.Name), normalizeIdentity(u.DisplayName)}
-	for _, c := range candidates {
-		for _, t := range targets {
-			if t != "" && c == t {
-				return true
-			}
+	for _, t := range []string{normalizeIdentity(u.Slug), normalizeIdentity(u.Name), normalizeIdentity(u.DisplayName)} {
+		if t != "" && slices.Contains(candidates, t) {
+			return true
 		}
 	}
 	return false
@@ -2548,34 +2029,25 @@ func isDraftPR(pr PullRequest) bool {
 	return strings.Contains(pr.Title, "[DRAFT]")
 }
 
+// prSortBucket orders the JSON PR list: PRs to review, then ones I marked
+// needs-work, then ones I approved, then drafts, then my own. It reads the
+// fields set by enrichPullRequests.
 func prSortBucket(pr PullRequest, candidates []string) int {
-	if isCurrentUser(pr.Author.User, candidates) {
+	switch {
+	case isCurrentUser(pr.Author.User, candidates):
 		return 5
-	}
-	isDraft := isDraftPR(pr)
-	for _, reviewer := range pr.Reviewers {
-		if !isCurrentUser(reviewer.User, candidates) {
-			continue
-		}
-		if isDraft {
-			return 4
-		}
-		status := strings.ToUpper(strings.TrimSpace(reviewer.Status))
-		if reviewer.Approved || status == "APPROVED" {
-			return 3
-		}
-		if status == "NEEDS_WORK" {
-			return 2
-		}
-	}
-	if isDraft {
+	case isDraftPR(pr):
 		return 4
+	case pr.MyApproved:
+		return 3
+	case pr.MyReviewStatus == "NEEDS_WORK":
+		return 2
+	default:
+		return 1
 	}
-	return 1
 }
 
-func reviewStatusForCurrentUser(pr PullRequest, cfg RuntimeConfig) (status string, approved bool) {
-	candidates := userCandidates(cfg)
+func reviewStatusForCurrentUser(pr PullRequest, candidates []string) (status string, approved bool) {
 	if len(candidates) == 0 {
 		return "UNKNOWN", false
 	}
@@ -2587,25 +2059,15 @@ func reviewStatusForCurrentUser(pr PullRequest, cfg RuntimeConfig) (status strin
 		if reviewer.Approved || st == "APPROVED" {
 			return "APPROVED", true
 		}
-		if st == "NEEDS_WORK" {
-			return "NEEDS_WORK", false
-		}
-		if st == "UNAPPROVED" {
-			return "UNAPPROVED", false
-		}
-		if st != "" {
-			return st, false
-		}
-		return "PENDING", false
+		return cmp.Or(st, "PENDING"), false
 	}
 	return "NOT_REVIEWER", false
 }
 
 func enrichPullRequests(prs []PullRequest, cfg RuntimeConfig) {
+	candidates := userCandidates(cfg)
 	for i := range prs {
-		status, approved := reviewStatusForCurrentUser(prs[i], cfg)
-		prs[i].MyReviewStatus = status
-		prs[i].MyApproved = approved
+		prs[i].MyReviewStatus, prs[i].MyApproved = reviewStatusForCurrentUser(prs[i], candidates)
 	}
 }
 
@@ -2613,57 +2075,56 @@ func enrichPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 // statuses of its latest commit concurrently.
 func enrichPullRequestBuilds(ctx context.Context, c *Client, prs []PullRequest) {
 	const workers = 10
-	type job struct{ idx int }
-	jobs := make(chan job)
+	jobs := make(chan int)
 	var wg sync.WaitGroup
 
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				commit := strings.TrimSpace(prs[j.idx].FromRef.LatestCommit)
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				commit := strings.TrimSpace(prs[i].FromRef.LatestCommit)
 				if commit == "" {
-					prs[j.idx].BuildStatus = "NONE"
+					prs[i].BuildStatus = "NONE"
 					continue
 				}
 				builds, err := c.GetCommitBuildStatuses(ctx, commit)
 				if err != nil {
-					prs[j.idx].BuildStatus = ""
+					prs[i].BuildStatus = ""
 					continue
 				}
-				prs[j.idx].BuildStatus = aggregateBuildState(builds)
+				prs[i].BuildStatus = aggregateBuildState(builds)
 			}
-		}()
+		})
 	}
 
 	for i := range prs {
-		jobs <- job{idx: i}
+		jobs <- i
 	}
 	close(jobs)
 	wg.Wait()
 }
 
-func myApprovalMarker(pr PullRequest, cfg RuntimeConfig) string {
-	status, approved := reviewStatusForCurrentUser(pr, cfg)
-	if approved {
+// myApprovalMarker renders the MINE column from the fields set by
+// enrichPullRequests.
+func myApprovalMarker(pr PullRequest) string {
+	switch {
+	case pr.MyApproved:
 		return "yes"
-	}
-	if status == "NOT_REVIEWER" || status == "UNKNOWN" {
+	case pr.MyReviewStatus == "NOT_REVIEWER" || pr.MyReviewStatus == "UNKNOWN":
 		return "-"
+	default:
+		return "no"
 	}
-	return "no"
 }
 
+// sortPullRequests orders PRs by prSortBucket, most recently updated first
+// within a bucket. PRs must be enriched first (enrichPullRequests).
 func sortPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 	candidates := userCandidates(cfg)
-	sort.Slice(prs, func(i, j int) bool {
-		bucketI := prSortBucket(prs[i], candidates)
-		bucketJ := prSortBucket(prs[j], candidates)
-		if bucketI != bucketJ {
-			return bucketI < bucketJ
-		}
-		return prs[i].UpdatedDate > prs[j].UpdatedDate
+	slices.SortFunc(prs, func(a, b PullRequest) int {
+		return cmp.Or(
+			cmp.Compare(prSortBucket(a, candidates), prSortBucket(b, candidates)),
+			cmp.Compare(b.UpdatedDate, a.UpdatedDate),
+		)
 	})
 }
 
@@ -2672,12 +2133,15 @@ func sortPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 // descending AGE column. PRs with an unknown/zero CreatedDate sort last. Used only
 // for the plain table output; JSON consumers keep sortPullRequests' ordering.
 func sortPullRequestsByOpenAge(prs []PullRequest) {
-	sort.SliceStable(prs, func(i, j int) bool {
-		ci, cj := prs[i].CreatedDate, prs[j].CreatedDate
-		if (ci <= 0) != (cj <= 0) {
-			return ci > 0 // known dates before unknown ones
+	slices.SortStableFunc(prs, func(a, b PullRequest) int {
+		ca, cb := a.CreatedDate, b.CreatedDate
+		if (ca <= 0) != (cb <= 0) {
+			if ca > 0 {
+				return -1 // known dates before unknown ones
+			}
+			return 1
 		}
-		return ci < cj // older (longer open) first
+		return cmp.Compare(ca, cb) // older (longer open) first
 	})
 }
 
@@ -2714,26 +2178,11 @@ func GetJiraIssue(ctx context.Context, cfg RuntimeConfig, issueKey string) (*Jir
 			return nil, err
 		}
 		req.Header.Set("Accept", "application/json")
-		auth := cfg.JiraAuth
-		if auth == "" {
-			auth = cfg.Auth
-		}
-		switch auth {
+		switch cmp.Or(cfg.JiraAuth, cfg.Auth) {
 		case "bearer":
-			tok := cfg.JiraToken
-			if tok == "" {
-				tok = cfg.Token
-			}
-			req.Header.Set("Authorization", "Bearer "+tok)
+			req.Header.Set("Authorization", "Bearer "+cmp.Or(cfg.JiraToken, cfg.Token))
 		case "basic":
-			u, p := cfg.JiraUser, cfg.JiraPassword
-			if u == "" {
-				u = cfg.User
-			}
-			if p == "" {
-				p = cfg.Password
-			}
-			req.SetBasicAuth(u, p)
+			req.SetBasicAuth(cmp.Or(cfg.JiraUser, cfg.User), cmp.Or(cfg.JiraPassword, cfg.Password))
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -2817,12 +2266,6 @@ const defaultIgnoredUsers = "bitbucket.system-user,Code Owners for Bitbucket,Cod
 type prStatEntry struct {
 	pr   PullRequest
 	repo string
-}
-
-type activityEntry struct {
-	prID       int64
-	repo       string
-	activities []Activity
 }
 
 type StatsResult struct {
@@ -2911,10 +2354,7 @@ func runStatsCommand(args []string) error {
 		return err
 	}
 
-	project := cfg.Project
-	if p := strings.TrimSpace(*projectFlag); p != "" {
-		project = p
-	}
+	project := cmp.Or(strings.TrimSpace(*projectFlag), cfg.Project)
 	if project == "" {
 		return errors.New("-project is required (or set config.project)")
 	}
@@ -2957,7 +2397,6 @@ func runStatsCommand(args []string) error {
 	repoCh := make(chan repoResult, len(repos))
 	commitCh := make(chan commitResult, len(repos))
 	for _, repo := range repos {
-		repo := repo
 		go func() {
 			prs, err := statsAllPRs(ctx, client, project, repo, *stateFlag, cutoff)
 			repoCh <- repoResult{repo: repo, prs: prs, err: err}
@@ -2991,179 +2430,93 @@ func runStatsCommand(args []string) error {
 	}
 
 	// Stage 2: fetch activities for every PR, bounded by semaphore.
+	// activities[i] belongs to allPRs[i]; it stays nil when the fetch failed.
 	sem := make(chan struct{}, *concurrency)
-	actResults := make([]activityEntry, len(allPRs))
+	activities := make([][]Activity, len(allPRs))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
 	for i, pe := range allPRs {
-		i, pe := i, pe
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			activities, err := statsAllActivities(ctx, client, project, pe.repo, pe.pr.ID)
+			acts, err := statsAllActivities(ctx, client, project, pe.repo, pe.pr.ID)
 			if err != nil {
 				mu.Lock()
 				warnings = append(warnings, fmt.Sprintf("PR #%d in %s: %v", pe.pr.ID, pe.repo, err))
 				mu.Unlock()
 				return
 			}
-			actResults[i] = activityEntry{prID: pe.pr.ID, repo: pe.repo, activities: activities}
-		}()
+			activities[i] = acts
+		})
 	}
 	wg.Wait()
 
-	result := computePRStats(allPRs, actResults, ignoredMap, project, repos, *sinceDays, cutoff, *topN, *numBuckets)
+	result := computePRStats(allPRs, activities, ignoredMap, project, repos, *sinceDays, cutoff, *topN, *numBuckets)
 
 	commitCounts := map[string]int{}
 	for _, c := range allCommits {
-		author := c.Author.Name
-		if author == "" {
-			author = c.Author.DisplayName
-		}
+		author := cmp.Or(c.Author.Name, c.Author.DisplayName)
 		if author == "" || ignoredMap[author] {
 			continue
 		}
 		commitCounts[author]++
 	}
 	result.UserCommits = sortedUserCounts(commitCounts)
-	result.Warnings = append(result.Warnings, warnings...)
+	result.Warnings = warnings
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(result)
+	printJSON(result, nil)
+	return nil
 }
 
+// statsCollect gathers a paged collection, stopping at the first value keep
+// rejects. Stuck pagination just ends the collection.
+func statsCollect[T any](ctx context.Context, c *Client, path string, query url.Values, keep func(T) bool) ([]T, error) {
+	var all []T
+	err := paginate(ctx, c, path, query, func(v T) bool {
+		if !keep(v) {
+			return false
+		}
+		all = append(all, v)
+		return true
+	})
+	if err != nil && !errors.Is(err, errPaginationStuck) {
+		return nil, err
+	}
+	return all, nil
+}
+
+// statsAllPRs returns the repo's PRs, newest first, down to the cutoff.
 func statsAllPRs(ctx context.Context, c *Client, project, repo, state string, cutoff time.Time) ([]PullRequest, error) {
-	var all []PullRequest
-	start := 0
 	cutoffMs := cutoff.UnixMilli()
-
-	for {
-		path := fmt.Sprintf(
-			"/rest/api/latest/projects/%s/repos/%s/pull-requests?state=%s&order=NEWEST&limit=100&start=%d",
-			url.PathEscape(project), url.PathEscape(repo), url.QueryEscape(state), start,
-		)
-		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
-		if err != nil {
-			return nil, err
-		}
-		var page PRPage
-		if err := json.Unmarshal(b, &page); err != nil {
-			return nil, fmt.Errorf("decode PR page for %s: %w", repo, err)
-		}
-
-		for _, pr := range page.Values {
-			if cutoffMs > 0 && pr.CreatedDate < cutoffMs {
-				return all, nil
-			}
-			all = append(all, pr)
-		}
-
-		if page.IsLastPage {
-			break
-		}
-		next := page.NextPageStart
-		if next <= start {
-			if page.Size > 0 {
-				next = start + page.Size
-			} else {
-				break
-			}
-		}
-		start = next
-	}
-	return all, nil
+	query := url.Values{"state": {state}, "order": {"NEWEST"}, "limit": {"100"}}
+	return statsCollect(ctx, c, projectRepoPath(restAPIPrefix, project, repo, "/pull-requests"), query, func(pr PullRequest) bool {
+		return cutoffMs <= 0 || pr.CreatedDate >= cutoffMs
+	})
 }
 
+// statsRepoCommits returns the repo's commits, newest first, down to the cutoff.
 func statsRepoCommits(ctx context.Context, c *Client, project, repo string, cutoff time.Time) ([]PRCommit, error) {
-	var all []PRCommit
-	start := 0
 	cutoffMs := cutoff.UnixMilli()
-
-	for {
-		path := fmt.Sprintf(
-			"/rest/api/latest/projects/%s/repos/%s/commits?limit=100&start=%d",
-			url.PathEscape(project), url.PathEscape(repo), start,
-		)
-		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
-		if err != nil {
-			return nil, err
-		}
-		var page CommitPage
-		if err := json.Unmarshal(b, &page); err != nil {
-			return nil, fmt.Errorf("decode commit page for %s: %w", repo, err)
-		}
-
-		for _, commit := range page.Values {
-			if cutoffMs > 0 && commit.AuthorTime < cutoffMs {
-				return all, nil
-			}
-			all = append(all, commit)
-		}
-
-		if page.IsLastPage {
-			break
-		}
-		next := page.NextPageStart
-		if next <= start {
-			if page.Size > 0 {
-				next = start + page.Size
-			} else {
-				break
-			}
-		}
-		start = next
-	}
-	return all, nil
+	query := url.Values{"limit": {"100"}}
+	return statsCollect(ctx, c, projectRepoPath(restAPIPrefix, project, repo, "/commits"), query, func(commit PRCommit) bool {
+		return cutoffMs <= 0 || commit.AuthorTime >= cutoffMs
+	})
 }
 
 func statsAllActivities(ctx context.Context, c *Client, project, repo string, prID int64) ([]Activity, error) {
-	var all []Activity
-	start := 0
-
-	for {
-		path := fmt.Sprintf(
-			"/rest/api/latest/projects/%s/repos/%s/pull-requests/%d/activities?limit=100&start=%d",
-			url.PathEscape(project), url.PathEscape(repo), prID, start,
-		)
-		b, err := c.doJSON(ctx, http.MethodGet, path, nil)
-		if err != nil {
-			return nil, err
-		}
-		var page ActivityPage
-		if err := json.Unmarshal(b, &page); err != nil {
-			return nil, fmt.Errorf("decode activity page: %w", err)
-		}
-		all = append(all, page.Values...)
-		if page.IsLastPage {
-			break
-		}
-		next := page.NextPageStart
-		if next <= start {
-			if page.Size > 0 {
-				next = start + page.Size
-			} else {
-				break
-			}
-		}
-
-		start = next
-	}
-	return all, nil
+	query := url.Values{"limit": {"100"}}
+	return statsCollect(ctx, c, projectRepoPath(restAPIPrefix, project, repo, "/pull-requests/%d/activities", prID), query, func(Activity) bool {
+		return true
+	})
 }
 
-type prStatKey struct {
-	id   int64
-	repo string
-}
-
+// computePRStats aggregates the stats report. activities[i] holds the
+// activities of prEntries[i] (nil when they could not be fetched).
 func computePRStats(
 	prEntries []prStatEntry,
-	actResults []activityEntry,
+	activities [][]Activity,
 	ignored map[string]bool,
 	project string,
 	repos []string,
@@ -3172,67 +2525,10 @@ func computePRStats(
 	topN int,
 	numBuckets int,
 ) StatsResult {
-	prAuthor := map[prStatKey]string{}
-	for _, pe := range prEntries {
-		prAuthor[prStatKey{pe.pr.ID, pe.repo}] = pe.pr.Author.User.DisplayName
-	}
-
 	commentCounts := map[string]int{}
 	approvalCounts := map[string]int{}
-
-	type timeMeta struct {
-		createdMs      int64
-		closedMs       int64
-		state          string
-		firstCommentMs int64
-	}
-	metas := map[prStatKey]timeMeta{}
-	for _, pe := range prEntries {
-		k := prStatKey{pe.pr.ID, pe.repo}
-		metas[k] = timeMeta{
-			createdMs: pe.pr.CreatedDate,
-			closedMs:  pe.pr.ClosedDate,
-			state:     pe.pr.State,
-		}
-	}
-
-	prCommentCounts := map[prStatKey]int{}
-
-	for _, ae := range actResults {
-		if ae.activities == nil {
-			continue
-		}
-		k := prStatKey{ae.prID, ae.repo}
-		author := prAuthor[k]
-		meta := metas[k]
-
-		for _, act := range ae.activities {
-			user := act.User.DisplayName
-			if user == "" {
-				user = act.User.Name
-			}
-			if ignored[user] {
-				continue
-			}
-
-			if act.Action == "COMMENTED" && act.Comment != nil {
-				if user != author {
-					commentCounts[user]++
-					prCommentCounts[k]++
-				}
-				if t := act.Comment.CreatedDate; t > 0 {
-					if meta.firstCommentMs == 0 || t < meta.firstCommentMs {
-						meta.firstCommentMs = t
-					}
-				}
-			}
-			if act.Action == "APPROVED" {
-				approvalCounts[user]++
-			}
-		}
-		metas[k] = meta
-	}
-
+	authorPRCount := map[string]int{} // merged PRs per author (denominator for the long ratio)
+	authorHours := map[string][]float64{}
 	var openDurations, openToFirst, firstToMerge, commentDist []float64
 
 	type durEntry struct {
@@ -3243,79 +2539,72 @@ func computePRStats(
 		hours  float64
 	}
 	var durEntries []durEntry
-	authorHours := map[string][]float64{}
+	hoursBetween := func(fromMs, toMs int64) float64 { return float64(toMs-fromMs) / (3600 * 1000) }
 
-	for _, pe := range prEntries {
-		k := prStatKey{pe.pr.ID, pe.repo}
-		m := metas[k]
+	for i, pe := range prEntries {
+		pr := pe.pr
+		author := pr.Author.User.DisplayName
 
-		if pe.pr.State == "MERGED" && m.createdMs > 0 && m.closedMs > 0 {
-			h := float64(m.closedMs-m.createdMs) / (3600 * 1000)
-			if h >= 0 {
+		var firstCommentMs int64
+		reviewComments := 0 // comments by anyone but the author
+		for _, act := range activities[i] {
+			user := cmp.Or(act.User.DisplayName, act.User.Name)
+			if ignored[user] {
+				continue
+			}
+			switch {
+			case act.Action == "COMMENTED" && act.Comment != nil:
+				if user != author {
+					commentCounts[user]++
+					reviewComments++
+				}
+				if t := act.Comment.CreatedDate; t > 0 && (firstCommentMs == 0 || t < firstCommentMs) {
+					firstCommentMs = t
+				}
+			case act.Action == "APPROVED":
+				approvalCounts[user]++
+			}
+		}
+
+		merged := pr.State == "MERGED"
+		if merged && author != "" && !ignored[author] {
+			authorPRCount[author]++
+		}
+		if merged && pr.CreatedDate > 0 && pr.ClosedDate > 0 {
+			if h := hoursBetween(pr.CreatedDate, pr.ClosedDate); h >= 0 {
 				openDurations = append(openDurations, h)
-				author := prAuthor[k]
-				durEntries = append(durEntries, durEntry{id: pe.pr.ID, repo: pe.repo, title: pe.pr.Title, author: author, hours: h})
+				durEntries = append(durEntries, durEntry{id: pr.ID, repo: pe.repo, title: pr.Title, author: author, hours: h})
 				if author != "" && !ignored[author] {
 					authorHours[author] = append(authorHours[author], h)
 				}
 			}
 		}
-
-		if m.firstCommentMs > 0 && m.createdMs > 0 {
-			h := float64(m.firstCommentMs-m.createdMs) / (3600 * 1000)
-			if h >= 0 {
+		if firstCommentMs > 0 && pr.CreatedDate > 0 {
+			if h := hoursBetween(pr.CreatedDate, firstCommentMs); h >= 0 {
 				openToFirst = append(openToFirst, h)
 			}
-			if pe.pr.State == "MERGED" && m.closedMs > 0 {
-				h2 := float64(m.closedMs-m.firstCommentMs) / (3600 * 1000)
-				if h2 >= 0 {
-					firstToMerge = append(firstToMerge, h2)
+			if merged && pr.ClosedDate > 0 {
+				if h := hoursBetween(firstCommentMs, pr.ClosedDate); h >= 0 {
+					firstToMerge = append(firstToMerge, h)
 				}
 			}
 		}
-
-		if cnt := prCommentCounts[k]; cnt > 0 {
-			commentDist = append(commentDist, float64(cnt))
+		if reviewComments > 0 {
+			commentDist = append(commentDist, float64(reviewComments))
 		}
 	}
 
-	sort.Slice(durEntries, func(i, j int) bool { return durEntries[i].hours > durEntries[j].hours })
-	ratioN := len(durEntries) / 10
-	if ratioN < 1 && len(durEntries) > 0 {
-		ratioN = 1
-	}
+	// The longest-open 10% of merged PRs (at least one), and how many of each
+	// author's PRs landed in that list.
+	slices.SortFunc(durEntries, func(a, b durEntry) int { return cmp.Compare(b.hours, a.hours) })
+	ratioN := min(len(durEntries), max(1, len(durEntries)/10))
 	top := make([]LongestPR, 0, ratioN)
-	for i, d := range durEntries {
-		if i >= ratioN {
-			break
-		}
-		top = append(top, LongestPR{ID: d.id, Title: d.title, Repo: d.repo, Author: d.author, DurationHours: round2(d.hours)})
-	}
-
-	// Total merged PRs per author (denominator for ratio).
-	authorPRCount := map[string]int{}
-	for _, pe := range prEntries {
-		if pe.pr.State == "MERGED" {
-			author := prAuthor[prStatKey{pe.pr.ID, pe.repo}]
-			if author != "" && !ignored[author] {
-				authorPRCount[author]++
-			}
-		}
-	}
-
-	// How many of each author's PRs landed in the p90 top list.
 	topAuthorHits := map[string]int{}
-	for i, d := range durEntries {
-		if i >= ratioN {
-			break
-		}
+	for _, d := range durEntries[:ratioN] {
+		top = append(top, LongestPR{ID: d.id, Title: d.title, Repo: d.repo, Author: d.author, DurationHours: round2(d.hours)})
 		if d.author != "" {
 			topAuthorHits[d.author]++
 		}
-	}
-	authorPRSlice := sortedUserCounts(topAuthorHits)
-	if len(authorPRSlice) > topN {
-		authorPRSlice = authorPRSlice[:topN]
 	}
 
 	authorAvg := make([]UserCount, 0, len(authorHours))
@@ -3326,23 +2615,13 @@ func computePRStats(
 		}
 		authorAvg = append(authorAvg, UserCount{User: author, Count: int(math.Round(sum / float64(len(hours))))})
 	}
-	sort.Slice(authorAvg, func(i, j int) bool { return authorAvg[i].Count > authorAvg[j].Count })
-	if len(authorAvg) > topN {
-		authorAvg = authorAvg[:topN]
-	}
 
 	longRatio := make([]UserCount, 0, len(topAuthorHits))
 	for author, hits := range topAuthorHits {
-		total := authorPRCount[author]
-		if total == 0 {
-			continue
+		if total := authorPRCount[author]; total > 0 {
+			pct := int(math.Round(float64(hits) / float64(total) * 100))
+			longRatio = append(longRatio, UserCount{User: author, Count: pct})
 		}
-		pct := int(math.Round(float64(hits) / float64(total) * 100))
-		longRatio = append(longRatio, UserCount{User: author, Count: pct})
-	}
-	sort.Slice(longRatio, func(i, j int) bool { return longRatio[i].Count > longRatio[j].Count })
-	if len(longRatio) > topN {
-		longRatio = longRatio[:topN]
 	}
 
 	sinceStr := ""
@@ -3366,19 +2645,29 @@ func computePRStats(
 		FirstCommentToMerge: computeDistribution(firstToMerge, numBuckets, "h"),
 		CommentDistribution: computeDistribution(commentDist, numBuckets, ""),
 		TopLongestPRs:       top,
-		TopAuthorPRCount:    authorPRSlice,
-		TopAuthorDuration:   authorAvg,
-		TopAuthorLongRatio:  longRatio,
+		TopAuthorPRCount:    topUserCounts(userCounts(topAuthorHits), topN),
+		TopAuthorDuration:   topUserCounts(authorAvg, topN),
+		TopAuthorLongRatio:  topUserCounts(longRatio, topN),
 	}
 }
 
-func sortedUserCounts(m map[string]int) []UserCount {
+// userCounts returns m's entries in no particular order.
+func userCounts(m map[string]int) []UserCount {
 	out := make([]UserCount, 0, len(m))
 	for u, c := range m {
 		out = append(out, UserCount{User: u, Count: c})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
 	return out
+}
+
+// topUserCounts sorts counts highest first and keeps at most n of them.
+func topUserCounts(counts []UserCount, n int) []UserCount {
+	slices.SortFunc(counts, func(a, b UserCount) int { return cmp.Compare(b.Count, a.Count) })
+	return counts[:min(n, len(counts))]
+}
+
+func sortedUserCounts(m map[string]int) []UserCount {
+	return topUserCounts(userCounts(m), len(m))
 }
 
 func computeDistribution(values []float64, numBuckets int, unit string) DistributionStats {
@@ -3386,9 +2675,7 @@ func computeDistribution(values []float64, numBuckets int, unit string) Distribu
 		return DistributionStats{}
 	}
 
-	sorted := make([]float64, len(values))
-	copy(sorted, values)
-	sort.Float64s(sorted)
+	sorted := slices.Sorted(slices.Values(values))
 
 	n := len(sorted)
 	sum := 0.0
@@ -3433,23 +2720,12 @@ func computeDistribution(values []float64, numBuckets int, unit string) Distribu
 		if i == numBuckets-1 {
 			end = maxV
 		}
-		var label string
-		if unit != "" {
-			label = fmt.Sprintf("%.0f-%.0f%s", start, end, unit)
-		} else {
-			label = fmt.Sprintf("%.0f-%.0f", start, end)
-		}
+		label := fmt.Sprintf("%.0f-%.0f%s", start, end, unit)
 		buckets[i] = HistogramBucket{Label: label, Start: round2(start), End: round2(end)}
 	}
 
 	for _, v := range sorted {
-		idx := int((v - minV) / bucketWidth)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= numBuckets {
-			idx = numBuckets - 1
-		}
+		idx := min(max(int((v-minV)/bucketWidth), 0), numBuckets-1)
 		buckets[idx].Count++
 	}
 
@@ -3481,6 +2757,19 @@ func splitTrimmed(s, sep string) []string {
 
 func round2(v float64) float64 {
 	return math.Round(v*100) / 100
+}
+
+// printJSON writes v to stdout as indented JSON, exiting on err or a write
+// failure.
+func printJSON(v any, err error) {
+	if err != nil {
+		fatal(err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		fatal(err)
+	}
 }
 
 func fatal(err error) {
