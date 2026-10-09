@@ -2288,6 +2288,25 @@ local function open_diffview(pr)
 	-- the process cwd drifting as tabs/windows with local directories gain focus.
 	local git_opts = { text = true, cwd = repo_root }
 
+	-- Comments only need the PR id, so fetch them alongside the git steps below;
+	-- they are shown once both the comments and the PR tab are there.
+	local comments_payload, pr_tab
+	local function show_comments()
+		if not (comments_payload and pr_tab) then
+			return
+		end
+		local payload = comments_payload
+		set_tab_comments(pr_tab, payload)
+		apply_comments_when_diffview_ready(pr_tab, payload)
+		vim.defer_fn(function()
+			try_navigate_to_pending_comment(pr, payload)
+		end, 300)
+	end
+	run_comments_provider(pr.id, function(payload)
+		comments_payload = payload
+		show_comments()
+	end, { notify_errors = false })
+
 	local function open_after_fetch()
 		local checkout_cmd = { "git", "checkout", "-B", from_ref, "origin/" .. from_ref }
 		vim.system(checkout_cmd, git_opts, function(co_res)
@@ -2338,14 +2357,8 @@ local function open_diffview(pr)
 					set_current_tab_pr(pr)
 					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
 					set_current_tab_diff_base(repo_root, from_ref, to_ref)
-					local pr_tab = vim.api.nvim_get_current_tabpage()
-					run_comments_provider(pr.id, function(payload)
-						set_tab_comments(pr_tab, payload)
-						apply_comments_when_diffview_ready(pr_tab, payload)
-						vim.defer_fn(function()
-							try_navigate_to_pending_comment(pr, payload)
-						end, 300)
-					end, { notify_errors = false })
+					pr_tab = vim.api.nvim_get_current_tabpage()
+					show_comments()
 				end)
 			end)
 		end)
