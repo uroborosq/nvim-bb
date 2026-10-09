@@ -18,14 +18,21 @@ local function section_lines(title, width)
 	return { "", title, sep }
 end
 
+local MAX_ITEMS = 15
+
 -- Render a single bar chart block. Returns lines, highlights (0-indexed within the block).
--- opts: { value_suffix = "h" } to append a unit after the count.
-local function render_bar_chart(title, items, max_items, bar_hl, bar_width, sep_width, opts)
-	max_items = max_items or 15
-	bar_hl = bar_hl or "DiagnosticInfo"
-	bar_width = bar_width or BAR_WIDTH
-	local value_suffix = (opts and opts.value_suffix) or ""
-	local lines = section_lines(title, sep_width)
+-- opts: {
+--   bar_hl = "DiagnosticInfo",  -- highlight group for the bars
+--   two_col = false,            -- narrow bars and a fixed name width, for merge_two_columns
+--   value_suffix = "",          -- unit appended after the count, e.g. "h"
+-- }
+local function render_bar_chart(title, items, opts)
+	opts = opts or {}
+	local bar_hl = opts.bar_hl or "DiagnosticInfo"
+	local two_col = opts.two_col or false
+	local bar_width = two_col and BAR_WIDTH_2COL or BAR_WIDTH
+	local value_suffix = opts.value_suffix or ""
+	local lines = section_lines(title, two_col and COL_WIDTH or nil)
 	local highlights = {}
 
 	if not items or #items == 0 then
@@ -34,27 +41,27 @@ local function render_bar_chart(title, items, max_items, bar_hl, bar_width, sep_
 	end
 
 	local max_count = 0
+	local max_name = 10
 	for i, item in ipairs(items) do
-		if i > max_items then break end
+		if i > MAX_ITEMS then break end
 		max_count = math.max(max_count, item.count or 0)
+		max_name = math.max(max_name, #(item.user or ""))
 	end
 	if max_count == 0 then
 		table.insert(lines, "  (no data)")
 		return lines, highlights
 	end
 
-	local max_name = 10
-	for i, item in ipairs(items) do
-		if i > max_items then break end
-		max_name = math.max(max_name, #(item.user or ""))
-	end
 	-- In two-column mode pin to a fixed cap so both columns' bars are column-aligned.
-	local name_cap = (bar_width == BAR_WIDTH_2COL) and 18 or 26
-	max_name = (bar_width == BAR_WIDTH_2COL) and name_cap or math.min(max_name, name_cap)
+	if two_col then
+		max_name = 18
+	else
+		max_name = math.min(max_name, 26)
+	end
 
 	local base = #lines
 	for i, item in ipairs(items) do
-		if i > max_items then break end
+		if i > MAX_ITEMS then break end
 		local name = item.user or "?"
 		if #name > max_name then name = name:sub(1, max_name - 1) .. "…" end
 		local pad = max_name - #name
@@ -101,12 +108,10 @@ local function merge_two_columns(left_lines, left_hl, right_lines, right_hl)
 		right_byte_start[i] = byte_len + #SEP
 	end
 
-	for _, h in ipairs(left_hl or {}) do
-		table.insert(highlights, { line = h.line, col_start = h.col_start, col_end = h.col_end, group = h.group })
-	end
+	vim.list_extend(highlights, left_hl or {})
 
 	for _, h in ipairs(right_hl or {}) do
-		local shift = right_byte_start[h.line + 1] or (COL_WIDTH + #SEP)
+		local shift = right_byte_start[h.line + 1]
 		table.insert(highlights, { line = h.line, col_start = h.col_start + shift, col_end = h.col_end + shift, group = h.group })
 	end
 
@@ -177,6 +182,29 @@ local function render_top_prs(title, prs)
 	return lines
 end
 
+-- Render two bar charts side by side when both have items, otherwise just the
+-- one that does. Each spec: { title, title_2col?, items, bar_hl, value_suffix? };
+-- title_2col replaces title in the (narrower) two-column layout.
+local function render_bar_chart_pair(left, right)
+	local has_left = left.items and #left.items > 0
+	local has_right = right.items and #right.items > 0
+
+	local function chart(spec, two_col)
+		local title = two_col and spec.title_2col or spec.title
+		return render_bar_chart(title, spec.items, { bar_hl = spec.bar_hl, two_col = two_col, value_suffix = spec.value_suffix })
+	end
+
+	if has_left and has_right then
+		local ll, lh = chart(left, true)
+		local rl, rh = chart(right, true)
+		return merge_two_columns(ll, lh, rl, rh)
+	elseif has_left then
+		return chart(left, false)
+	elseif has_right then
+		return chart(right, false)
+	end
+end
+
 function M.render(data)
 	local all_lines = {}
 	local all_highlights = {}
@@ -207,21 +235,13 @@ function M.render(data)
 	})
 
 	-- COMMENTS and APPROVALS side by side.
-	local has_comments = data.user_comments and #data.user_comments > 0
-	local has_approvals = data.user_approvals and #data.user_approvals > 0
-
-	if has_comments and has_approvals then
-		local ll, lh = render_bar_chart("USER COMMENTS  (excl. self)", data.user_comments, 15, "DiagnosticInfo", BAR_WIDTH_2COL, COL_WIDTH)
-		local rl, rh = render_bar_chart("USER APPROVALS", data.user_approvals, 15, "DiagnosticOk", BAR_WIDTH_2COL, COL_WIDTH)
-		push(merge_two_columns(ll, lh, rl, rh))
-	elseif has_comments then
-		push(render_bar_chart("USER COMMENTS  (excluding self-comments)", data.user_comments, 15, "DiagnosticInfo"))
-	elseif has_approvals then
-		push(render_bar_chart("USER APPROVALS", data.user_approvals, 15, "DiagnosticOk"))
-	end
+	push(render_bar_chart_pair(
+		{ title = "USER COMMENTS  (excluding self-comments)", title_2col = "USER COMMENTS  (excl. self)", items = data.user_comments, bar_hl = "DiagnosticInfo" },
+		{ title = "USER APPROVALS", items = data.user_approvals, bar_hl = "DiagnosticOk" }
+	))
 
 	if data.user_commits and #data.user_commits > 0 then
-		push(render_bar_chart("COMMITS TO BRANCH (by git author)", data.user_commits, 15, "DiagnosticWarn"))
+		push(render_bar_chart("COMMITS TO BRANCH (by git author)", data.user_commits, { bar_hl = "DiagnosticWarn" }))
 	end
 
 	if data.pr_open_duration then
@@ -244,22 +264,13 @@ function M.render(data)
 		push(render_top_prs("TOP LONGEST PRs  (by open duration, MERGED)", data.top_longest_prs))
 	end
 
-	local has_pr_count = data.top_author_pr_count and #data.top_author_pr_count > 0
-	local has_dur      = data.top_author_duration and #data.top_author_duration > 0
-	local has_ratio    = data.top_author_long_ratio and #data.top_author_long_ratio > 0
+	push(render_bar_chart_pair(
+		{ title = "AUTHOR PRs IN TOP 10%", items = data.top_author_pr_count, bar_hl = "DiagnosticWarn" },
+		{ title = "AUTHOR AVG DURATION (hours, MERGED)", items = data.top_author_duration, bar_hl = "DiagnosticHint", value_suffix = "h" }
+	))
 
-	if has_pr_count and has_dur then
-		local ll, lh = render_bar_chart("AUTHOR PRs IN TOP 10%", data.top_author_pr_count, 15, "DiagnosticWarn", BAR_WIDTH_2COL, COL_WIDTH)
-		local rl, rh = render_bar_chart("AUTHOR AVG DURATION (hours, MERGED)", data.top_author_duration, 15, "DiagnosticHint", BAR_WIDTH_2COL, COL_WIDTH, { value_suffix = "h" })
-		push(merge_two_columns(ll, lh, rl, rh))
-	elseif has_pr_count then
-		push(render_bar_chart("AUTHOR PRs IN TOP 10%", data.top_author_pr_count, 15, "DiagnosticWarn"))
-	elseif has_dur then
-		push(render_bar_chart("AUTHOR AVG DURATION (hours, MERGED)", data.top_author_duration, 15, "DiagnosticHint", nil, nil, { value_suffix = "h" }))
-	end
-
-	if has_ratio then
-		push(render_bar_chart("AUTHOR LONG-PR RATE  (% of own PRs in top longest)", data.top_author_long_ratio, 15, "DiagnosticError", nil, nil, { value_suffix = "%" }))
+	if data.top_author_long_ratio and #data.top_author_long_ratio > 0 then
+		push(render_bar_chart("AUTHOR LONG-PR RATE  (% of own PRs in top longest)", data.top_author_long_ratio, { bar_hl = "DiagnosticError", value_suffix = "%" }))
 	end
 
 	if data.warnings and #data.warnings > 0 then
