@@ -1,6 +1,7 @@
 local M = {}
 local reactions = require("bb_pr.reactions")
 local linemap = require("bb_pr.linemap")
+local seen = require("bb_pr.seen")
 
 local default_config = {
 	-- internals
@@ -93,6 +94,18 @@ local default_config = {
 		autosave_debounce_ms = 400,
 	},
 
+	-- last-viewed records per PR (seen commit, comment counts) used to show what changed since
+	since_last_view = {
+		enabled = true,
+		store_path = vim.fn.stdpath("state") .. "/bb_pr_seen.json",
+		max_count = 200,
+		diff_map = "<leader>rn",
+		-- toggles the viewed mark of a PR file (panel line, directory or selection; the
+		-- shown file in a diff buffer)
+		viewed_map = "<leader>rv",
+		use_bitbucket_baseline = true,
+	},
+
 	-- debug log: rotated when it exceeds max_size_bytes or max_age_seconds
 	log = {
 		path             = vim.fn.stdpath("state") .. "/bb_pr.log",
@@ -107,9 +120,31 @@ local state = {
 	-- tab_key -> per-tab state (see tab_state):
 	--   pr, comments, pending_comments (applied by the next BufEnter/CursorMoved), builds,
 	--   conflict ({ to_ref } while the PR branch sits on an unresolved merge),
-	--   diff_base ({ root, base, source }: the commits Bitbucket anchors FROM / TO lines to)
+	--   info_opened once open_diffview opened the tab's PR Info (once per tab),
+	--   info_pending while that PR Info is still to open (holds the auto-mark back),
+	--   info_autocmd = the TabEnter autocmd id while it waits for the tab to be entered,
+	--   diff_base ({ root, base, source }: the commits Bitbucket anchors FROM / TO lines to),
+	--   since ({ key, prev, baseline, baseline_origin }: set only while the tab's PR is tracked;
+	--   the view record as it was when the tab opened and the commit changes are measured
+	--   from; see track_tab_view). With a baseline, since.delta arrives later (see
+	--   compute_since_delta): { missing_baseline = true } when the baseline commit is not
+	--   in the repo, { failed = true } when git failed (logged), else { ancestor,
+	--   commits (nil unless ancestor), base_changed }.
+	--   since.comment_marks = { [comment id] = "new" | "edited" } (set_tab_comments, only with
+	--   a prev that has a comment_count, i.e. saw the comments; keyed by the payload's
+	--   numeric `id`, others' comments only).
+	--   viewed ({ blobs, files, last_path, version }: set with since, see
+	--   seen_view.compute_viewed / mark_shown_file): blobs = { [PR path] = blob sha } at
+	--   the source tip (merge base for a deleted file; renames by their new path), nil
+	--   until git answered or when it failed; failed = true when git failed (logged), so
+	--   blobs nil without failed means still loading; files = { [path] = sha } the marks, a
+	--   copy of the record's kept in step with the store (seen_view.set_viewed);
+	--   last_path = the Diffview file last handled by the auto-mark; version counts the
+	--   blobs arrival and every set_viewed write
 	tabs = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
+	-- "[new]" / "[edited]" highlights of the comment headers in PR Info and the float
+	comment_mark_ns = vim.api.nvim_create_namespace("bb_pr_comment_marks"),
 	diffview_panel_ns = vim.api.nvim_create_namespace("bb_pr_diffview_panel"),
 	git_text_cache = {},
 	hunks_cache = {},
@@ -130,6 +165,10 @@ local state = {
 	--   ids_by_line = { [line] = comment_id } for the lines that act on a comment,
 	--   reaction_segments = { [line] = { comment_id, segments } } for reaction lines,
 	--   thread_lines (overview) = ascending lines of the "### Thread" headings,
+	--   tabpage = the tab whose state the view renders (PR Info: the tab it was opened from;
+	--   float: the tab of its source window), marks = that tab's since.comment_marks or nil,
+	--   marks_by_line = { [line] = { mark = "new" | "edited", col } } for the headers
+	--   carrying a mark (col = byte column of the label),
 	--   pr (overview) = the PR the buffer renders
 	comment_view_by_buf = {},
 }
@@ -279,7 +318,12 @@ local function reviewer_status(reviewer)
 	return raw == "" and "PENDING" or raw
 end
 
-local function format_pr_entry(pr)
+local function pr_state(pr)
+	return string.upper(tostring(pr.state or ""))
+end
+
+-- marker: the seen_view.format_marker column, or nil without tracking
+local function format_pr_entry(pr, marker)
 	local approvals = 0
 	local has_needs_work = false
 	for _, reviewer in ipairs(pr.reviewers or {}) do
@@ -292,7 +336,7 @@ local function format_pr_entry(pr)
 	end
 	local needs_work_status = has_needs_work and "NW" or "OK"
 
-	return string.format(
+	return (marker or "") .. string.format(
 		"%s appr: %d %s %s • open %s, comm %s • %s - %s",
 		format_build_marker(pr),
 		approvals,
@@ -577,22 +621,26 @@ end
 -- Runs a bb command. On success on_ok runs on the main loop (nvim API is safe there)
 -- with the decoded JSON when opts.json, otherwise with the vim.system result.
 -- Failures notify "bb_pr: <opts.fail_msg>: <stderr>" and, for undecodable JSON,
--- "bb_pr: <opts.invalid_msg>", unless opts.notify_errors == false.
+-- "bb_pr: <opts.invalid_msg>", unless opts.notify_errors == false. On failure,
+-- opts.on_error() then runs on the main loop when given.
 local function run_bb_cmd(cmd, opts, on_ok)
 	opts = opts or {}
 	local notify_errors = opts.notify_errors ~= false
+	local function fail(msg)
+		if notify_errors then
+			vim.notify(msg, vim.log.levels.ERROR)
+		end
+		if opts.on_error then
+			opts.on_error()
+		end
+	end
 	vim.system(
 		cmd,
 		{ text = true },
 		vim.schedule_wrap(function(res)
 			if res.code ~= 0 then
 				log("bb command failed:", cmd, "code=", res.code, "stderr=", res.stderr or "")
-				if notify_errors then
-					vim.notify(
-						"bb_pr: " .. (opts.fail_msg or "bb failed") .. ": " .. (res.stderr or ""),
-						vim.log.levels.ERROR
-					)
-				end
+				fail("bb_pr: " .. (opts.fail_msg or "bb failed") .. ": " .. (res.stderr or ""))
 				return
 			end
 			if not opts.json then
@@ -601,9 +649,7 @@ local function run_bb_cmd(cmd, opts, on_ok)
 			end
 			local ok, decoded = pcall(vim.json.decode, res.stdout)
 			if not ok or type(decoded) ~= "table" then
-				if notify_errors then
-					vim.notify("bb_pr: " .. (opts.invalid_msg or "invalid bb JSON output"), vim.log.levels.ERROR)
-				end
+				fail("bb_pr: " .. (opts.invalid_msg or "invalid bb JSON output"))
 				return
 			end
 			on_ok(decoded)
@@ -667,20 +713,230 @@ local open_pr_info_with_comments
 local ticket_under_cursor
 local open_jira_ticket
 local open_attachment_at_cursor
+local compute_since_delta
 
--- cb(payload) runs on the main loop
+-- cb(payload) runs on the main loop; so does opts.on_error() when the fetch fails
 local function run_comments_provider(pr_id, cb, opts)
 	local cmd = with_repo_autodetect_flag(M.config.comments_cmd)
 	table.insert(cmd, tostring(pr_id))
 	run_bb_cmd(cmd, {
 		json = true,
 		notify_errors = not (opts and opts.notify_errors == false),
+		on_error = opts and opts.on_error,
 		fail_msg = "comments provider failed",
 		invalid_msg = "invalid PR comments JSON",
 	}, cb)
 end
 
 local prefetch_comment_file_texts
+
+local function log_seen_ref_failure(what, key)
+	return function(ok, stderr)
+		if not ok then
+			log("since_last_view: " .. what .. " failed:", key, stderr)
+		end
+	end
+end
+
+local function unpin_seen_record(record)
+	seen.unpin(record.root, record.key, log_seen_ref_failure("unpin", record.key))
+end
+
+-- The PR list column and closed-PR cleanup over the view records. One table, as the
+-- main chunk is close to Lua's 200 locals limit.
+local seen_view = { MARKER_WIDTH = 4 }
+
+-- The PR list's since-last-view column (D10) for a PR and its view record (or nil):
+-- "·" never opened, "◆" new commits, "+N" new comments and tasks. Blank for own and
+-- non-OPEN PRs. Padded to MARKER_WIDTH display cells, always ending in a blank, so a
+-- long +N widens the column instead of running into the line.
+function seen_view.format_marker(pr, record)
+	local marker = ""
+	if not pr.is_mine and pr_state(pr) == "OPEN" then
+		local latest = type(pr.fromRef) == "table" and pr.fromRef.latestCommit or nil
+		latest = type(latest) == "string" and latest ~= "" and latest or nil
+		local reviewed = pr.my_last_reviewed_commit
+		reviewed = type(reviewed) == "string" and reviewed ~= "" and reviewed or nil
+		if record then
+			-- a Bitbucket review of the current tip counts as seen, as in the tab
+			marker = latest and latest ~= record.source and latest ~= reviewed and "◆" or ""
+			-- no comment_count: this record never saw the comments, so no +N
+			if record.comment_count ~= nil then
+				local total = (tonumber(pr.commentCount) or 0)
+					+ (tonumber(pr.openTaskCount) or 0)
+					+ (tonumber(pr.resolvedTaskCount) or 0)
+				local new = total - (tonumber(record.comment_count) or 0)
+				if new > 0 then
+					marker = marker .. "+" .. new
+				end
+			end
+		else
+			if not reviewed then
+				marker = "·"
+			elseif latest and latest ~= reviewed then
+				marker = "◆"
+			end
+		end
+	end
+	local width = vim.fn.strdisplaywidth(marker)
+	return marker .. string.rep(" ", math.max(seen_view.MARKER_WIDTH - width, 1))
+end
+
+-- Drops the view record and ref of a merged/declined PR (D2). Returns whether it removed one.
+function seen_view.forget_closed_pr(pr, key)
+	local st = pr_state(pr)
+	if not key or (st ~= "MERGED" and st ~= "DECLINED") then
+		return false
+	end
+	local removed = seen.remove((M.config.since_last_view or {}).store_path, key)
+	if not removed then
+		return false
+	end
+	log("since_last_view: removed the record of closed PR", key)
+	unpin_seen_record(removed)
+	return true
+end
+
+-- forget_closed_pr for every PR of a list that has a record (the store is read once);
+-- PRs merely absent from the list keep theirs
+function seen_view.forget_closed_prs(prs)
+	local cfg = M.config.since_last_view or {}
+	if not cfg.enabled then
+		return
+	end
+	local records = seen.all(cfg.store_path)
+	for _, pr in ipairs(prs) do
+		local key = seen.key(pr)
+		if key and records[key] then
+			seen_view.forget_closed_pr(pr, key)
+		end
+	end
+end
+
+-- Read-only, once per PR list: { [pr] = format_marker column }, or nil when
+-- tracking is off.
+function seen_view.list_markers(prs)
+	local cfg = M.config.since_last_view or {}
+	if not cfg.enabled then
+		return nil
+	end
+	local records = seen.all(cfg.store_path)
+	local markers = {}
+	for _, pr in ipairs(prs) do
+		local key = seen.key(pr)
+		markers[pr] = seen_view.format_marker(pr, key and records[key] or nil)
+	end
+	return markers
+end
+
+local function plural(n, word)
+	return string.format("%d %s%s", n, word, n == 1 and "" or "s")
+end
+
+-- What changed since the tab's last view, for PR Info:
+-- { age_label (nil without prev), code_known (the delta arrived and measured the code),
+-- commits (new commits, 0 when unknown), rewritten, bitbucket (code measured from the
+-- Bitbucket review), new, edited (comment marks) }
+local function since_summary(since)
+	local summary = { code_known = false, commits = 0, rewritten = false, new = 0, edited = 0 }
+	summary.bitbucket = since.baseline_origin == "bitbucket"
+	local seen_at = since.prev and tonumber(since.prev.seen_at)
+	summary.age_label = seen_at and draft_age_label(math.floor(seen_at / 1000)) or nil
+	local delta = since.delta
+	if delta and not delta.failed and not delta.missing_baseline then
+		summary.code_known = true
+		summary.rewritten = not delta.ancestor
+		summary.commits = delta.ancestor and delta.commits or 0
+	end
+	for _, mark in pairs(since.comment_marks or {}) do
+		if mark == "new" then
+			summary.new = summary.new + 1
+		else
+			summary.edited = summary.edited + 1
+		end
+	end
+	return summary
+end
+
+-- All comments of a payload; replies are entries of their own
+local function payload_comment_list(payload)
+	local list = {}
+	for _, field in ipairs({ "file_comments", "overview_comments" }) do
+		vim.list_extend(list, type(payload[field]) == "table" and payload[field] or {})
+	end
+	return list
+end
+
+-- { [payload id] = "new" | "edited" } for the others' comments of `comments` against
+-- prev_comments ({ ["<id>"] = version }); keys keep the payload's numeric ids
+local function comment_marks(prev_comments, comments)
+	local marks = {}
+	for _, c in ipairs(comments) do
+		if c.id ~= nil and not c.is_mine then
+			local before = prev_comments[tostring(c.id)]
+			if before == nil then
+				marks[c.id] = "new"
+			elseif tonumber(before) ~= tonumber(c.version) then
+				marks[c.id] = "edited"
+			end
+		end
+	end
+	return marks
+end
+
+-- Merges the versions of `comments` into the stored view record of since.key and
+-- sets its comment_count; skipped (logged) when the record is gone.
+local function merge_seen_comment_versions(since, comments)
+	local cfg = M.config.since_last_view or {}
+	local record = seen.get(cfg.store_path, since.key)
+	if not record then
+		log("since_last_view: no record to merge the comments into:", since.key)
+		return
+	end
+	local versions, count, counted = {}, 0, {}
+	for id, version in pairs(type(record.comments) == "table" and record.comments or {}) do
+		versions[tostring(id)] = version
+	end
+	for _, c in ipairs(comments) do
+		local id = c.id ~= nil and tostring(c.id) or nil
+		if id and not counted[id] then
+			counted[id] = true
+			count = count + 1
+			versions[id] = tonumber(c.version) or 0
+		end
+	end
+	record.comments = versions
+	record.comment_count = count
+	local evicted, ok = seen.put(cfg.store_path, since.key, record, cfg.max_count)
+	if not ok then
+		log("since_last_view: failed to write", cfg.store_path)
+		return
+	end
+	for _, old in ipairs(evicted) do
+		unpin_seen_record(old)
+	end
+end
+
+-- For a tracked tab: records the payload's comment versions and marks the others'
+-- comments new/edited since since.prev (when that record saw the comments). A payload
+-- of another PR than the tab's is ignored.
+local function record_since_comments(tabpage, payload)
+	local ts = tab_state(tabpage)
+	local since = ts.since
+	if not since then
+		return
+	end
+	if payload.pr_id ~= nil and not (ts.pr and tostring(ts.pr.id) == tostring(payload.pr_id)) then
+		log("since_last_view: ignoring the comments of another PR:", payload.pr_id, since.key)
+		return
+	end
+	local comments = payload_comment_list(payload)
+	merge_seen_comment_versions(since, comments)
+	if since.prev and since.prev.comment_count ~= nil then
+		local prev_comments = type(since.prev.comments) == "table" and since.prev.comments or {}
+		since.comment_marks = comment_marks(prev_comments, comments)
+	end
+end
 
 local function set_tab_comments(tabpage, payload)
 	local ts = tab_state(tabpage)
@@ -692,6 +948,7 @@ local function set_tab_comments(tabpage, payload)
 	if ts.diff_base then
 		prefetch_comment_file_texts(ts.diff_base, payload)
 	end
+	record_since_comments(tabpage, payload)
 end
 
 local function set_current_tab_comments(payload)
@@ -702,6 +959,28 @@ local function get_current_tab_comments()
 	return tab_state().comments
 end
 
+-- The since of `tabpage` (default: current tab), when that tab is open and tracks the
+-- PR `pr` (any PR when nil)
+local function tab_since(tabpage, pr)
+	if tabpage and not vim.api.nvim_tabpage_is_valid(tabpage) then
+		return nil
+	end
+	local ts = tab_state(tabpage)
+	if not ts.since then
+		return nil
+	end
+	if pr and not (ts.pr and tostring(ts.pr.id) == tostring(pr.id)) then
+		return nil
+	end
+	return ts.since
+end
+
+-- since.comment_marks of `tabpage` (default: current tab), nil when untracked or not computed
+local function tab_comment_marks(tabpage)
+	local since = tab_since(tabpage)
+	return since and since.comment_marks
+end
+
 local function get_buf_line_comments(bufnr)
 	return state.line_comments_by_buf[bufnr] or {}
 end
@@ -710,10 +989,6 @@ end
 -- merge with its target, nil otherwise.
 local function set_current_tab_conflict(info)
 	tab_state().conflict = info
-end
-
-local function get_current_tab_conflict()
-	return tab_state().conflict
 end
 
 -- Records the commits Bitbucket anchors comment lines to: FROM lines to the merge
@@ -740,6 +1015,73 @@ local function set_current_tab_diff_base(repo_root, from_ref, to_ref)
 	log("set_current_tab_diff_base:", ts.diff_base)
 end
 
+-- true when commit `a` is an ancestor of `b`; false also when either is missing locally
+local function git_is_ancestor(root, a, b)
+	local res = vim.system({ "git", "merge-base", "--is-ancestor", a, b }, { cwd = root, text = true }):wait()
+	return res.code == 0
+end
+
+-- Runs once the PR tab has its diff_base, so a failed open writes nothing. Drops the
+-- view record of a merged/declined PR; for an open PR of someone else, snapshots the
+-- previous record into tab_state().since and records this view. Own PRs are not tracked.
+local function track_tab_view(tabpage, pr)
+	tabpage = tabpage or vim.api.nvim_get_current_tabpage()
+	local cfg = M.config.since_last_view or {}
+	local ts = tab_state(tabpage)
+	local diff_base = ts.diff_base
+	ts.since = nil
+	ts.viewed = nil
+	local key = seen.key(pr)
+	if not cfg.enabled or not diff_base or not key then
+		return
+	end
+	seen_view.forget_closed_pr(pr, key)
+	if pr.is_mine or pr_state(pr) ~= "OPEN" then
+		return
+	end
+
+	local prev = seen.get(cfg.store_path, key)
+	local reviewed = cfg.use_bitbucket_baseline and pr.my_last_reviewed_commit or nil
+	local baseline, origin = seen.choose_baseline(prev and prev.source, reviewed, function(a, b)
+		return git_is_ancestor(diff_base.root, a, b)
+	end)
+	ts.since = { key = key, prev = prev, baseline = baseline, baseline_origin = origin }
+	if baseline then
+		local to_ref = pr.toRef and pr.toRef.displayId
+		compute_since_delta(tabpage, ts.since, to_ref)
+	end
+
+	-- comments are carried over until set_tab_comments records the fetched ones; a first
+	-- view has no comment_count until they arrive (none seen if they never do)
+	local record = {
+		seen_at = os.time() * 1000,
+		source = diff_base.source,
+		root = diff_base.root,
+		comment_count = prev and tonumber(prev.comment_count) or nil,
+		comments = prev and type(prev.comments) == "table" and prev.comments or {},
+		files = prev and type(prev.files) == "table" and prev.files or {},
+	}
+	local evicted, ok = seen.put(cfg.store_path, key, record, cfg.max_count)
+	if not ok then
+		log("since_last_view: failed to write", cfg.store_path)
+		-- without a record no mark can be stored: the toggle reports the failure
+		ts.viewed = { files = {}, version = 0, failed = true }
+		return
+	end
+	seen_view.compute_viewed(tabpage, ts.since, record.files)
+	seen.pin(record.root, key, record.source, log_seen_ref_failure("pin", key))
+	for _, old in ipairs(evicted) do
+		unpin_seen_record(old)
+	end
+	log(
+		"since_last_view:",
+		key,
+		"baseline_origin=" .. origin,
+		"prev.source=" .. tostring(prev and prev.source),
+		"source=" .. record.source
+	)
+end
+
 local function consume_pending_tab_comments()
 	local ts = tab_state()
 	local payload = ts.pending_comments
@@ -761,10 +1103,6 @@ end
 
 local function set_tab_builds(tabpage, payload)
 	tab_state(tabpage).builds = payload
-end
-
-local function get_current_tab_builds()
-	return tab_state().builds
 end
 
 local function split_first_line(text)
@@ -1088,8 +1426,9 @@ local function parse_cat_file_batch(out, count)
 end
 
 -- cb({ { from_path, path }, ... }) on the main loop with the files the PR changes
--- (merge base → source tip); the name-status pass maps renamed files to their
--- merge-base path. Parsed once per diff-base object, i.e. per (base, source).
+-- (merge base → source tip), or cb(nil) when git fails; the name-status pass maps
+-- renamed files to their merge-base path. Parsed once per diff-base object, i.e. per
+-- (base, source).
 local function with_pr_changed_files(info, cb)
 	if info.changed_files then
 		cb(info.changed_files)
@@ -1098,6 +1437,10 @@ local function with_pr_changed_files(info, cb)
 	local diff_cmd = { "git", "diff", "--name-status", "-z", "-M", info.base, info.source }
 	vim.system(diff_cmd, { cwd = info.root, text = true }, function(diff_res)
 		if diff_res.code ~= 0 then
+			log("with_pr_changed_files failed:", diff_res.stderr)
+			vim.schedule(function()
+				cb(nil)
+			end)
 			return
 		end
 		local fields = vim.split(diff_res.stdout or "", "\0", { plain = true })
@@ -1134,6 +1477,9 @@ prefetch_comment_file_texts = function(info, payload)
 		return
 	end
 	with_pr_changed_files(info, function(changed)
+		if not changed then
+			return
+		end
 		local keys = {}
 		local function want(rev, path)
 			local key = rev .. ":" .. path -- same key as git_file_text
@@ -1354,9 +1700,10 @@ local function open_centered_float(buf, opts)
 	})
 end
 
--- Sets the normal-mode maps of `specs` on `buf` (nil: global maps). A spec is
--- { key, rhs, desc = ..., help = ... }: rhs is a command string or a function, nil to
--- only list the spec in the help; a nil or "" key skips the spec. `help` is its help
+-- Sets the maps of `specs` on `buf` (nil: global maps). A spec is
+-- { key, rhs, desc = ..., help = ..., mode = ... }: rhs is a command string or a
+-- function, nil to only list the spec in the help; mode defaults to "n"; a nil or ""
+-- key skips the spec. `help` is its help
 -- text (default: desc), false leaves it out. With `help_title`, "?" opens a help float
 -- listing the specs in order.
 local function bind_keymaps(buf, specs, help_title)
@@ -1365,7 +1712,7 @@ local function bind_keymaps(buf, specs, help_title)
 		local key, rhs = spec[1], spec[2]
 		if key and key ~= "" then
 			if rhs then
-				vim.keymap.set("n", key, rhs, { buffer = buf, silent = true, desc = spec.desc })
+				vim.keymap.set(spec.mode or "n", key, rhs, { buffer = buf, silent = true, desc = spec.desc })
 			end
 			local help = spec.help
 			if help == nil then
@@ -1493,8 +1840,20 @@ local function is_task_done(c)
 	return status == "DONE" or status == "RESOLVED"
 end
 
--- "- │ ☐ author time (#id) ↳ reply to #parent"
-local function format_comment_header(c)
+-- Label and highlight of the since-last-view comment marks
+local COMMENT_MARKS = {
+	new = { label = "[new]", hl = "BbPrCommentNew" },
+	edited = { label = "[edited]", hl = "BbPrCommentEdited" },
+}
+
+-- "new" | "edited" | nil: the mark of comment `c` in `marks` (since.comment_marks, may be nil)
+local function comment_mark(marks, c)
+	return marks and c.id ~= nil and marks[c.id] or nil
+end
+
+-- "- │ ☐ author time (#id) ↳ reply to #parent [new]", the mark of `c` in `marks`
+-- (since.comment_marks, may be nil) and the byte column its label starts at
+local function format_comment_header(c, marks)
 	local depth = math.max(tonumber(c.depth or 0) or 0, 0)
 	local bars = depth > 0 and (string.rep("│", depth) .. " ") or ""
 	local status = ""
@@ -1512,7 +1871,25 @@ local function format_comment_header(c)
 	if reply_to > 0 then
 		header = header .. string.format(" ↳ reply to #%d", reply_to)
 	end
-	return header
+	local mark = comment_mark(marks, c)
+	local mark_col = nil
+	if mark then
+		mark_col = #header + 1
+		header = header .. " " .. COMMENT_MARKS[mark].label
+	end
+	return header, mark, mark_col
+end
+
+-- Highlights the mark labels of the comment view `view` shown in `buf`
+local function highlight_comment_marks(buf, view)
+	vim.api.nvim_buf_clear_namespace(buf, state.comment_mark_ns, 0, -1)
+	for line, m in pairs(view.marks_by_line or {}) do
+		local spec = COMMENT_MARKS[m.mark]
+		vim.api.nvim_buf_set_extmark(buf, state.comment_mark_ns, line - 1, m.col, {
+			end_col = m.col + #spec.label,
+			hl_group = spec.hl,
+		})
+	end
 end
 
 -- comment bodies and reaction lines are indented by this in both views
@@ -1529,10 +1906,15 @@ end
 -- Appends comment `c` to `lines`: header, indented body, reactions, blank separator.
 -- The header acts on the comment in both views; the PR Info overview (`overview`)
 -- also maps the body and reaction lines and shows "(empty)" for an empty body.
+-- view.marks (since.comment_marks, may be nil) adds the new/edited label to the header.
 local function append_comment_lines(lines, view, c, overview)
 	local comment_id = tonumber(c.id or 0) or 0
 	local body_id = overview and comment_id or nil
-	push_view_line(lines, view, format_comment_header(c), comment_id)
+	local header, mark, mark_col = format_comment_header(c, view.marks)
+	push_view_line(lines, view, header, comment_id)
+	if mark then
+		view.marks_by_line[#lines] = { mark = mark, col = mark_col }
+	end
 	local body = trim_edge_empty_lines(vim.split(c.text or "", "\n", { plain = true }))
 	if #body == 0 and overview then
 		body = { "(empty)" }
@@ -1554,13 +1936,21 @@ local function open_comment_float(comments, line)
 	local source_buf = vim.api.nvim_get_current_buf()
 
 	local lines = { string.format("PR comments for line %d", line), "" }
-	local view = { kind = "float", ids_by_line = {}, reaction_segments = {} }
+	local view = {
+		kind = "float",
+		tabpage = vim.api.nvim_win_get_tabpage(source_win),
+		ids_by_line = {},
+		reaction_segments = {},
+		marks_by_line = {},
+	}
+	view.marks = tab_comment_marks(view.tabpage)
 	for _, c in ipairs(comments) do
 		append_comment_lines(lines, view, c, false)
 	end
 
 	local buf = create_scratch_buf("markdown")
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	highlight_comment_marks(buf, view)
 	state.comment_view_by_buf[buf] = view
 	vim.b[buf].bb_pr_float_source_win = source_win
 	vim.b[buf].bb_pr_float_source_bufnr = source_buf
@@ -1626,8 +2016,12 @@ local function jump_comment(direction)
 end
 
 -- Places the comment signs / virtual text / underlines of `bufnr` and records the
--- comments per local line in state.line_comments_by_buf.
-local function render_buffer_comments(bufnr, comments_payload, cur_path, side, info, finfo)
+-- comments per local line in state.line_comments_by_buf. ctx = { path, side, info, finfo,
+-- marks }: the buffer's repo path and diff side, the tab's diff base and the window's
+-- file info (both nil without line translation), and since.comment_marks (may be nil),
+-- which labels a line "[new]" when any of its comments is new, else "[edited]".
+local function render_buffer_comments(bufnr, comments_payload, ctx)
+	local cur_path, side, info, finfo, marks = ctx.path, ctx.side, ctx.info, ctx.finfo, ctx.marks
 	local line_count = vim.api.nvim_buf_line_count(bufnr)
 	vim.api.nvim_buf_clear_namespace(bufnr, state.comment_ns, 0, -1)
 	local by_line = {}
@@ -1661,7 +2055,12 @@ local function render_buffer_comments(bufnr, comments_payload, cur_path, side, i
 			local preview = split_first_line(line_comments[1].text)
 			local root_count = 0
 			local fully_resolved = true
+			local line_mark = nil
 			for _, c in ipairs(line_comments) do
+				local mark = comment_mark(marks, c)
+				if mark == "new" or (mark and not line_mark) then
+					line_mark = mark
+				end
 				if (tonumber(c.parent_id or 0) or 0) == 0 then
 					root_count = root_count + 1
 					if not c.is_resolved then
@@ -1674,11 +2073,17 @@ local function render_buffer_comments(bufnr, comments_payload, cur_path, side, i
 			local virt_text_hl = resolved and "BbPrResolvedVirtText" or "DiagnosticVirtualTextInfo"
 			local sign_icon = resolved and "✅" or "💬"
 			local sign_hl = resolved and "BbPrResolvedVirtText" or "DiagnosticSignInfo"
-			local vt = string.format("%s %d %s", sign_icon, #line_comments, preview)
+			local virt_text = { { string.format("%s %d ", sign_icon, #line_comments), virt_text_hl } }
+			if line_mark then
+				local spec = COMMENT_MARKS[line_mark]
+				table.insert(virt_text, { spec.label, spec.hl })
+				table.insert(virt_text, { " ", virt_text_hl })
+			end
+			table.insert(virt_text, { preview, virt_text_hl })
 			vim.api.nvim_buf_set_extmark(bufnr, state.comment_ns, line - 1, 0, {
 				sign_text = sign_icon,
 				sign_hl_group = sign_hl,
-				virt_text = { { vt, virt_text_hl } },
+				virt_text = virt_text,
 				virt_text_pos = "eol",
 			})
 			local line_text = vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or ""
@@ -1707,6 +2112,7 @@ apply_comments_to_current_buffer = function(comments_payload)
 	local side = finfo and finfo.side or current_diff_side()
 	-- translate Bitbucket line numbers when the PR tab knows its commits
 	local info = finfo and tab_diff_base()
+	local marks = tab_comment_marks()
 
 	-- The marks are buffer extmarks (eol virtual text needs no window width), so they
 	-- depend only on these inputs. CursorMoved / WinScrolled re-run this for every
@@ -1718,6 +2124,9 @@ apply_comments_to_current_buffer = function(comments_payload)
 		from_path = finfo and finfo.from_path or false,
 		side = side,
 		info = info or false,
+		-- set_tab_comments resets the memo when it recomputes the marks; this also
+		-- covers a retracked tab (new since) keeping its payload
+		marks = marks or false,
 		tick = vim.api.nvim_buf_get_changedtick(bufnr),
 	}
 	local prev = state.rendered_by_buf[bufnr]
@@ -1732,7 +2141,11 @@ apply_comments_to_current_buffer = function(comments_payload)
 	end
 	if not unchanged then
 		state.rendered_by_buf[bufnr] = memo
-		render_buffer_comments(bufnr, comments_payload, cur_path, side, info, finfo)
+		render_buffer_comments(
+			bufnr,
+			comments_payload,
+			{ path = cur_path, side = side, info = info, finfo = finfo, marks = marks }
+		)
 	end
 
 	-- only file buffers get the comment keymaps: the diffview file panel, commit log
@@ -1758,6 +2171,52 @@ local function each_diffview_file_comp(node, fn)
 	end
 end
 
+-- The visible rows of a diffview panel component tree (CompStruct), in panel order:
+-- { row = 0-based like lstart, paths = { path, ... }, dir = true on a directory row }.
+-- A file row has its one path; a directory row (its dir_name component) has every file
+-- under it, those of collapsed subdirectories included. Hidden components (lend ==
+-- lstart, e.g. files of a collapsed directory) have no row; a component without lend
+-- counts as one row.
+function seen_view.panel_rows(components)
+	local rows = {}
+	local function row_of(comp)
+		if type(comp) ~= "table" or type(comp.lstart) ~= "number" then
+			return nil
+		end
+		local lend = type(comp.lend) == "number" and comp.lend or comp.lstart + 1
+		return lend > comp.lstart and comp.lstart or nil
+	end
+	local function file_path(comp)
+		local ctx = comp.context
+		return type(ctx) == "table" and type(ctx.path) == "string" and ctx.path or nil
+	end
+	local function walk(node)
+		if type(node) ~= "table" then
+			return
+		end
+		if node._name == "file" and type(node.comp) == "table" then
+			local row, path = row_of(node.comp), file_path(node.comp)
+			if row and path then
+				table.insert(rows, { row = row, paths = { path } })
+			end
+		elseif node._name == "directory" and type(node[1]) == "table" then
+			local row = row_of(node[1].comp)
+			if row then
+				local paths = {}
+				each_diffview_file_comp(node, function(comp)
+					table.insert(paths, file_path(comp))
+				end)
+				table.insert(rows, { row = row, paths = paths, dir = true })
+			end
+		end
+		for i = 1, #node do
+			walk(node[i])
+		end
+	end
+	walk(components)
+	return rows
+end
+
 local function collect_diffview_file_rows(panel_buf)
 	local ok, lib = pcall(require, "diffview.lib")
 	if not ok then
@@ -1773,13 +2232,14 @@ local function collect_diffview_file_rows(panel_buf)
 	if type(view.panel.components) ~= "table" then
 		return nil
 	end
+	-- file rows only: a file in a collapsed directory has none (its lstart is the next
+	-- visible row's)
 	local rows = {}
-	each_diffview_file_comp(view.panel.components, function(comp)
-		local ctx = comp.context
-		if type(ctx) == "table" and type(ctx.path) == "string" and type(comp.lstart) == "number" then
-			rows[ctx.path] = comp.lstart
+	for _, r in ipairs(seen_view.panel_rows(view.panel.components)) do
+		if not r.dir then
+			rows[r.paths[1]] = r.row
 		end
-	end)
+	end
 	if next(rows) == nil then
 		return nil
 	end
@@ -1793,21 +2253,36 @@ local function mark_panel_row(buf, row)
 	})
 end
 
+-- Dims the row of a viewed file; a line highlight, so the 💬 sign stays visible.
+local function mark_panel_row_viewed(buf, row)
+	vim.api.nvim_buf_set_extmark(buf, state.diffview_panel_ns, row, 0, {
+		line_hl_group = "BbPrViewedFile",
+	})
+end
+
+-- Marks the diffview panel files that have comments and, in a tracked tab whose blobs
+-- arrived, dims the viewed files (viewed.files against viewed.blobs).
 local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payload)
 	if not (tabpage and vim.api.nvim_tabpage_is_valid(tabpage)) then
 		return
 	end
-	local paths_with_comments = {}
-	for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
-		if not c.is_outdated then
-			local path = c.path
-			if type(path) == "string" and path ~= "" then
-				paths_with_comments[normalize_repo_path(path)] = true
+	local _, viewed = seen_view.tracked(tabpage)
+	local blobs = viewed and viewed.blobs
+	-- the path set, built on the first memo miss only: a CursorMoved hit does no O(n) work
+	local paths_with_comments
+	local function build_paths()
+		paths_with_comments = {}
+		for _, c in ipairs(as_array(comments_payload and comments_payload.file_comments)) do
+			if not c.is_outdated then
+				local path = c.path
+				if type(path) == "string" and path ~= "" then
+					paths_with_comments[normalize_repo_path(path)] = true
+				end
 			end
 		end
 	end
-	if next(paths_with_comments) == nil then
-		return
+	local function is_viewed(path)
+		return blobs ~= nil and seen_view.viewed_lib.is_viewed(viewed.files, blobs, path)
 	end
 	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
 		if vim.api.nvim_win_is_valid(win) then
@@ -1822,16 +2297,26 @@ local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payl
 					payload = comments_payload,
 					tick = vim.api.nvim_buf_get_changedtick(buf),
 					precise = rows ~= nil,
+					-- viewed.version moves on every mark change and when the blobs land;
+					-- a retracked tab gets a new viewed table
+					viewed = viewed or false,
+					viewed_version = viewed and viewed.version or false,
 				}
 				local prev = state.panel_rendered_by_buf[buf]
-				if
-					not (
-						prev
-						and prev.payload == memo.payload
-						and prev.tick == memo.tick
-						and prev.precise == memo.precise
-					)
-				then
+				local miss = not (
+					prev
+					and prev.payload == memo.payload
+					and prev.tick == memo.tick
+					and prev.precise == memo.precise
+					and prev.viewed == memo.viewed
+					and prev.viewed_version == memo.viewed_version
+				)
+				if miss and not paths_with_comments then
+					build_paths()
+				end
+				-- a tracked tab always renders, so the dimming of a file unmarked meanwhile
+				-- gets cleared; an untracked one without comments keeps its panel as is
+				if miss and (viewed or next(paths_with_comments) ~= nil) then
 					state.panel_rendered_by_buf[buf] = memo
 					vim.api.nvim_buf_clear_namespace(buf, state.diffview_panel_ns, 0, -1)
 					if rows then
@@ -1839,23 +2324,36 @@ local function apply_comment_indicators_to_diffview_panel(tabpage, comments_payl
 							if paths_with_comments[normalize_repo_path(path)] then
 								mark_panel_row(buf, row)
 							end
+							if is_viewed(path) then
+								mark_panel_row_viewed(buf, row)
+							end
 						end
 					else
 						-- Fallback for older diffview versions: full path / basename match.
 						local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-						local marked = {}
-						for path, _ in pairs(paths_with_comments) do
-							local basename = path:match("([^/]+)$") or path
-							for idx, line in ipairs(lines) do
-								if not marked[idx] and type(line) == "string" then
-									if line:find(path, 1, true) or line:find(basename, 1, true) then
-										marked[idx] = true
-										mark_panel_row(buf, idx - 1)
-										break
+						local function mark_matching(paths, mark)
+							local marked = {}
+							for path, _ in pairs(paths) do
+								local basename = path:match("([^/]+)$") or path
+								for idx, line in ipairs(lines) do
+									if not marked[idx] and type(line) == "string" then
+										if line:find(path, 1, true) or line:find(basename, 1, true) then
+											marked[idx] = true
+											mark(buf, idx - 1)
+											break
+										end
 									end
 								end
 							end
 						end
+						mark_matching(paths_with_comments, mark_panel_row)
+						local viewed_paths = {}
+						for path in pairs(blobs or {}) do
+							if is_viewed(path) then
+								viewed_paths[path] = true
+							end
+						end
+						mark_matching(viewed_paths, mark_panel_row_viewed)
 					end
 				end
 			end
@@ -1875,16 +2373,17 @@ local function apply_comments_to_tab(tabpage, comments_payload, opts)
 		if vim.api.nvim_win_is_valid(win) then
 			local ok, err = pcall(vim.api.nvim_win_call, win, function()
 				apply_comments_to_current_buffer(comments_payload)
-				if refresh_info then
-					local bufnr = vim.api.nvim_get_current_buf()
-					local info_pr = pr_info_buffer_pr(bufnr)
-					if info_pr then
-						apply_pr_info_content(bufnr, info_pr)
-					end
-				end
 			end)
 			if not ok then
 				log("apply_comments_to_tab: window", win, "failed:", err)
+			end
+		end
+	end
+	if refresh_info then
+		for _, buf in ipairs(seen_view.info_bufs(tabpage)) do
+			local ok, err = pcall(apply_pr_info_content, buf, pr_info_buffer_pr(buf))
+			if not ok then
+				log("apply_comments_to_tab: PR Info", buf, "failed:", err)
 			end
 		end
 	end
@@ -1893,6 +2392,7 @@ end
 
 -- Calls fn until it returns true: at most opts.tries calls, opts.delay ms apart.
 -- The first call runs after opts.first_delay ms, or right away when that is nil.
+-- opts.on_give_up, when given, runs after the last call failed.
 local function retry(fn, opts)
 	local tries_left = opts.tries
 	local function attempt()
@@ -1902,6 +2402,8 @@ local function retry(fn, opts)
 		tries_left = tries_left - 1
 		if tries_left > 0 then
 			vim.defer_fn(attempt, opts.delay)
+		elseif opts.on_give_up then
+			opts.on_give_up()
 		end
 	end
 	if opts.first_delay then
@@ -1929,10 +2431,394 @@ local function apply_comments_when_diffview_ready(tabpage, comments_payload, ref
 	end, { tries = 20, delay = 100 })
 end
 
-local function build_lines(prs)
+-- Measures in the background how the PR moved from since.baseline to the source tip
+-- and stores it in since.delta (shape in the state.tabs comment). The merge base of
+-- the source tip with origin/<to_ref> is diff_base.base. Dropped when the tab closed
+-- or got a new `since` meanwhile; otherwise re-renders the tab's file panel and PR Info.
+-- on_done(delta), when given, runs last: with the stored delta, or nil when dropped.
+compute_since_delta = function(tabpage, since, to_ref, on_done)
+	local ts = tab_state(tabpage)
+	local info = ts.diff_base
+	local baseline = since.baseline
+	local opts = { cwd = info.root, text = true }
+	local results = {}
+	-- one extra count until every job is started, so none can finish the delta early
+	local pending = 1
+
+	local function finish(delta)
+		local live = vim.api.nvim_tabpage_is_valid(tabpage) and state.tabs[tab_key(tabpage)] == ts
+		if not (live and ts.since == since) then
+			log("since_last_view: delta dropped, the tab closed or was retracked:", since.key)
+			if on_done then
+				on_done(nil)
+			end
+			return
+		end
+		since.delta = delta
+		if delta.missing_baseline then
+			log("since_last_view: baseline commit missing locally:", since.key, baseline)
+		elseif not delta.failed then
+			log(
+				"since_last_view: delta",
+				since.key,
+				"commits=" .. tostring(delta.commits),
+				"ancestor=" .. tostring(delta.ancestor),
+				"base_changed=" .. tostring(delta.base_changed)
+			)
+		end
+		-- refresh_info: PR Info's "Since Last View" section shows the delta
+		apply_comments_when_diffview_ready(tabpage, ts.comments, true)
+		if on_done then
+			on_done(delta)
+		end
+	end
+
+	local function assemble_delta()
+		if results.exists.code ~= 0 then
+			finish({ missing_baseline = true })
+			return
+		end
+		-- --is-ancestor exits 0 (yes) or 1 (no); anything else is an error
+		local ancestor_code = results.ancestor.code
+		local ancestor = ancestor_code == 0
+		local ancestor_failed = ancestor_code ~= 0 and ancestor_code ~= 1
+		local count_failed = ancestor and results.count.code ~= 0
+		-- merge-base exits 1 when the commits share no base, which is no error
+		local target_base_failed = results.target_base ~= nil and results.target_base.code > 1
+		if ancestor_failed or count_failed or target_base_failed then
+			local errors = {}
+			for name, r in pairs(results) do
+				errors[name] = { code = r.code, stderr = r.stderr }
+			end
+			log("since_last_view: delta failed:", since.key, errors)
+			finish({ failed = true })
+			return
+		end
+		-- no merge base with the target (exit 1) counts as a changed one
+		local base_changed = not ancestor
+			or (results.target_base ~= nil and vim.trim(results.target_base.stdout or "") ~= info.base)
+		finish({
+			ancestor = ancestor,
+			commits = ancestor and tonumber(vim.trim(results.count.stdout or "")) or nil,
+			base_changed = base_changed,
+		})
+	end
+
+	local function job_done()
+		pending = pending - 1
+		if pending == 0 then
+			assemble_delta()
+		end
+	end
+	-- start(cb) runs a job that calls cb(result) on the main loop
+	local function run(name, start)
+		pending = pending + 1
+		start(function(result)
+			results[name] = result
+			job_done()
+		end)
+	end
+	local function git(args)
+		return function(cb)
+			vim.system(vim.list_extend({ "git" }, args), opts, function(r)
+				vim.schedule(function()
+					cb(r)
+				end)
+			end)
+		end
+	end
+
+	run("exists", git({ "cat-file", "-e", baseline .. "^{commit}" }))
+	run("ancestor", git({ "merge-base", "--is-ancestor", baseline, info.source }))
+	run("count", git({ "rev-list", "--count", baseline .. ".." .. info.source }))
+	if to_ref then
+		run("target_base", git({ "merge-base", baseline, "origin/" .. to_ref }))
+	end
+	job_done()
+end
+
+-- Viewed files (D1-D3); in seen_view as the main chunk is close to the locals limit.
+seen_view.viewed_lib = require("bb_pr.viewed")
+
+-- Sets tab_state(tabpage).viewed (shape in the state.tabs comment) for the tracked
+-- `since`, with `files` the view record's marks, then fetches the PR files' blob shas
+-- in the background: at the source tip, or at the merge base for a file the PR
+-- deletes. Dropped when the tab closed, got a new `since` or a new `viewed` meanwhile;
+-- otherwise re-renders the tab. A git failure is logged, leaves blobs nil and sets
+-- viewed.failed.
+function seen_view.compute_viewed(tabpage, since, files)
+	local ts = tab_state(tabpage)
+	local info = ts.diff_base
+	local viewed = { files = vim.deepcopy(files or {}), version = 0 }
+	ts.viewed = viewed
+	local function live()
+		return vim.api.nvim_tabpage_is_valid(tabpage)
+			and state.tabs[tab_key(tabpage)] == ts
+			and ts.since == since
+			and ts.viewed == viewed
+	end
+	-- cb(blobs) on the main loop, or cb(nil) when git failed (logged)
+	local function ls_tree(rev, paths, cb)
+		if #paths == 0 then
+			cb({})
+			return
+		end
+		local cmd = vim.list_extend({ "git", "--literal-pathspecs", "ls-tree", "-r", "-z", rev, "--" }, paths)
+		vim.system(cmd, { cwd = info.root, text = true }, function(res)
+			vim.schedule(function()
+				if res.code ~= 0 then
+					log("viewed: git ls-tree failed:", since.key, rev, res.stderr)
+					cb(nil)
+					return
+				end
+				cb(seen_view.viewed_lib.parse_ls_tree(res.stdout))
+			end)
+		end)
+	end
+	local function finish(blobs)
+		if not live() then
+			log("viewed: blobs dropped, the tab closed or was retracked:", since.key)
+			return
+		end
+		if not blobs then
+			viewed.failed = true
+			return
+		end
+		viewed.blobs = blobs
+		-- the version bump misses the panel memo, so the next render shows the dimming
+		viewed.version = viewed.version + 1
+		-- the file already shown gets no BufEnter/CursorMoved of its own; a mark already
+		-- re-rendered the panel and PR Info (set_viewed)
+		if tabpage == vim.api.nvim_get_current_tabpage() and seen_view.mark_shown_file(tabpage) then
+			return
+		end
+		-- refresh_info: PR Info shows the "Files viewed" count from now on
+		apply_comments_when_diffview_ready(tabpage, ts.comments, true)
+	end
+
+	with_pr_changed_files(info, function(changed)
+		if not changed then
+			log("viewed: no PR file list, nothing is marked:", since.key)
+			finish(nil)
+			return
+		end
+		local paths = {}
+		for _, f in ipairs(changed) do
+			table.insert(paths, f.path)
+		end
+		ls_tree(info.source, paths, function(tip)
+			if not tip then
+				finish(nil)
+				return
+			end
+			local deleted = {}
+			for _, path in ipairs(paths) do
+				if not tip[path] then
+					table.insert(deleted, path)
+				end
+			end
+			ls_tree(info.base, deleted, function(removed)
+				if not removed then
+					finish(nil)
+					return
+				end
+				for path, sha in pairs(removed) do
+					tip[path] = sha
+				end
+				finish(tip)
+			end)
+		end)
+	end)
+end
+
+-- The tab state and viewed state of a tracked `tabpage`, or nil when it is not tracked.
+function seen_view.tracked(tabpage)
+	local ts = state.tabs[tab_key(tabpage)]
+	local viewed = ts and ts.viewed
+	if viewed and ts.since then
+		return ts, viewed
+	end
+end
+
+-- Marks (path -> blob sha) or unmarks (path -> false) files of the tracked `tabpage`:
+-- writes the view record with seen.set_files (one synchronous read-modify-write of the
+-- store), then updates viewed.files, bumps viewed.version, resets the panel memo and
+-- re-renders the panel and the tab's PR Info, once per call. On failure it logs and
+-- changes nothing in memory. Returns whether it wrote.
+function seen_view.set_viewed(tabpage, changes)
+	local ts, viewed = seen_view.tracked(tabpage)
+	if not ts then
+		return false
+	end
+	if next(changes or {}) == nil then
+		return true
+	end
+	local written, why = seen.set_files(M.config.since_last_view.store_path, ts.since.key, changes)
+	if not written then
+		log("viewed: failed to write marks", ts.since.key, changes, why)
+		return false
+	end
+	for path, sha in pairs(changes) do
+		viewed.files[path] = sha or nil
+	end
+	viewed.version = viewed.version + 1
+	state.panel_rendered_by_buf = {}
+	-- the one place a re-render of what shows the marks (panel, PR Info) belongs
+	apply_comment_indicators_to_diffview_panel(tabpage, ts.comments)
+	seen_view.refresh_info(tabpage)
+	return true
+end
+
+-- The PR Info buffers shown in the windows of `tabpage`, each once, in window order;
+-- with `pr_id`, only those of that PR
+function seen_view.info_bufs(tabpage, pr_id)
+	local bufs, added = {}, {}
+	for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+		local buf = vim.api.nvim_win_get_buf(win)
+		local info_pr = pr_info_buffer_pr(buf)
+		if info_pr and not added[buf] and (pr_id == nil or tostring(info_pr.id) == tostring(pr_id)) then
+			added[buf] = true
+			table.insert(bufs, buf)
+		end
+	end
+	return bufs
+end
+
+-- Rebuilds the PR Info of the tab's PR when it is open in `tabpage` (its "Files viewed"
+-- count). With none open, the cost is one pass over the tab's windows: the auto-mark
+-- never finds one, as it waits for PR Info to close.
+function seen_view.refresh_info(tabpage)
+	local ts = state.tabs[tab_key(tabpage)]
+	local pr = ts and ts.pr
+	if not pr then
+		return
+	end
+	for _, buf in ipairs(seen_view.info_bufs(tabpage, pr.id)) do
+		apply_pr_info_content(buf, pr_info_buffer_pr(buf))
+	end
+end
+
+-- Marks the file the tab's Diffview shows as viewed (D3), for tracked tabs whose blobs
+-- arrived. `tabpage` must be the current tab: the file comes from diffview's
+-- get_current_view(), i.e. the current tab's view. Runs on every BufEnter/CursorMoved
+-- and returns at once while the shown file stays the same (no git calls, no store
+-- reads); on a file switch to an unviewed file, set_viewed reads and writes the store
+-- synchronously. A PR Info window in the tab, or one open_diffview is still to open,
+-- defers the mark (last_path unchanged) until it closes. Returns whether it marked a file.
+function seen_view.mark_shown_file(tabpage)
+	local _, viewed = seen_view.tracked(tabpage)
+	local blobs = viewed and viewed.blobs
+	if not blobs then
+		return false
+	end
+	local ok, lib = pcall(require, "diffview.lib")
+	local view = ok and lib.get_current_view() or nil
+	local path = view and view.cur_entry and view.cur_entry.path
+	if not path or path == viewed.last_path then
+		return false
+	end
+	-- also while open_diffview's PR Info is still to open (info_pending, info_autocmd)
+	local ts = tab_state(tabpage)
+	if #seen_view.info_bufs(tabpage) > 0 or ts.info_pending or ts.info_autocmd then
+		return false
+	end
+	viewed.last_path = path
+	local sha = blobs[path]
+	if not sha or seen_view.viewed_lib.is_viewed(viewed.files, blobs, path) then
+		return false
+	end
+	return seen_view.set_viewed(tabpage, { [path] = sha })
+end
+
+-- The paths on panel rows first..last (0-based, inclusive) of seen_view.panel_rows,
+-- deduplicated, in panel order: a directory row stands for every file under it.
+function seen_view.panel_paths_in_rows(components, first, last)
+	local paths, added = {}, {}
+	for _, r in ipairs(seen_view.panel_rows(components)) do
+		if r.row >= first and r.row <= last then
+			for _, path in ipairs(r.paths) do
+				if not added[path] then
+					added[path] = true
+					table.insert(paths, path)
+				end
+			end
+		end
+	end
+	return paths
+end
+
+-- The paths :BBPRToggleViewed acts on in the current buffer: in the Diffview panel
+-- (`view.panel`), the files on lines line1..line2 (1-based); elsewhere the shown file.
+function seen_view.viewed_targets(view, line1, line2)
+	local shown = view and view.cur_entry and view.cur_entry.path
+	if view and type(view.panel) == "table" and view.panel.bufid == vim.api.nvim_get_current_buf() then
+		local first, last = math.min(line1, line2) - 1, math.max(line1, line2) - 1
+		return seen_view.panel_paths_in_rows(view.panel.components, first, last)
+	end
+	return shown and { shown } or {}
+end
+
+-- :BBPRToggleViewed (D4) in the current tab. In the Diffview panel: the files on lines
+-- line1..line2 (1-based; directory lines expand to their files); elsewhere in the tab:
+-- the shown file (cur_entry). Only PR files with a blob count. Marks them all when one
+-- is not viewed, else unmarks them all. A toggle that covers the shown file sets
+-- viewed.last_path to it, so the auto-mark does not undo an unmark at the next
+-- CursorMoved; it marks again once the user leaves the file and comes back.
+function seen_view.toggle_viewed(line1, line2)
+	local tabpage = vim.api.nvim_get_current_tabpage()
+	local ts = state.tabs[tab_key(tabpage)]
+	local pr = ts and ts.pr
+	local function notify(msg, level)
+		vim.notify("bb_pr: " .. msg, level or vim.log.levels.INFO)
+	end
+	if not pr then
+		return notify("no PR tracked for current tab", vim.log.levels.WARN)
+	end
+	if pr.is_mine then
+		return notify("change tracking is disabled for your own PRs")
+	end
+	local _, viewed = seen_view.tracked(tabpage)
+	if not viewed then
+		return notify("viewed files are tracked only in the tab of an open PR", vim.log.levels.WARN)
+	end
+	local blobs = viewed.blobs
+	if not blobs then
+		if viewed.failed then
+			return notify("could not read the state of the PR files (see the log)", vim.log.levels.WARN)
+		end
+		return notify("the state of the PR files is still loading")
+	end
+	local ok, lib = pcall(require, "diffview.lib")
+	local view = ok and lib.get_current_view() or nil
+	local shown = view and view.cur_entry and view.cur_entry.path
+	local paths = {}
+	for _, path in ipairs(seen_view.viewed_targets(view, line1, line2)) do
+		if blobs[path] then
+			table.insert(paths, path)
+		end
+	end
+	if #paths == 0 then
+		return notify("no PR file here to mark as viewed")
+	end
+	local mark = seen_view.viewed_lib.action(viewed.files, blobs, paths) == "mark"
+	local changes = {}
+	for _, path in ipairs(paths) do
+		changes[path] = mark and blobs[path] or false
+	end
+	if not seen_view.set_viewed(tabpage, changes) then
+		return notify("could not save the viewed marks (see the log)", vim.log.levels.ERROR)
+	end
+	if shown and changes[shown] ~= nil then
+		viewed.last_path = shown
+	end
+end
+
+-- markers: from seen_view.list_markers, or nil without tracking
+local function build_lines(prs, markers)
+	local pad = markers and string.rep(" ", seen_view.MARKER_WIDTH) or ""
 	local lines = {
-		"ID  STATE    AUTHOR               FROM -> TO           TITLE",
-		string.rep("-", 90),
+		pad .. "ID  STATE    AUTHOR               FROM -> TO           TITLE",
+		string.rep("-", 90 + #pad),
 	}
 
 	for _, pr in ipairs(prs) do
@@ -1942,7 +2828,7 @@ local function build_lines(prs)
 		local to_ref = (pr.toRef and pr.toRef.displayId) or "?"
 		table.insert(
 			lines,
-			string.format(
+			(markers and markers[pr] or "") .. string.format(
 				"%s %-3s %-8s %-20s %-18s %s",
 				format_build_marker(pr),
 				pr.id,
@@ -1986,9 +2872,12 @@ local function collect_diffview_file_entries(view)
 	return entries
 end
 
+-- opts.open_float (default true): open the line comments float there; opts.on_fail,
+-- when given, runs when the comment's file or line could not be reached
 local function navigate_to_file_comment_in_diffview(c, opts)
 	opts = opts or {}
 	local should_open_float = opts.open_float ~= false
+	local on_fail = opts.on_fail or function() end
 	local ok, lib = pcall(require, "diffview.lib")
 	local view = ok and lib.get_current_view() or nil
 	if type(view) ~= "table" then
@@ -1996,6 +2885,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 			string.format("bb_pr: comment on %s:%s", c.path or "?", tostring(c.line or "?")),
 			vim.log.levels.INFO
 		)
+		on_fail()
 		return
 	end
 
@@ -2019,6 +2909,7 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 				.. (#paths > 0 and ("\navailable: " .. table.concat(paths, ", ")) or ""),
 			vim.log.levels.WARN
 		)
+		on_fail()
 		return
 	end
 	if type(view.set_file) == "function" then
@@ -2091,10 +2982,10 @@ local function navigate_to_file_comment_in_diffview(c, opts)
 		if should_open_float then
 			retry(function()
 				return open_float_for_line(jumped.buf)
-			end, { tries = 20, delay = 100 })
+			end, { tries = 20, delay = 100, on_give_up = on_fail })
 		end
 		return true
-	end, { tries = 20, delay = 100, first_delay = 50 })
+	end, { tries = 20, delay = 100, first_delay = 50, on_give_up = on_fail })
 end
 
 local function navigate_to_overview_comment(pr, comment_id)
@@ -2110,40 +3001,56 @@ local function navigate_to_overview_comment(pr, comment_id)
 	end, { tries = 20, delay = 100, first_delay = 50 })
 end
 
-local function consume_pending_nav(pr_id)
+-- The pending comment jump of PR `pr_id`, removed from the queue unless `keep`
+local function consume_pending_nav(pr_id, keep)
 	local key = tonumber(pr_id or 0) or 0
 	if key <= 0 then
 		return nil
 	end
 	local nav = state.pending_nav_by_pr_id[key]
-	state.pending_nav_by_pr_id[key] = nil
+	if not keep then
+		state.pending_nav_by_pr_id[key] = nil
+	end
 	return nav
 end
 
-local function try_navigate_to_pending_comment(pr, payload)
-	local pr_id = tonumber(pr and pr.id or 0) or 0
-	local nav = consume_pending_nav(pr_id)
+-- Jumps to the PR's pending comment, if any. A jump to an overview comment opens PR
+-- Info, which counts as the PR Info of `tabpage` (the PR tab; sets its info_opened);
+-- either jump takes over from the PR Info open_diffview holds back (clears
+-- info_pending). on_fail, when given, runs when a pending jump finds no comment or
+-- cannot reach it.
+local function try_navigate_to_pending_comment(pr, payload, on_fail, tabpage)
+	on_fail = on_fail or function() end
+	local nav = consume_pending_nav(pr and pr.id)
 	if type(nav) ~= "table" then
+		-- no jump (or it vanished meanwhile): on_fail lets the caller open its fallback
+		on_fail()
 		return
 	end
 	local comment_id = tonumber(nav.comment_id or 0) or 0
 	if comment_id <= 0 then
+		on_fail()
 		return
 	end
 
+	local ts = tabpage and vim.api.nvim_tabpage_is_valid(tabpage) and tab_state(tabpage) or {}
 	for _, c in ipairs(as_array(payload and payload.file_comments)) do
 		if tonumber(c.id or 0) == comment_id then
-			navigate_to_file_comment_in_diffview(c)
+			ts.info_pending = nil
+			navigate_to_file_comment_in_diffview(c, { on_fail = on_fail })
 			return
 		end
 	end
 	for _, c in ipairs(as_array(payload and payload.overview_comments)) do
 		if tonumber(c.id or 0) == comment_id then
+			ts.info_pending = nil
+			ts.info_opened = true
 			navigate_to_overview_comment(pr, comment_id)
 			return
 		end
 	end
 	vim.notify("bb_pr: comment #" .. comment_id .. " not found in PR", vim.log.levels.WARN)
+	on_fail()
 end
 
 local function close_old_pr_tabs()
@@ -2290,7 +3197,47 @@ local function open_diffview(pr)
 
 	-- Comments only need the PR id, so fetch them alongside the git steps below;
 	-- they are shown once both the comments and the PR tab are there.
-	local comments_payload, pr_tab
+	local comments_payload, comments_failed, pr_tab
+	-- PR Info opens once per PR tab (D6, ts.info_opened), from the PR tab, once the
+	-- comments are shown or failed to load; a later comment reload never gets here.
+	-- With another tab current it waits for the next TabEnter of the PR tab
+	-- (ts.info_autocmd, a one-shot autocmd dropped when it fires or the tab closes) and
+	-- opens once the switch settled (BufEnter on the diff buffer); ts.info_autocmd stays
+	-- set until then, which holds the auto-mark back (seen_view.mark_shown_file).
+	local function open_info_once()
+		local ts = pr_tab and vim.api.nvim_tabpage_is_valid(pr_tab) and tab_state(pr_tab)
+		if not ts or ts.info_opened then
+			return
+		end
+		if pr_tab ~= vim.api.nvim_get_current_tabpage() then
+			if not ts.info_autocmd then
+				log("open_diffview: PR Info waits for the PR tab to be entered:", pr.id)
+				-- deleted by id: returning true would drop only the firing event's entry
+				ts.info_autocmd = vim.api.nvim_create_autocmd({ "TabEnter", "TabClosed" }, {
+					callback = function()
+						local valid = vim.api.nvim_tabpage_is_valid(pr_tab)
+						if valid and pr_tab ~= vim.api.nvim_get_current_tabpage() then
+							return
+						end
+						pcall(vim.api.nvim_del_autocmd, ts.info_autocmd)
+						if not valid then
+							ts.info_autocmd = nil
+							return
+						end
+						vim.schedule(function()
+							ts.info_autocmd = nil
+							open_info_once()
+						end)
+					end,
+				})
+			end
+			return
+		end
+		ts.info_opened = true
+		ts.info_pending = nil
+		-- the tab's comments when loaded; never a second fetch after a failure
+		open_pr_info_with_comments(pr, { no_fetch = true })
+	end
 	local function show_comments()
 		if not (comments_payload and pr_tab) then
 			return
@@ -2298,14 +3245,22 @@ local function open_diffview(pr)
 		local payload = comments_payload
 		set_tab_comments(pr_tab, payload)
 		apply_comments_when_diffview_ready(pr_tab, payload)
+		-- a pending comment jump opens its own view; PR Info only when the jump fails
+		if not consume_pending_nav(pr.id, true) then
+			open_info_once()
+		end
 		vim.defer_fn(function()
-			try_navigate_to_pending_comment(pr, payload)
+			try_navigate_to_pending_comment(pr, payload, open_info_once, pr_tab)
 		end, 300)
+	end
+	local function on_comments_failed()
+		comments_failed = true
+		open_info_once()
 	end
 	run_comments_provider(pr.id, function(payload)
 		comments_payload = payload
 		show_comments()
-	end, { notify_errors = false })
+	end, { notify_errors = false, on_error = on_comments_failed })
 
 	local function open_after_fetch()
 		local checkout_cmd = { "git", "checkout", "-B", from_ref, "origin/" .. from_ref }
@@ -2339,6 +3294,20 @@ local function open_diffview(pr)
 						)
 					end
 					close_old_pr_tabs()
+					-- A session restore (e.g. auto-session) recreates diffview:// buffers as
+					-- plain empty ones; Diffview reuses a buffer by name, so such a file would
+					-- show as fully added or deleted. Diffview's own rev buffers are "nowrite";
+					-- index (:0:) buffers are writable and stay.
+					for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+						local name = vim.api.nvim_buf_get_name(buf)
+						if
+							vim.bo[buf].buftype == ""
+							and vim.startswith(name, "diffview://")
+							and not name:find("/:%d:/")
+						then
+							pcall(vim.api.nvim_buf_delete, buf, { force = true })
+						end
+					end
 					-- "commits" diffs the target tip against the merge commit HEAD, which
 					-- holds the same content as the clean working tree; a conflicted merge
 					-- has no such commit, so it keeps the working tree
@@ -2358,6 +3327,13 @@ local function open_diffview(pr)
 					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
 					set_current_tab_diff_base(repo_root, from_ref, to_ref)
 					pr_tab = vim.api.nvim_get_current_tabpage()
+					-- holds the auto-mark back until PR Info opened (open_info_once)
+					tab_state(pr_tab).info_pending = true
+					-- before show_comments: set_tab_comments merges comment versions into `since`
+					track_tab_view(pr_tab, pr)
+					if comments_failed then
+						open_info_once()
+					end
 					show_comments()
 				end)
 			end)
@@ -2407,6 +3383,140 @@ local function open_diffview(pr)
 	end)
 end
 
+-- The escaped Diffview path arguments of `pr_files` (with_pr_changed_files): the
+-- source-tip path and, for a rename, the merge-base path too.
+local function pr_pathspecs(pr_files)
+	local paths, added = {}, {}
+	for _, f in ipairs(pr_files) do
+		for _, p in ipairs({ f.from_path, f.path }) do
+			if p and not added[p] then
+				added[p] = true
+				table.insert(paths, vim.fn.fnameescape(p))
+			end
+		end
+	end
+	return paths
+end
+
+-- :BBPRSinceLastView — a separate Diffview of since.baseline..diff_base.source for the
+-- tracked PR of the current tab. A baseline missing locally (a Bitbucket one) is fetched
+-- once from origin. When the merge base moved since the baseline, the diff is limited to
+-- the PR's own files. base_changed comes from since.delta; while the delta is pending or
+-- lacks it (failed, or the baseline was missing), compute_since_delta runs again, which
+-- also refreshes PR Info after a fetch. since.diff_opening keeps a second press
+-- from opening another Diffview meanwhile. The new tab has no tab_state().pr, so
+-- close_old_pr_tabs keeps it and no comments are drawn there; it closes with :DiffviewClose.
+local function open_since_last_view_diff()
+	local tabpage = vim.api.nvim_get_current_tabpage()
+	local ts = tab_state(tabpage)
+	local pr = ts.pr
+	if not pr then
+		vim.notify("bb_pr: no PR tracked for current tab", vim.log.levels.WARN)
+		return
+	end
+	if pr.is_mine then
+		vim.notify("bb_pr: change tracking is disabled for your own PRs", vim.log.levels.INFO)
+		return
+	end
+	local since = ts.since
+	local info = ts.diff_base
+	local baseline = since and since.baseline
+	if not (baseline and info) then
+		vim.notify("bb_pr: no earlier view of this PR to compare with (first view)", vim.log.levels.INFO)
+		return
+	end
+	local delta = since.delta
+	if baseline == info.source or (delta and delta.ancestor and delta.commits == 0) then
+		vim.notify("bb_pr: no new commits since last view", vim.log.levels.INFO)
+		return
+	end
+	local function notify_unavailable(why)
+		vim.notify(
+			"bb_pr: the last viewed commit " .. baseline:sub(1, 12) .. " " .. why,
+			vim.log.levels.WARN
+		)
+	end
+	-- the sha goes into git argv and the Diffview command line
+	if not baseline:match("^%x+$") then
+		notify_unavailable("is not a commit id")
+		return
+	end
+	if since.diff_opening then
+		return
+	end
+	since.diff_opening = true
+
+	local function tab_current()
+		return vim.api.nvim_tabpage_is_valid(tabpage) and state.tabs[tab_key(tabpage)] == ts and ts.since == since
+	end
+	local function open_diff(pr_files)
+		since.diff_opening = nil
+		if not tab_current() then
+			log("since_last_view: diff dropped, the tab closed or was retracked:", since.key)
+			return
+		end
+		local cmd = string.format(
+			"%s -C%s %s",
+			M.config.diffview_cmd,
+			vim.fn.fnameescape(info.root),
+			vim.fn.fnameescape(baseline .. ".." .. info.source)
+		)
+		if pr_files then
+			cmd = cmd .. " -- " .. table.concat(pr_pathspecs(pr_files), " ")
+			vim.notify(
+				"bb_pr: the merge base changed since last view; the diff is limited to the PR's files",
+				vim.log.levels.INFO
+			)
+		end
+		vim.cmd(cmd)
+	end
+
+	-- a dropped or failed delta (logged) opens the diff unlimited
+	local function open_when_measured()
+		local function with_delta(d)
+			if not (d and d.base_changed) then
+				open_diff(nil)
+				return
+			end
+			with_pr_changed_files(info, function(pr_files)
+				-- no PR file list (logged): the unlimited diff beats none
+				open_diff(pr_files)
+			end)
+		end
+		if delta and delta.base_changed ~= nil then
+			with_delta(delta)
+		elseif not tab_current() then
+			open_diff(nil) -- drops it
+		else
+			compute_since_delta(tabpage, since, pr.toRef and pr.toRef.displayId, with_delta)
+		end
+	end
+
+	local opts = { cwd = info.root, text = true }
+	vim.system({ "git", "cat-file", "-e", baseline .. "^{commit}" }, opts, function(exists)
+		vim.schedule(function()
+			if exists.code == 0 then
+				open_when_measured()
+				return
+			end
+			log("since_last_view: fetching the missing baseline:", since.key, baseline)
+			vim.system({ "git", "fetch", "origin", baseline }, opts, function(fetch)
+				vim.schedule(function()
+					if fetch.code ~= 0 then
+						log("since_last_view: baseline fetch failed:", since.key, fetch.stderr)
+						since.diff_opening = nil
+						notify_unavailable("is not available locally and could not be fetched (see log)")
+						return
+					end
+					-- the delta measured without the commit is stale
+					delta = nil
+					open_when_measured()
+				end)
+			end)
+		end)
+	end)
+end
+
 local function format_opened_date(ms)
 	if type(ms) ~= "number" or ms <= 0 then
 		return "unknown"
@@ -2448,6 +3558,7 @@ end
 -- Appends the body of the PR Info "## Comments" section to `lines` (every comment of the
 -- PR, grouped into threads, most recently active thread first) and records in `view`
 -- which comment each line acts on, the reaction lines and the thread heading lines.
+-- view.marks (since.comment_marks, may be nil) labels the new/edited comment headers.
 local function append_overview_comment_lines(lines, view, payload)
 	local comments = {}
 	vim.list_extend(comments, as_array(payload and payload.overview_comments))
@@ -2575,8 +3686,43 @@ local function build_status_lines(payload)
 	return lines
 end
 
--- The PR Info lines of `pr` and their comment view (see state.comment_view_by_buf)
-local function build_pr_info_content(pr)
+-- The PR Info "## Since Last View" section of a tracked tab's `since`; `viewed` and
+-- `pr_files` (diff_base.changed_files) of that tab give the "Files viewed: x/y" line,
+-- left out while the blobs load or after they failed
+local function since_section_lines(since, viewed, pr_files)
+	local summary = since_summary(since)
+	local lines = { "## Since Last View", "" }
+	table.insert(lines, summary.age_label and ("Last view: " .. summary.age_label) or "Last view: first open")
+	if summary.code_known then
+		local code = summary.rewritten and "branch history rewritten"
+			or summary.commits > 0 and plural(summary.commits, "new commit")
+			or "no new commits"
+		table.insert(lines, "Code: " .. code)
+	end
+	if summary.code_known and summary.bitbucket then
+		table.insert(lines, "Code compared from your Bitbucket review")
+	end
+	if since.comment_marks then
+		table.insert(lines, string.format("Comments: %d new, %d edited", summary.new, summary.edited))
+	end
+	if viewed and viewed.blobs and pr_files then
+		local paths = {}
+		for _, f in ipairs(pr_files) do
+			table.insert(paths, f.path)
+		end
+		local x, y = seen_view.viewed_lib.count(viewed.files, viewed.blobs, paths)
+		table.insert(lines, string.format("Files viewed: %d/%d", x, y))
+	end
+	table.insert(lines, "")
+	return lines
+end
+
+-- The PR Info lines of `pr` and their comment view (see state.comment_view_by_buf),
+-- built from the state of `tabpage` (the tab PR Info was opened from; the current tab
+-- once that one is closed). `comments` (kept in the view) replaces the tab's comments,
+-- for a PR other than the tab's.
+local function build_pr_info_content(pr, tabpage, comments)
+	local ts = tab_state(vim.api.nvim_tabpage_is_valid(tabpage) and tabpage or nil)
 	local function to_lines(text)
 		if type(text) ~= "string" or text == "" then
 			return { "(no description)" }
@@ -2594,7 +3740,7 @@ local function build_pr_info_content(pr)
 		"",
 	}
 
-	local conflict = get_current_tab_conflict()
+	local conflict = ts.conflict
 	if conflict then
 		-- right after "Opened:", so the conflict is the first thing visible in the header
 		table.insert(info_lines, 4, string.format("Merge: CONFLICT with origin/%s", conflict.to_ref))
@@ -2611,21 +3757,42 @@ local function build_pr_info_content(pr)
 
 	vim.list_extend(info_lines, build_approval_lines(pr))
 	table.insert(info_lines, "")
+	-- only the tab tracking this PR has a since (never own PRs); a PR Info opened from
+	-- the list for another PR gets neither the section nor the comment marks
+	local since = tab_since(tabpage, pr)
+	if since then
+		local pr_files = ts.diff_base and ts.diff_base.changed_files
+		vim.list_extend(info_lines, since_section_lines(since, ts.viewed, pr_files))
+	end
 	table.insert(info_lines, "## Build")
 	table.insert(info_lines, "")
 
-	vim.list_extend(info_lines, build_status_lines(get_current_tab_builds()))
+	vim.list_extend(info_lines, build_status_lines(ts.builds))
 	table.insert(info_lines, "")
 	table.insert(info_lines, "## Comments")
 	table.insert(info_lines, "")
 
-	local view = { kind = "overview", pr = pr, ids_by_line = {}, reaction_segments = {}, thread_lines = {} }
-	append_overview_comment_lines(info_lines, view, get_current_tab_comments())
+	local view = {
+		kind = "overview",
+		pr = pr,
+		tabpage = tabpage,
+		marks = since and since.comment_marks,
+		ids_by_line = {},
+		reaction_segments = {},
+		thread_lines = {},
+		marks_by_line = {},
+		comments = comments,
+	}
+	append_overview_comment_lines(info_lines, view, comments or ts.comments)
 	return info_lines, view
 end
 
-apply_pr_info_content = function(buf, pr)
-	local info_lines, view = build_pr_info_content(pr)
+-- `comments`: see build_pr_info_content; refreshes keep the ones of the first build
+apply_pr_info_content = function(buf, pr, comments)
+	-- the first build pins the buffer to the current tab; refreshes reuse that tab
+	local old_view = comment_view(buf)
+	local tabpage = old_view and old_view.tabpage or vim.api.nvim_get_current_tabpage()
+	local info_lines, view = build_pr_info_content(pr, tabpage, comments or (old_view and old_view.comments))
 
 	local saved_cursors = {}
 	for _, win in ipairs(vim.fn.win_findbuf(buf)) do
@@ -2635,6 +3802,7 @@ apply_pr_info_content = function(buf, pr)
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, info_lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+	highlight_comment_marks(buf, view)
 	-- set once: re-setting it would re-run every FileType autocmd on each refresh
 	if vim.bo[buf].filetype ~= "markdown" then
 		vim.bo[buf].filetype = "markdown"
@@ -2736,9 +3904,10 @@ local function open_edit_pr_description(pr, info_buf)
 	end)
 end
 
-local function open_pr_info(pr)
+-- `comments`: see build_pr_info_content
+local function open_pr_info(pr, comments)
 	local buf = vim.api.nvim_create_buf(false, true)
-	apply_pr_info_content(buf, pr)
+	apply_pr_info_content(buf, pr, comments)
 
 	local pr_id = tonumber(pr.id or 0) or 0
 	if pr_id > 0 then
@@ -2825,20 +3994,30 @@ local function open_pr_info(pr)
 	bind_keymaps(buf, specs, "PR Info — Keymaps")
 end
 
-open_pr_info_with_comments = function(pr)
-	local payload = get_current_tab_comments()
-	if payload then
+-- The tab's comments serve only its own PR (or a tab without one); another PR's PR
+-- Info gets its fetched comments, which never reach the tab's state or view record.
+-- opts.no_fetch: the own PR's PR Info opens with the tab's comments, or none, without
+-- fetching them.
+open_pr_info_with_comments = function(pr, opts)
+	local tab_pr = get_current_tab_pr()
+	local own = not tab_pr or tostring(tab_pr.id) == tostring(pr.id)
+	local payload = own and get_current_tab_comments()
+	if payload or (own and opts and opts.no_fetch) then
 		open_pr_info(pr)
 		return
 	end
 
 	run_comments_provider(pr.id, function(fetched)
-		set_current_tab_comments(fetched)
-		open_pr_info(pr)
+		if own then
+			set_current_tab_comments(fetched)
+			open_pr_info(pr)
+		else
+			open_pr_info(pr, fetched)
+		end
 	end, { notify_errors = true })
 end
 
-local function open_telescope_picker(prs)
+local function open_telescope_picker(prs, markers)
 	local ok_pickers, pickers = pcall(require, "telescope.pickers")
 	local ok_finders, finders = pcall(require, "telescope.finders")
 	local ok_config, telescope_config = pcall(require, "telescope.config")
@@ -2857,7 +4036,7 @@ local function open_telescope_picker(prs)
 				entry_maker = function(pr)
 					return {
 						value = pr,
-						display = format_pr_entry(pr),
+						display = format_pr_entry(pr, markers and markers[pr]),
 						ordinal = table.concat({ tostring(pr.id or ""), pr.title or "", pr.state or "" }, " "),
 					}
 				end,
@@ -2912,8 +4091,10 @@ function M.open_list()
 	run_provider(function(prs)
 		local sorted_prs = prs or {}
 		state.prs = sorted_prs
+		seen_view.forget_closed_prs(sorted_prs)
+		local markers = seen_view.list_markers(sorted_prs)
 
-		if open_telescope_picker(sorted_prs) then
+		if open_telescope_picker(sorted_prs, markers) then
 			return
 		end
 
@@ -2921,7 +4102,7 @@ function M.open_list()
 		vim.api.nvim_buf_set_name(buf, "bb_pr://pull_requests")
 		vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
 		vim.api.nvim_set_option_value("filetype", "bb_pr", { buf = buf })
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs))
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines(sorted_prs, markers))
 
 		-- the PR on the cursor line, below the two header lines of build_lines
 		local function pr_at_cursor()
@@ -4522,6 +5703,9 @@ function M.setup(opts)
 
 	vim.api.nvim_set_hl(0, "BbPrResolvedThread", { default = true, underline = true, sp = "Gray" })
 	vim.api.nvim_set_hl(0, "BbPrResolvedVirtText", { default = true, link = "Comment" })
+	vim.api.nvim_set_hl(0, "BbPrCommentNew", { default = true, link = "DiagnosticInfo" })
+	vim.api.nvim_set_hl(0, "BbPrCommentEdited", { default = true, link = "DiagnosticWarn" })
+	vim.api.nvim_set_hl(0, "BbPrViewedFile", { default = true, link = "Comment" })
 
 	-- commands that just run a function; the wrapper keeps the command opts away from it
 	local commands = {
@@ -4594,11 +5778,40 @@ function M.setup(opts)
 		{ M.config.stats.map, "<cmd>BBPRStats<CR>", desc = "BB PR Stats" },
 	})
 
+	local since_cfg = M.config.since_last_view or {}
+	if since_cfg.enabled then
+		vim.api.nvim_create_user_command("BBPRSinceLastView", function()
+			open_since_last_view_diff()
+		end, { desc = "Diff the PR in current tab from the last viewed commit to its tip" })
+		vim.api.nvim_create_user_command("BBPRToggleViewed", function(cmd)
+			seen_view.toggle_viewed(cmd.line1, cmd.line2)
+		end, { range = true, desc = "Toggle the viewed mark of PR files (panel line or range, or the shown file)" })
+		bind_keymaps(nil, {
+			{ since_cfg.diff_map, "<cmd>BBPRSinceLastView<CR>", desc = "PR changes since last view" },
+			{ since_cfg.viewed_map, "<cmd>BBPRToggleViewed<CR>", desc = "Toggle file viewed" },
+			-- a function, not "<cmd>": '<,'> are only set once visual mode ends, so a
+			-- <cmd> range would be the previous selection; and not ":", which moves the
+			-- cursor to the start of the selection
+			{
+				since_cfg.viewed_map,
+				function()
+					local line1, line2 = vim.fn.line("v"), vim.fn.line(".")
+					vim.cmd("normal! " .. vim.keycode("<Esc>"))
+					seen_view.toggle_viewed(line1, line2)
+				end,
+				desc = "Toggle selected files viewed",
+				mode = "x",
+			},
+		})
+	end
+
 	local aug = vim.api.nvim_create_augroup("bb_pr_comments", { clear = true })
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "CursorMoved", "WinScrolled" }, {
 		group = aug,
 		callback = function()
 			local tabpage = vim.api.nvim_get_current_tabpage()
+			-- a mark resets the panel memo, so the render below shows it
+			seen_view.mark_shown_file(tabpage)
 			local pending_payload = consume_pending_tab_comments()
 			if pending_payload then
 				apply_comments_when_diffview_ready(tabpage, pending_payload)
@@ -4610,6 +5823,10 @@ function M.setup(opts)
 				-- cheap when nothing changed: apply_comments_to_current_buffer and the
 				-- panel indicators skip buffers whose render inputs are unchanged
 				apply_comments_to_tab(tabpage, payload)
+			elseif seen_view.tracked(tabpage) then
+				-- no payload yet (still loading) or ever (failed): keep the viewed-file
+				-- dimming across diffview's panel rewrites; the panel memo keeps it cheap
+				apply_comment_indicators_to_diffview_panel(tabpage, nil)
 			end
 		end,
 	})

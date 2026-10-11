@@ -87,6 +87,9 @@ type PullRequest struct {
 	UpdatedDate  int64  `json:"updatedDate"`
 	ClosedDate   int64  `json:"closedDate"`
 
+	OpenTaskCount     int `json:"openTaskCount"`
+	ResolvedTaskCount int `json:"resolvedTaskCount"`
+
 	Author struct {
 		User User `json:"user"`
 	} `json:"author"`
@@ -95,6 +98,9 @@ type PullRequest struct {
 	MyReviewStatus string     `json:"my_review_status,omitempty"`
 	MyApproved     bool       `json:"my_approved,omitempty"`
 	BuildStatus    string     `json:"build_status,omitempty"` // SUCCESSFUL | FAILED | INPROGRESS | NONE
+
+	MyLastReviewedCommit string `json:"my_last_reviewed_commit,omitempty"`
+	IsMine               bool   `json:"is_mine,omitempty"`
 
 	FromRef Ref `json:"fromRef"`
 	ToRef   Ref `json:"toRef"`
@@ -106,11 +112,42 @@ type PullRequest struct {
 	} `json:"links"`
 }
 
+// UnmarshalJSON fills the comment/task counters from "properties", the only
+// place Bitbucket Server 8.9.7 sends them. Top-level values are kept when a
+// key is absent from properties.
+func (p *PullRequest) UnmarshalJSON(data []byte) error {
+	type alias PullRequest
+	var aux struct {
+		alias
+		Properties struct {
+			CommentCount      *int `json:"commentCount"`
+			OpenTaskCount     *int `json:"openTaskCount"`
+			ResolvedTaskCount *int `json:"resolvedTaskCount"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*p = PullRequest(aux.alias)
+	if v := aux.Properties.CommentCount; v != nil {
+		p.CommentCount = *v
+	}
+	if v := aux.Properties.OpenTaskCount; v != nil {
+		p.OpenTaskCount = *v
+	}
+	if v := aux.Properties.ResolvedTaskCount; v != nil {
+		p.ResolvedTaskCount = *v
+	}
+	return nil
+}
+
 type Reviewer struct {
 	User     User   `json:"user"`
 	Role     string `json:"role"`
 	Approved bool   `json:"approved"`
 	Status   string `json:"status"`
+
+	LastReviewedCommit string `json:"lastReviewedCommit,omitempty"`
 }
 
 type Ref struct {
@@ -295,6 +332,7 @@ type PRCommentView struct {
 	TaskStatus    string              `json:"task_status,omitempty"`
 	IsResolved    bool                `json:"is_resolved,omitempty"`
 	IsOutdated    bool                `json:"is_outdated,omitempty"`
+	IsMine        bool                `json:"is_mine,omitempty"`
 	Version       int                 `json:"version"`
 }
 
@@ -1411,6 +1449,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 		return nil, err
 	}
 	self := <-selfCh
+	candidates := userCandidates(c.cfg)
 
 	out := &PullRequestComments{PRID: prID, FetchedAt: time.Now().Format(time.RFC3339)}
 	for _, item := range all {
@@ -1432,6 +1471,7 @@ func (c *Client) GetPullRequestComments(ctx context.Context, prID int64) (*PullR
 			ReactionUsers: reactionUsers,
 			IsResolved:    cmt.ThreadResolved,
 			IsOutdated:    item.IsOutdated,
+			IsMine:        isCurrentUser(cmt.Author, candidates),
 			Version:       cmt.Version,
 		}
 		if strings.ToUpper(strings.TrimSpace(cmt.Severity)) == "BLOCKER" {
@@ -2047,9 +2087,9 @@ func prSortBucket(pr PullRequest, candidates []string) int {
 	}
 }
 
-func reviewStatusForCurrentUser(pr PullRequest, candidates []string) (status string, approved bool) {
+func reviewStatusForCurrentUser(pr PullRequest, candidates []string) (status string, approved bool, lastReviewed string) {
 	if len(candidates) == 0 {
-		return "UNKNOWN", false
+		return "UNKNOWN", false, ""
 	}
 	for _, reviewer := range pr.Reviewers {
 		if !isCurrentUser(reviewer.User, candidates) {
@@ -2057,17 +2097,18 @@ func reviewStatusForCurrentUser(pr PullRequest, candidates []string) (status str
 		}
 		st := strings.ToUpper(strings.TrimSpace(reviewer.Status))
 		if reviewer.Approved || st == "APPROVED" {
-			return "APPROVED", true
+			return "APPROVED", true, reviewer.LastReviewedCommit
 		}
-		return cmp.Or(st, "PENDING"), false
+		return cmp.Or(st, "PENDING"), false, reviewer.LastReviewedCommit
 	}
-	return "NOT_REVIEWER", false
+	return "NOT_REVIEWER", false, ""
 }
 
 func enrichPullRequests(prs []PullRequest, cfg RuntimeConfig) {
 	candidates := userCandidates(cfg)
 	for i := range prs {
-		prs[i].MyReviewStatus, prs[i].MyApproved = reviewStatusForCurrentUser(prs[i], candidates)
+		prs[i].MyReviewStatus, prs[i].MyApproved, prs[i].MyLastReviewedCommit = reviewStatusForCurrentUser(prs[i], candidates)
+		prs[i].IsMine = isCurrentUser(prs[i].Author.User, candidates)
 	}
 }
 
