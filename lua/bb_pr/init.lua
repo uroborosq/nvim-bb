@@ -123,7 +123,9 @@ local state = {
 	--   info_opened once open_diffview opened the tab's PR Info (once per tab),
 	--   info_pending while that PR Info is still to open (holds the auto-mark back),
 	--   info_autocmd = the TabEnter autocmd id while it waits for the tab to be entered,
-	--   diff_base ({ root, base, source }: the commits Bitbucket anchors FROM / TO lines to),
+	--   diff_base ({ root, base, source }: the commits Bitbucket anchors FROM / TO lines to;
+	--   with_pr_changed_files adds changed_files, line_stats and, while its git runs,
+	--   changed_files_waiters),
 	--   since ({ key, prev, baseline, baseline_origin }: set only while the tab's PR is tracked;
 	--   the view record as it was when the tab opened and the commit changes are measured
 	--   from; see track_tab_view). With a baseline, since.delta arrives later (see
@@ -1425,39 +1427,43 @@ local function parse_cat_file_batch(out, count)
 	return texts
 end
 
--- cb({ { from_path, path }, ... }) on the main loop with the files the PR changes
--- (merge base → source tip), or cb(nil) when git fails; the name-status pass maps
--- renamed files to their merge-base path. Parsed once per diff-base object, i.e. per
--- (base, source).
+-- cb({ { from_path, path, added, deleted }, ... }) on the main loop with the files the
+-- PR changes (merge base → source tip), or cb(nil) when git fails; renamed files keep
+-- their merge-base path in from_path, binary files have nil added/deleted. Also sets
+-- info.line_stats = { files, added, deleted } (git numstat totals, merge base → source tip).
+-- Parsed once per diff-base object, i.e. per (base, source); calls made while git runs
+-- wait in info.changed_files_waiters for the same answer instead of spawning another git.
 local function with_pr_changed_files(info, cb)
 	if info.changed_files then
 		cb(info.changed_files)
 		return
 	end
-	local diff_cmd = { "git", "diff", "--name-status", "-z", "-M", info.base, info.source }
+	if info.changed_files_waiters then
+		table.insert(info.changed_files_waiters, cb)
+		return
+	end
+	info.changed_files_waiters = { cb }
+	local diff_cmd = { "git", "diff", "--numstat", "-z", "-M", info.base, info.source }
 	vim.system(diff_cmd, { cwd = info.root, text = true }, function(diff_res)
 		if diff_res.code ~= 0 then
 			log("with_pr_changed_files failed:", diff_res.stderr)
-			vim.schedule(function()
-				cb(nil)
-			end)
-			return
-		end
-		local fields = vim.split(diff_res.stdout or "", "\0", { plain = true })
-		local changed = {}
-		local i = 1
-		while i <= #fields and fields[i] ~= "" do
-			local renamed = fields[i]:match("^[RC]") ~= nil
-			local from_path = fields[i + 1]
-			local path = renamed and fields[i + 2] or from_path
-			i = i + (renamed and 3 or 2)
-			if path then
-				table.insert(changed, { from_path = from_path, path = path })
-			end
 		end
 		vim.schedule(function()
-			info.changed_files = changed
-			cb(changed)
+			local changed, totals
+			-- on failure changed_files stays nil, so the next call retries
+			if diff_res.code == 0 then
+				changed, totals = require("bb_pr.diffstat").parse_numstat(diff_res.stdout)
+			end
+			info.changed_files, info.line_stats = changed, totals
+			local waiters = info.changed_files_waiters
+			info.changed_files_waiters = nil
+			for _, waiter in ipairs(waiters) do
+				-- one throwing waiter must not leave the others (e.g. viewed tracking) waiting
+				local ok, err = pcall(waiter, changed)
+				if not ok then
+					log("with_pr_changed_files waiter failed:", err)
+				end
+			end
 		end)
 	end)
 end
@@ -3327,6 +3333,20 @@ local function open_diffview(pr)
 					set_current_tab_conflict(conflicted and { to_ref = to_ref } or nil)
 					set_current_tab_diff_base(repo_root, from_ref, to_ref)
 					pr_tab = vim.api.nvim_get_current_tabpage()
+					-- PR Info's "Changes:" line; its git runs alongside the comments fetch
+					local diff_base = tab_state(pr_tab).diff_base
+					if diff_base then
+						with_pr_changed_files(diff_base, function(changed)
+							-- a failure is logged already; skip when the tab's diff_base was replaced since
+							if
+								changed
+								and vim.api.nvim_tabpage_is_valid(pr_tab)
+								and tab_state(pr_tab).diff_base == diff_base
+							then
+								seen_view.refresh_info(pr_tab)
+							end
+						end)
+					end
 					-- holds the auto-mark back until PR Info opened (open_info_once)
 					tab_state(pr_tab).info_pending = true
 					-- before show_comments: set_tab_comments merges comment versions into `since`
@@ -3735,16 +3755,20 @@ local function build_pr_info_content(pr, tabpage, comments)
 		string.format("PR #%s", tostring(pr.id or "?")),
 		string.format("Title: %s", pr.title or ""),
 		string.format("Opened: %s (%s ago)", format_opened_date(pr.createdDate), format_opened_age(pr.createdDate)),
-		"",
-		"## Description",
-		"",
 	}
-
-	local conflict = ts.conflict
-	if conflict then
-		-- right after "Opened:", so the conflict is the first thing visible in the header
-		table.insert(info_lines, 4, string.format("Merge: CONFLICT with origin/%s", conflict.to_ref))
+	-- only the tab's own PR: its diff_base describes that PR's diff, not another one's
+	local line_stats = ts.pr and tostring(ts.pr.id) == tostring(pr.id) and ts.diff_base and ts.diff_base.line_stats
+	if line_stats then
+		table.insert(
+			info_lines,
+			string.format("Changes: %d files, +%d -%d", line_stats.files, line_stats.added, line_stats.deleted)
+		)
 	end
+	-- in the header, so the conflict is visible at once
+	if ts.conflict then
+		table.insert(info_lines, string.format("Merge: CONFLICT with origin/%s", ts.conflict.to_ref))
+	end
+	vim.list_extend(info_lines, { "", "## Description", "" })
 
 	vim.list_extend(info_lines, to_lines(pr.description))
 	table.insert(info_lines, "")
