@@ -98,6 +98,8 @@ local default_config = {
 		-- shown file in a diff buffer)
 		viewed_map = "<leader>rv",
 		use_bitbucket_baseline = true,
+		-- the PR list puts PRs whose files are all viewed and that have nothing new last
+		sort_done_last = true,
 	},
 
 	-- debug log: rotated when it exceeds max_size_bytes or max_age_seconds
@@ -136,7 +138,8 @@ local state = {
 	--   blobs nil without failed means still loading; files = { [path] = sha } the marks, a
 	--   copy of the record's kept in step with the store (seen_view.set_viewed);
 	--   last_path = the Diffview file last handled by the auto-mark; version counts the
-	--   blobs arrival and every set_viewed write
+	--   blobs arrival and every set_viewed write; all_viewed = the record's all_viewed as
+	--   stored (false when absent), see seen_view.sync_all_viewed
 	tabs = {},
 	comment_ns = vim.api.nvim_create_namespace("bb_pr_comments"),
 	-- "[new]" / "[edited]" highlights of the comment headers in PR Info and the float
@@ -810,19 +813,42 @@ function seen_view.forget_closed_prs(prs)
 end
 
 -- Read-only, once per PR list: { [pr] = format_marker column }, or nil when
--- tracking is off.
+-- tracking is off, and { [pr] = true } for the done PRs: blank marker (nothing new),
+-- comments seen, and every file viewed at the current source tip (record.all_viewed).
 function seen_view.list_markers(prs)
 	local cfg = M.config.since_last_view or {}
 	if not cfg.enabled then
-		return nil
+		return nil, {}
 	end
 	local records = seen.all(cfg.store_path)
-	local markers = {}
+	local markers, done = {}, {}
 	for _, pr in ipairs(prs) do
 		local key = seen.key(pr)
-		markers[pr] = seen_view.format_marker(pr, key and records[key] or nil)
+		local record = key and records[key] or nil
+		markers[pr] = seen_view.format_marker(pr, record)
+		local latest = type(pr.fromRef) == "table" and pr.fromRef.latestCommit or nil
+		done[pr] = record ~= nil
+			and not pr.is_mine
+			and pr_state(pr) == "OPEN"
+			and record.comment_count ~= nil
+			and type(latest) == "string"
+			and record.all_viewed == latest
+			and vim.trim(markers[pr]) == ""
 	end
-	return markers
+	return markers, done
+end
+
+-- `prs` with the done ones (list_markers) moved to the end, both parts in their order;
+-- unchanged without since_last_view.sort_done_last.
+function seen_view.sort_done_last(prs, done)
+	if not (M.config.since_last_view or {}).sort_done_last then
+		return prs
+	end
+	local head, tail = {}, {}
+	for _, pr in ipairs(prs) do
+		table.insert(done[pr] and tail or head, pr)
+	end
+	return vim.list_extend(head, tail)
 end
 
 local function plural(n, word)
@@ -1056,6 +1082,7 @@ local function track_tab_view(tabpage, pr)
 		comment_count = prev and tonumber(prev.comment_count) or nil,
 		comments = prev and type(prev.comments) == "table" and prev.comments or {},
 		files = prev and type(prev.files) == "table" and prev.files or {},
+		all_viewed = prev and prev.all_viewed or nil,
 	}
 	local evicted, ok = seen.put(cfg.store_path, key, record, cfg.max_count)
 	if not ok then
@@ -1064,7 +1091,7 @@ local function track_tab_view(tabpage, pr)
 		ts.viewed = { files = {}, version = 0, failed = true }
 		return
 	end
-	seen_view.compute_viewed(tabpage, ts.since, record.files)
+	seen_view.compute_viewed(tabpage, ts.since, record)
 	seen.pin(record.root, key, record.source, log_seen_ref_failure("pin", key))
 	for _, old in ipairs(evicted) do
 		unpin_seen_record(old)
@@ -2541,15 +2568,15 @@ end
 seen_view.viewed_lib = require("bb_pr.viewed")
 
 -- Sets tab_state(tabpage).viewed (shape in the state.tabs comment) for the tracked
--- `since`, with `files` the view record's marks, then fetches the PR files' blob shas
+-- `since` from its view `record` (marks and all_viewed), then fetches the PR files' blob shas
 -- in the background: at the source tip, or at the merge base for a file the PR
 -- deletes. Dropped when the tab closed, got a new `since` or a new `viewed` meanwhile;
 -- otherwise re-renders the tab. A git failure is logged, leaves blobs nil and sets
 -- viewed.failed.
-function seen_view.compute_viewed(tabpage, since, files)
+function seen_view.compute_viewed(tabpage, since, record)
 	local ts = tab_state(tabpage)
 	local info = ts.diff_base
-	local viewed = { files = vim.deepcopy(files or {}), version = 0 }
+	local viewed = { files = vim.deepcopy(record.files or {}), version = 0, all_viewed = record.all_viewed or false }
 	ts.viewed = viewed
 	local function live()
 		return vim.api.nvim_tabpage_is_valid(tabpage)
@@ -2587,6 +2614,7 @@ function seen_view.compute_viewed(tabpage, since, files)
 		viewed.blobs = blobs
 		-- the version bump misses the panel memo, so the next render shows the dimming
 		viewed.version = viewed.version + 1
+		seen_view.sync_all_viewed(ts)
 		-- the file already shown gets no BufEnter/CursorMoved of its own; a mark already
 		-- re-rendered the panel and PR Info (set_viewed)
 		if tabpage == vim.api.nvim_get_current_tabpage() and seen_view.mark_shown_file(tabpage) then
@@ -2631,6 +2659,38 @@ function seen_view.compute_viewed(tabpage, since, files)
 	end)
 end
 
+-- The all_viewed value for the view record of the tracked tab state `ts` with the
+-- marks `files`: the source sha when every PR file is viewed, else false; nil while
+-- the blobs or the PR file list are not known.
+function seen_view.all_viewed_value(ts, files)
+	local viewed, info = ts.viewed, ts.diff_base
+	local pr_files = info and info.changed_files
+	if not (viewed and viewed.blobs and pr_files) then
+		return nil
+	end
+	local paths = {}
+	for _, f in ipairs(pr_files) do
+		table.insert(paths, f.path)
+	end
+	local x, y = seen_view.viewed_lib.count(files, viewed.blobs, paths)
+	return x == y and info.source or false
+end
+
+-- Writes the record's all_viewed when the current marks of the tracked tab state `ts`
+-- give another value than the stored one (the list sorts done PRs by it).
+function seen_view.sync_all_viewed(ts)
+	local value = seen_view.all_viewed_value(ts, ts.viewed.files)
+	if value == nil or value == ts.viewed.all_viewed then
+		return
+	end
+	local written, why = seen.set_files(M.config.since_last_view.store_path, ts.since.key, {}, value)
+	if not written then
+		log("viewed: failed to write all_viewed", ts.since.key, why)
+		return
+	end
+	ts.viewed.all_viewed = value
+end
+
 -- The tab state and viewed state of a tracked `tabpage`, or nil when it is not tracked.
 function seen_view.tracked(tabpage)
 	local ts = state.tabs[tab_key(tabpage)]
@@ -2653,13 +2713,22 @@ function seen_view.set_viewed(tabpage, changes)
 	if next(changes or {}) == nil then
 		return true
 	end
-	local written, why = seen.set_files(M.config.since_last_view.store_path, ts.since.key, changes)
+	local after = vim.deepcopy(viewed.files)
+	for path, sha in pairs(changes) do
+		after[path] = sha or nil
+	end
+	local all_viewed = seen_view.all_viewed_value(ts, after)
+	if all_viewed == viewed.all_viewed then
+		all_viewed = nil
+	end
+	local written, why = seen.set_files(M.config.since_last_view.store_path, ts.since.key, changes, all_viewed)
 	if not written then
 		log("viewed: failed to write marks", ts.since.key, changes, why)
 		return false
 	end
-	for path, sha in pairs(changes) do
-		viewed.files[path] = sha or nil
+	viewed.files = after
+	if all_viewed ~= nil then
+		viewed.all_viewed = all_viewed
 	end
 	viewed.version = viewed.version + 1
 	state.panel_rendered_by_buf = {}
@@ -4101,10 +4170,11 @@ end
 
 function M.open_list()
 	run_provider(function(prs)
-		local sorted_prs = prs or {}
+		prs = prs or {}
+		seen_view.forget_closed_prs(prs)
+		local markers, done = seen_view.list_markers(prs)
+		local sorted_prs = seen_view.sort_done_last(prs, done)
 		state.prs = sorted_prs
-		seen_view.forget_closed_prs(sorted_prs)
-		local markers = seen_view.list_markers(sorted_prs)
 
 		if open_telescope_picker(sorted_prs, markers) then
 			return

@@ -2,7 +2,8 @@
 --
 -- File format: { version = 1, prs = { ["<project>/<repo>#<id>"] = record } } where record is
 -- { seen_at (ms), source (sha), root, comment_count, comments = { ["<comment id>"] = version },
--- files = { ["<path>"] = "<blob sha>" } } (files: marked as viewed; a record written before this field existed has none, i.e. reads as empty);
+-- files = { ["<path>"] = "<blob sha>" }, all_viewed } (files: marked as viewed; a record written before this field existed has none, i.e. reads as empty;
+-- all_viewed: the source sha at which every PR file was viewed, absent otherwise);
 -- comment_count is absent while the record has not seen the PR's comments yet.
 -- Callers pass paths and limits; the module holds no state.
 local M = {}
@@ -129,10 +130,12 @@ function M.put(path, key, record, max_count)
 end
 
 -- Re-reads the file and changes only the given paths of record `key`: changes maps
--- path -> blob sha to mark, or false to unmark. Empty changes write nothing, and so
--- does a missing record. Returns true, or false plus "missing" (no record) / "write".
-function M.set_files(path, key, changes)
-	if not key or next(changes or {}) == nil then
+-- path -> blob sha to mark, or false to unmark. all_viewed (optional): a sha sets the
+-- record's all_viewed, false clears it, nil leaves it. Nothing to change writes
+-- nothing, and so does a missing record. Returns true, or false plus "missing" (no
+-- record) / "write".
+function M.set_files(path, key, changes, all_viewed)
+	if not key or (next(changes or {}) == nil and all_viewed == nil) then
 		return true
 	end
 	local prs = read_prs(path)
@@ -145,6 +148,9 @@ function M.set_files(path, key, changes)
 		files[file] = sha or nil
 	end
 	record.files = files
+	if all_viewed ~= nil then
+		record.all_viewed = all_viewed or nil
+	end
 	if not write_prs(path, prs) then
 		return false, "write"
 	end
