@@ -11,12 +11,6 @@ local default_config = {
 	force_repo_autodetect = true,
 	force_repo_autodetect_flag = "-force-autodetect-repo",
 	diffview_cmd = "DiffviewOpen",
-	-- what the right side of the PR tab shows:
-	--   "worktree": the working tree files (LSP, editing; every new file runs the
-	--               full BufRead/FileType chain, so the first open is slower)
-	--   "commits":  read-only diffview buffers of the merge commit (faster to open,
-	--               no LSP); falls back to "worktree" when the merge conflicts
-	diff_mode = "worktree",
 
 	-- comment actions: popup windows use the key as-is; diff buffer prepends "g"
 	comments = {
@@ -3314,19 +3308,13 @@ local function open_diffview(pr)
 							pcall(vim.api.nvim_buf_delete, buf, { force = true })
 						end
 					end
-					-- "commits" diffs the target tip against the merge commit HEAD, which
-					-- holds the same content as the clean working tree; a conflicted merge
-					-- has no such commit, so it keeps the working tree
-					local rev = "origin/" .. to_ref
-					if M.config.diff_mode == "commits" and not conflicted then
-						rev = rev .. "..HEAD"
-					end
+					-- the right side is the working tree (LSP, editing), never a git revision
 					vim.cmd(
 						string.format(
 							"%s -C%s %s",
 							M.config.diffview_cmd,
 							vim.fn.fnameescape(repo_root),
-							rev
+							"origin/" .. to_ref
 						)
 					)
 					set_current_tab_pr(pr)
@@ -4942,8 +4930,8 @@ local function accept_suggestion()
 		vim.notify("bb_pr: failed to apply suggestion: " .. tostring(apply_err or ""), vim.log.levels.ERROR)
 		return
 	end
-	-- with diff_mode = "commits" the tab shows no working tree file, so an edit to a
-	-- hidden buffer would go unnoticed: write it out
+	-- accepted from PR Info with the file shown in no window, an edit to the hidden
+	-- buffer would go unnoticed: write it out
 	if #vim.fn.win_findbuf(buf) == 0 then
 		local ok_write, write_err = pcall(vim.api.nvim_buf_call, buf, function()
 			vim.cmd("silent write")
