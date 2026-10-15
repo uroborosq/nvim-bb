@@ -5,7 +5,6 @@
 ## Roadmap
 
 - review mode support
-- open bb pr in browser
 
 ## Overview
 
@@ -83,5 +82,13 @@ Bitbucket PR helper CLI + Neovim plugin.
   - Merge conflicts do not block review: when the PR branch conflicts with its target, the PR still opens with the full diff against the target, and conflicted files carry inline `<<<<<<<` markers. The conflict is reported with a warning and marked as `Merge: CONFLICT with origin/<target>` in the `:BBPRInfo` header. For a 3-way resolve, run `:DiffviewOpen` with no arguments — Diffview only builds its **Conflicts** section for a revless invocation, since `git diff --name-status <rev>` reports unmerged paths as `M` rather than `U`.
   - Leaving a conflicted PR is automatic: opening another PR first runs `git merge --abort` (falling back to `git reset --hard HEAD`) so the new branch can be checked out. Only a real in-progress merge is rolled back — an ordinary dirty working tree is still reported instead of being reset, and untracked files are never removed.
   - `<leader>rq` (or `:BBPRClose`) closes the open PR tabs and rolls back the conflicted merge without opening another PR. Mapping is configurable via `setup({ pr = { close_map = "..." } })`.
+  - `<leader>rb` (or `:BBPRBrowse`) opens the most specific thing at the cursor in the browser: a comment, else a PR file, else the PR. `:BBPRBrowse pr|file|comment` opens that kind only and warns when there is none at the cursor.
+    - PR list (Telescope and the plain buffer): the PR under the cursor (Telescope keeps the list open).
+    - PR Info: the comment or reply on the cursor line, else the PR (also for a PR opened from the list without a tab).
+    - Line comments float: the comment or reply on the cursor line.
+    - Diff buffer of a PR tab: the file in the Bitbucket PR diff at the cursor line, translated to Bitbucket's line numbers (left side: the original version, right side: the PR branch). A line that is not in the PR diff (e.g. from the merged target branch) opens the file without a line and tells you why.
+    - Diffview file panel: the file on the cursor line; a directory line opens the PR.
+    - Any other buffer of a PR tab: the PR.
+    URLs come from the PR's Bitbucket link and open with `vim.ui.open()` (as do Jira tickets and attachments). Keys: `setup({ browse = { map = "<leader>rb", float_map = "gx", picker_map = "<C-o>" } })` — `map` is global, `float_map` works in PR Info, the line comments float, the plain PR list buffer and Telescope normal mode, `picker_map` in Telescope insert mode; `""` disables a key. The diff buffers keep the built-in `gx`.
 
   - Your own reactions are marked with `(you)` in comment popups/overview so you can quickly see what you already added.

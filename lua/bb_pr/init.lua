@@ -69,6 +69,15 @@ local default_config = {
 		open_url_map = "o",
 	},
 
+	-- open the PR / file / comment at the cursor in the browser (:BBPRBrowse)
+	browse = {
+		map = "<leader>rb",
+		-- PR Info, line comments float, PR list buffer, Telescope PR list (normal mode)
+		float_map = "gx",
+		-- Telescope PR list (insert mode)
+		picker_map = "<C-o>",
+	},
+
 	-- stats
 	stats = {
 		map = "<leader>rS",
@@ -1789,6 +1798,8 @@ local function comment_action_specs(overview)
 			})
 		end
 	end
+	-- the comment on the cursor line, else (PR Info) the PR
+	table.insert(specs, { M.config.browse.float_map, "<cmd>BBPRBrowse<CR>", desc = "Open in browser" })
 	table.insert(specs, { "q", nil, help = "Close" })
 	return specs
 end
@@ -4123,7 +4134,7 @@ local function open_telescope_picker(prs, markers)
 				end,
 			}),
 			sorter = telescope_config.values.generic_sorter({}),
-			attach_mappings = function(prompt_bufnr)
+			attach_mappings = function(prompt_bufnr, map)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -4138,6 +4149,20 @@ local function open_telescope_picker(prs, markers)
 						open_pr_info_with_comments(selection.value)
 					end
 				end)
+
+				-- open the selected PR in the browser, keeping the picker open
+				local function browse_selection()
+					local selection = action_state.get_selected_entry()
+					if selection and selection.value then
+						M.browse(nil, selection.value)
+					end
+				end
+				local browse_cfg = M.config.browse
+				for mode, key in pairs({ i = browse_cfg.picker_map, n = browse_cfg.float_map }) do
+					if key and key ~= "" then
+						map(mode, key, browse_selection)
+					end
+				end
 
 				return true
 			end,
@@ -4204,6 +4229,19 @@ function M.open_list()
 				open_pr_info_with_comments(pr)
 			end
 		end, { buffer = buf, silent = true })
+
+		bind_keymaps(buf, {
+			{
+				M.config.browse.float_map,
+				function()
+					local pr = pr_at_cursor()
+					if pr then
+						M.browse(nil, pr)
+					end
+				end,
+				desc = "Open PR in browser",
+			},
+		})
 
 		vim.api.nvim_set_current_buf(buf)
 	end)
@@ -4825,6 +4863,77 @@ local function tab_pr_or_warn()
 	return pr
 end
 
+-- :BBPRBrowse — opens in the browser the comment, PR file (with its Bitbucket line
+-- when there is one) or PR at the cursor: the most specific one, or the one of `kind`
+-- ("pr" | "file" | "comment"). `pr` opens that PR (PR list).
+function M.browse(kind, pr)
+	local browse = require("bb_pr.browse")
+	local function warn(msg)
+		vim.notify("bb_pr: " .. msg, vim.log.levels.WARN)
+	end
+	local target = { pr = pr }
+	if not pr then
+		local buf, win = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
+		local view = comment_view(buf)
+		if view then
+			-- PR Info may show a PR without a tab; the line comments float is the tab's
+			target.pr = view.kind == "overview" and view.pr or get_current_tab_pr()
+			target.comment = resolve_reply_target_comment_id()
+		else
+			target.pr = get_current_tab_pr()
+			local ok, lib = pcall(require, "diffview.lib")
+			local dv = ok and lib.get_current_view() or nil
+			local dv_file = diffview_window_file(win)
+			if not target.pr then
+				-- nothing to open
+			elseif dv and type(dv.panel) == "table" and dv.panel.bufid == buf then
+				local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+				for _, r in ipairs(seen_view.panel_rows(dv.panel.components)) do
+					if r.row == row and not r.dir then
+						target.file = { path = r.paths[1] }
+					end
+				end
+			elseif dv_file then
+				local finfo, err = window_file_info(win)
+				if finfo then
+					local info = tab_diff_base(vim.api.nvim_win_get_tabpage(win))
+					local anchor, reason = nil, "the PR diff is still loading"
+					if info then
+						anchor, reason = local_line_to_anchor(info, finfo, vim.api.nvim_win_get_cursor(win)[1])
+					end
+					target.file = { path = finfo.path, anchor = anchor, reason = not anchor and reason or nil }
+				elseif type(dv_file.path) == "string" and dv_file.path ~= "" then
+					-- e.g. the empty side of an added file
+					target.file = { path = dv_file.path, reason = err }
+				end
+			end
+		end
+	end
+
+	if not target.pr then
+		return warn("no PR tracked for current tab")
+	end
+	if not browse.pr_url(target.pr) then
+		return warn("PR has no Bitbucket link")
+	end
+	kind = kind or (target.comment and "comment") or (target.file and "file") or "pr"
+	if kind == "comment" then
+		if not target.comment then
+			return warn("cursor is not on a comment")
+		end
+		return browse.open(browse.comment_url(target.pr, target.comment))
+	elseif kind == "file" then
+		if not target.file then
+			return warn("cursor is not on a PR file")
+		end
+		if target.file.reason then
+			vim.notify("bb_pr: opening the file without a line: " .. target.file.reason, vim.log.levels.INFO)
+		end
+		return browse.open(browse.file_url(target.pr, target.file.path, target.file.anchor))
+	end
+	browse.open(browse.pr_url(target.pr))
+end
+
 local COMMENT_LINE_HINT = "bb_pr: move cursor to a comment line in BBPROpenLineComments or PR Info"
 local COMMENT_NOT_LOADED = "bb_pr: could not find selected comment in loaded payload"
 
@@ -5442,7 +5551,7 @@ open_jira_ticket = function(ticket)
 			{
 				url ~= "" and M.config.jira.open_url_map or nil,
 				function()
-					vim.fn.jobstart({ "xdg-open", url }, { detach = true })
+					require("bb_pr.browse").open(url)
 				end,
 				desc = "Open Jira ticket in browser",
 				help = "Open in browser",
@@ -5513,7 +5622,7 @@ open_attachment_at_cursor = function()
 		f:write(res.stdout)
 		f:close()
 		vim.schedule(function()
-			vim.fn.jobstart({ "xdg-open", tmp }, { detach = true })
+			require("bb_pr.browse").open(tmp)
 		end)
 	end)
 end
@@ -5853,11 +5962,28 @@ function M.setup(opts)
 		open_comment_float(comments, line)
 	end, { desc = "Open floating window with comments for current line" })
 
+	local browse_kinds = { "pr", "file", "comment" }
+	vim.api.nvim_create_user_command("BBPRBrowse", function(cmd)
+		local kind = cmd.args ~= "" and cmd.args or nil
+		if kind and not vim.tbl_contains(browse_kinds, kind) then
+			vim.notify("bb_pr: unknown :BBPRBrowse target " .. kind .. " (pr, file, comment)", vim.log.levels.ERROR)
+			return
+		end
+		M.browse(kind)
+	end, {
+		nargs = "?",
+		complete = function()
+			return browse_kinds
+		end,
+		desc = "Open the PR, file or comment at the cursor in the browser",
+	})
+
 	bind_keymaps(nil, {
 		{ M.config.pr.create_map, "<cmd>BBPRCreatePR<CR>", desc = "Create PR" },
 		{ M.config.pr.merge_map, "<cmd>BBPRMerge<CR>", desc = "Merge PR" },
 		{ M.config.pr.close_map, "<cmd>BBPRClose<CR>", desc = "Close PR" },
 		{ M.config.stats.map, "<cmd>BBPRStats<CR>", desc = "BB PR Stats" },
+		{ M.config.browse.map, "<cmd>BBPRBrowse<CR>", desc = "Open in browser" },
 	})
 
 	local since_cfg = M.config.since_last_view or {}
